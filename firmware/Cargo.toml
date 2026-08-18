@@ -4,3 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+base64 = { workspace = true }
+bytes = { workspace = true }
+rtp = { workspace = true }
+tokio = { workspace = true, features = ["net", "io-util", "macros", "rt-multi-thread", "sync", "time", "signal"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }

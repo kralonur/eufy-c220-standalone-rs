@@ -13,6 +13,8 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use bytes::Bytes;
 use rtp::codecs::h264::H264Payloader;
 use rtp::packetizer::Payloader;
+use rtsp_runtime::{InterleavedFrame, LowerTransport, ServerEvent, ServerSession, Transport};
+use rtsp_types::{Message, Method, Request, Response, StatusCode, Version, headers};
 use std::io;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -73,13 +75,11 @@ const DEFAULT_H264_PROFILE_LEVEL_ID: &str = "42e01f";
 /// Initial deterministic RTP SSRC. Each client receives a distinct value.
 const FIRST_RTP_SSRC: u32 = 0xc220_0001;
 
-const STATUS_OK: u16 = 200;
-const STATUS_NOT_FOUND: u16 = 404;
-const STATUS_SESSION_NOT_FOUND: u16 = 454;
-const STATUS_METHOD_NOT_VALID: u16 = 455;
-const STATUS_UNSUPPORTED_TRANSPORT: u16 = 461;
-const STATUS_SERVICE_UNAVAILABLE: u16 = 503;
-const STATUS_NOT_IMPLEMENTED: u16 = 501;
+/// Methods implemented by the camera-local RTSP endpoint.
+const SUPPORTED_METHODS: &str = "OPTIONS, DESCRIBE, SETUP, PLAY, PAUSE, GET_PARAMETER, TEARDOWN";
+
+/// Server name included in responses generated outside the session engine.
+const RTSP_SERVER_NAME: &str = "c220-firmware";
 
 /// Codec reported by a camera-local video record.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -368,7 +368,6 @@ async fn accept_loop(listener: TcpListener, inner: Arc<RtspServerInner>) {
 }
 
 struct ClientState {
-    session_id: Option<String>,
     video_channel: Option<u8>,
     media_task: Option<JoinHandle<()>>,
 }
@@ -379,24 +378,14 @@ impl ClientState {
             task.abort();
         }
     }
-
-    fn session_matches(&self, request: &RtspRequest) -> bool {
-        let Some(expected) = self.session_id.as_deref() else {
-            return false;
-        };
-        request
-            .header("session")
-            .and_then(|value| value.split(';').next())
-            .map(str::trim)
-            == Some(expected)
-    }
 }
 
 async fn handle_connection(stream: TcpStream, inner: Arc<RtspServerInner>) -> io::Result<()> {
     let (mut reader, writer) = stream.into_split();
     let writer = Arc::new(Mutex::new(writer));
+    let session_seed = inner.next_session.fetch_add(1, Ordering::Relaxed);
+    let mut session = ServerSession::new().with_session_seed(session_seed);
     let mut state = ClientState {
-        session_id: None,
         video_channel: None,
         media_task: None,
     };
@@ -408,7 +397,7 @@ async fn handle_connection(stream: TcpStream, inner: Arc<RtspServerInner>) -> io
             result = read_request(&mut reader, &mut buffer) => result?,
         };
         let Some(request) = request else { break };
-        if handle_request(&inner, &writer, &mut state, request).await? {
+        if handle_request(&inner, &writer, &mut session, &mut state, request).await? {
             break;
         }
     }
@@ -420,247 +409,100 @@ async fn handle_connection(stream: TcpStream, inner: Arc<RtspServerInner>) -> io
 async fn handle_request(
     inner: &Arc<RtspServerInner>,
     writer: &Arc<Mutex<OwnedWriteHalf>>,
+    session: &mut ServerSession,
     state: &mut ClientState,
-    request: RtspRequest,
+    request: InboundRequest,
 ) -> io::Result<bool> {
-    let cseq = request.cseq();
-    match request.method.as_str() {
-        "OPTIONS" => {
-            send_response(
-                writer,
-                cseq,
-                STATUS_OK,
-                "OK",
-                &[(
-                    "Public",
-                    "OPTIONS, DESCRIBE, SETUP, PLAY, PAUSE, GET_PARAMETER, TEARDOWN",
-                )],
-                &[],
-            )
-            .await?;
-        }
-        "DESCRIBE" => {
-            if uri_path(&request.uri) != inner.path {
-                send_response(writer, cseq, STATUS_NOT_FOUND, "Not Found", &[], &[]).await?;
-            } else if !wait_for_codec(inner).await {
-                send_response(
-                    writer,
-                    cseq,
-                    STATUS_SERVICE_UNAVAILABLE,
-                    "Service Unavailable",
-                    &[],
-                    &[],
-                )
-                .await?;
-            } else if let Some(sdp) = build_sdp_from_inner(inner) {
-                let content_base = content_base(&request.uri);
-                send_response(
-                    writer,
-                    cseq,
-                    STATUS_OK,
-                    "OK",
-                    &[
-                        ("Content-Base", content_base.as_str()),
-                        ("Content-Type", "application/sdp"),
-                    ],
-                    sdp.as_bytes(),
-                )
-                .await?;
-            } else {
-                send_response(
-                    writer,
-                    cseq,
-                    STATUS_SERVICE_UNAVAILABLE,
-                    "Service Unavailable",
-                    &[],
-                    &[],
-                )
-                .await?;
+    let method = request.parsed.method().clone();
+
+    if !method_supported(&method) {
+        send_error(writer, &request.parsed, StatusCode::NotImplemented).await?;
+        return Ok(false);
+    }
+    if !request_path_allowed(&request.parsed, &method, &inner.path) {
+        send_error(writer, &request.parsed, StatusCode::NotFound).await?;
+        return Ok(false);
+    }
+    if session_required(&method, session) && !session_matches(session, &request.parsed) {
+        send_error(writer, &request.parsed, StatusCode::SessionNotFound).await?;
+        return Ok(false);
+    }
+
+    let setup = if method == Method::Setup {
+        match parse_setup_transport(&request.parsed) {
+            Ok(setup) => Some(setup),
+            Err(()) => {
+                send_error(writer, &request.parsed, StatusCode::UnsupportedTransport).await?;
+                return Ok(false);
             }
         }
-        "SETUP" => {
-            if uri_path(&request.uri) != format!("{}/trackID=0", inner.path) {
-                send_response(writer, cseq, STATUS_NOT_FOUND, "Not Found", &[], &[]).await?;
-            } else if state.session_id.is_some() && !state.session_matches(&request) {
-                send_response(
-                    writer,
-                    cseq,
-                    STATUS_SESSION_NOT_FOUND,
-                    "Session Not Found",
-                    &[],
-                    &[],
-                )
-                .await?;
-            } else {
-                let Some(transport_header) = request.header("transport") else {
-                    send_response(
-                        writer,
-                        cseq,
-                        STATUS_UNSUPPORTED_TRANSPORT,
-                        "Unsupported Transport",
-                        &[],
-                        &[],
-                    )
-                    .await?;
-                    return Ok(false);
-                };
-                let channel = match parse_interleaved_transport(transport_header) {
-                    Ok(channel) => channel,
-                    Err(()) => {
-                        send_response(
-                            writer,
-                            cseq,
-                            STATUS_UNSUPPORTED_TRANSPORT,
-                            "Unsupported Transport",
-                            &[],
-                            &[],
-                        )
-                        .await?;
-                        return Ok(false);
-                    }
-                };
-                let session_id = state.session_id.get_or_insert_with(|| {
-                    format!("{:08x}", inner.next_session.fetch_add(1, Ordering::Relaxed))
-                });
+    } else {
+        None
+    };
+
+    let sdp = if method == Method::Describe {
+        if !wait_for_codec(inner).await {
+            send_error(writer, &request.parsed, StatusCode::ServiceUnavailable).await?;
+            return Ok(false);
+        }
+        match build_sdp_from_inner(inner) {
+            Some(sdp) => Some(sdp),
+            None => {
+                send_error(writer, &request.parsed, StatusCode::ServiceUnavailable).await?;
+                return Ok(false);
+            }
+        }
+    } else {
+        None
+    };
+
+    let (response, events) = session
+        .handle_request(&request.raw)
+        .map_err(runtime_io_error)?;
+    let response = customize_response(
+        response,
+        &method,
+        &request.parsed,
+        sdp.as_deref(),
+        setup.as_ref().map(|(_, transport)| transport.as_str()),
+    )?;
+    {
+        let mut writer = writer.lock().await;
+        writer.write_all(&response).await?;
+    }
+
+    let accepted = events
+        .iter()
+        .any(|event| matches!(event, ServerEvent::RequestAccepted { .. }));
+    if !accepted {
+        return Ok(false);
+    }
+
+    match method {
+        Method::Setup => {
+            if let Some((channel, _)) = setup {
                 state.video_channel = Some(channel);
-                let transport =
-                    format!("RTP/AVP/TCP;unicast;interleaved={channel}-{}", channel + 1);
-                send_response(
-                    writer,
-                    cseq,
-                    STATUS_OK,
-                    "OK",
-                    &[
-                        ("Session", session_id.as_str()),
-                        ("Transport", transport.as_str()),
-                    ],
-                    &[],
-                )
-                .await?;
             }
         }
-        "PLAY" => {
-            if !state.session_matches(&request) {
-                send_response(
-                    writer,
-                    cseq,
-                    STATUS_SESSION_NOT_FOUND,
-                    "Session Not Found",
-                    &[],
-                    &[],
-                )
-                .await?;
-            } else if state.video_channel.is_none() {
-                send_response(
-                    writer,
-                    cseq,
-                    STATUS_METHOD_NOT_VALID,
-                    "Method Not Valid in This State",
-                    &[],
-                    &[],
-                )
-                .await?;
-            } else {
-                let session_id = state.session_id.as_deref().unwrap_or_default();
-                send_response(
-                    writer,
-                    cseq,
-                    STATUS_OK,
-                    "OK",
-                    &[("Session", session_id)],
-                    &[],
-                )
-                .await?;
-                state.stop_media();
-                let channel = state.video_channel.unwrap_or(0);
-                let receiver = inner.media_tx.subscribe();
-                let media_inner = Arc::clone(inner);
-                let media_writer = Arc::clone(writer);
-                state.media_task = Some(tokio::spawn(async move {
-                    media_loop(media_inner, media_writer, channel, receiver).await;
-                }));
-            }
+        Method::Play => {
+            state.stop_media();
+            let Some(channel) = state.video_channel else {
+                return Ok(false);
+            };
+            let receiver = inner.media_tx.subscribe();
+            let media_inner = Arc::clone(inner);
+            let media_writer = Arc::clone(writer);
+            state.media_task = Some(tokio::spawn(async move {
+                media_loop(media_inner, media_writer, channel, receiver).await;
+            }));
         }
-        "PAUSE" => {
-            if !state.session_matches(&request) {
-                send_response(
-                    writer,
-                    cseq,
-                    STATUS_SESSION_NOT_FOUND,
-                    "Session Not Found",
-                    &[],
-                    &[],
-                )
-                .await?;
-            } else {
-                state.stop_media();
-                let session_id = state.session_id.as_deref().unwrap_or_default();
-                send_response(
-                    writer,
-                    cseq,
-                    STATUS_OK,
-                    "OK",
-                    &[("Session", session_id)],
-                    &[],
-                )
-                .await?;
-            }
+        Method::Pause => state.stop_media(),
+        Method::Teardown => {
+            state.stop_media();
+            state.video_channel = None;
+            return Ok(true);
         }
-        "GET_PARAMETER" | "SET_PARAMETER" => {
-            if state.session_id.is_some() && !state.session_matches(&request) {
-                send_response(
-                    writer,
-                    cseq,
-                    STATUS_SESSION_NOT_FOUND,
-                    "Session Not Found",
-                    &[],
-                    &[],
-                )
-                .await?;
-            } else {
-                let session = state.session_id.as_deref().unwrap_or_default();
-                let headers = if session.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![("Session", session)]
-                };
-                send_response(writer, cseq, STATUS_OK, "OK", &headers, &[]).await?;
-            }
-        }
-        "TEARDOWN" => {
-            if state.session_id.is_some() && !state.session_matches(&request) {
-                send_response(
-                    writer,
-                    cseq,
-                    STATUS_SESSION_NOT_FOUND,
-                    "Session Not Found",
-                    &[],
-                    &[],
-                )
-                .await?;
-            } else {
-                state.stop_media();
-                let session = state.session_id.as_deref().unwrap_or_default();
-                let headers = if session.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![("Session", session)]
-                };
-                send_response(writer, cseq, STATUS_OK, "OK", &headers, &[]).await?;
-                return Ok(true);
-            }
-        }
-        _ => {
-            send_response(
-                writer,
-                cseq,
-                STATUS_NOT_IMPLEMENTED,
-                "Not Implemented",
-                &[],
-                &[],
-            )
-            .await?;
-        }
+        _ => {}
     }
     Ok(false)
 }
@@ -752,60 +594,60 @@ async fn write_interleaved(
     channel: u8,
     payload: &[u8],
 ) -> io::Result<()> {
-    let length = u16::try_from(payload.len()).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "RTP packet exceeds RTSP interleaved length",
-        )
-    })?;
-    let mut frame = Vec::with_capacity(4 + payload.len());
-    frame.extend_from_slice(&[b'$', channel]);
-    frame.extend_from_slice(&length.to_be_bytes());
-    frame.extend_from_slice(payload);
+    let frame = InterleavedFrame::new(channel, payload.to_vec());
+    let bytes = frame
+        .to_bytes()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
 
     let mut writer = writer.lock().await;
-    writer.write_all(&frame).await
+    writer.write_all(&bytes).await
 }
 
 #[derive(Debug)]
-struct RtspRequest {
-    method: String,
-    uri: String,
-    headers: Vec<(String, String)>,
-}
-
-impl RtspRequest {
-    fn cseq(&self) -> u32 {
-        self.header("cseq")
-            .and_then(|value| value.trim().parse().ok())
-            .unwrap_or(0)
-    }
-
-    fn header(&self, name: &str) -> Option<&str> {
-        self.headers
-            .iter()
-            .find(|(header, _)| header.eq_ignore_ascii_case(name))
-            .map(|(_, value)| value.as_str())
-    }
+struct InboundRequest {
+    raw: Vec<u8>,
+    parsed: Request<Vec<u8>>,
 }
 
 async fn read_request(
     reader: &mut OwnedReadHalf,
     buffer: &mut Vec<u8>,
-) -> io::Result<Option<RtspRequest>> {
+) -> io::Result<Option<InboundRequest>> {
     loop {
         if buffer.first() == Some(&b'$') {
-            if buffer.len() >= 4 {
-                let length = u16::from_be_bytes([buffer[2], buffer[3]]) as usize;
-                let total = 4 + length;
-                if buffer.len() >= total {
-                    buffer.drain(..total);
+            match InterleavedFrame::parse(buffer) {
+                Ok(Some((_frame, consumed))) => {
+                    buffer.drain(..consumed);
                     continue;
                 }
+                Ok(None) => {}
+                Err(error) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        error.to_string(),
+                    ));
+                }
             }
-        } else if let Some(end) = find_header_end(buffer) {
-            let raw: Vec<u8> = buffer.drain(..end).collect();
-            return parse_request(&raw).map(Some);
+        } else if !buffer.is_empty() {
+            match Message::<Vec<u8>>::parse(buffer) {
+                Ok((Message::Request(parsed), consumed)) => {
+                    let raw = buffer.drain(..consumed).collect();
+                    return Ok(Some(InboundRequest { raw, parsed }));
+                }
+                Ok((_, _)) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "RTSP control stream contained a non-request message",
+                    ));
+                }
+                Err(rtsp_types::ParseError::Incomplete(_)) => {}
+                Err(rtsp_types::ParseError::Error) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "malformed RTSP request",
+                    ));
+                }
+            }
         }
 
         if buffer.len() >= MAX_REQUEST_BUFFER {
@@ -827,85 +669,6 @@ async fn read_request(
         }
         buffer.extend_from_slice(&chunk[..count]);
     }
-}
-
-fn parse_request(raw: &[u8]) -> io::Result<RtspRequest> {
-    let text = std::str::from_utf8(raw)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "RTSP request is not UTF-8"))?;
-    let mut lines = text.split("\r\n");
-    let request_line = lines.next().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "RTSP request has no request line",
-        )
-    })?;
-    let mut parts = request_line.split_whitespace();
-    let method = parts
-        .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "RTSP request has no method"))?
-        .to_ascii_uppercase();
-    let uri = parts
-        .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "RTSP request has no URI"))?
-        .to_string();
-    let version = parts
-        .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "RTSP request has no version"))?;
-    if version != "RTSP/1.0" || parts.next().is_some() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "unsupported RTSP request line",
-        ));
-    }
-
-    let mut headers = Vec::new();
-    for line in lines {
-        if line.is_empty() {
-            break;
-        }
-        let (name, value) = line.split_once(':').ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "RTSP header has no colon")
-        })?;
-        headers.push((name.trim().to_ascii_lowercase(), value.trim().to_string()));
-    }
-
-    Ok(RtspRequest {
-        method,
-        uri,
-        headers,
-    })
-}
-
-async fn send_response(
-    writer: &Arc<Mutex<OwnedWriteHalf>>,
-    cseq: u32,
-    status: u16,
-    reason: &str,
-    headers: &[(&str, &str)],
-    body: &[u8],
-) -> io::Result<()> {
-    let mut response = format!(
-        "RTSP/1.0 {status} {reason}\r\nCSeq: {cseq}\r\nContent-Length: {}\r\n",
-        body.len()
-    );
-    for (name, value) in headers {
-        response.push_str(name);
-        response.push_str(": ");
-        response.push_str(value);
-        response.push_str("\r\n");
-    }
-    response.push_str("\r\n");
-
-    let mut writer = writer.lock().await;
-    writer.write_all(response.as_bytes()).await?;
-    writer.write_all(body).await
-}
-
-fn find_header_end(buffer: &[u8]) -> Option<usize> {
-    buffer
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .map(|position| position + 4)
 }
 
 fn normalize_path(path: &str) -> io::Result<String> {
@@ -931,34 +694,168 @@ fn uri_path(uri: &str) -> &str {
     path.split('?').next().unwrap_or(path)
 }
 
-fn content_base(uri: &str) -> String {
-    if uri.ends_with('/') {
-        uri.to_string()
-    } else {
-        format!("{uri}/")
+fn request_path(request: &Request<Vec<u8>>) -> Option<&str> {
+    request.request_uri().map(|uri| uri_path(uri.as_str()))
+}
+
+fn request_path_allowed(request: &Request<Vec<u8>>, method: &Method, path: &str) -> bool {
+    match method {
+        Method::Describe => request_path(request) == Some(path),
+        Method::Setup => {
+            request_path(request).is_some_and(|value| value == format!("{path}/trackID=0"))
+        }
+        _ => true,
     }
 }
 
-fn parse_interleaved_transport(value: &str) -> Result<u8, ()> {
-    let mut parts = value.split(';');
-    let profile = parts.next().ok_or(())?;
-    if !profile.eq_ignore_ascii_case("RTP/AVP/TCP") {
+fn method_supported(method: &Method) -> bool {
+    matches!(
+        method,
+        Method::Options
+            | Method::Describe
+            | Method::Setup
+            | Method::Play
+            | Method::Pause
+            | Method::GetParameter
+            | Method::SetParameter
+            | Method::Teardown
+    )
+}
+
+fn session_matches(session: &ServerSession, request: &Request<Vec<u8>>) -> bool {
+    let Some(expected) = session.session_id() else {
+        return false;
+    };
+    request
+        .header(&headers::SESSION)
+        .map(|value| value.as_str().split(';').next().unwrap_or_default().trim())
+        == Some(expected)
+}
+
+fn session_required(method: &Method, session: &ServerSession) -> bool {
+    match method {
+        Method::Play | Method::Pause => true,
+        Method::Setup | Method::GetParameter | Method::SetParameter | Method::Teardown => {
+            session.session_id().is_some()
+        }
+        _ => false,
+    }
+}
+
+fn parse_setup_transport(request: &Request<Vec<u8>>) -> Result<(u8, String), ()> {
+    let value = request.header(&headers::TRANSPORT).ok_or(())?.as_str();
+    let transport = Transport::parse(value).map_err(|_| ())?;
+    let spec = transport.first().ok_or(())?;
+    if spec.lower_transport != Some(LowerTransport::Tcp) {
+        return Err(());
+    }
+    let (rtp_channel, rtcp_channel) = spec.interleaved.ok_or(())?;
+    if rtp_channel.checked_add(1) != Some(rtcp_channel) {
         return Err(());
     }
 
-    let channel_pair = parts
-        .find_map(|part| part.strip_prefix("interleaved="))
-        .unwrap_or("0-1");
-    let mut channels = channel_pair.split('-');
-    let rtp_channel: u8 = channels.next().ok_or(())?.parse().map_err(|_| ())?;
-    let rtcp_channel: u8 = channels.next().ok_or(())?.parse().map_err(|_| ())?;
-    if channels.next().is_some()
-        || rtp_channel == u8::MAX
-        || rtcp_channel != rtp_channel.saturating_add(1)
-    {
-        return Err(());
+    Ok((
+        rtp_channel,
+        format!("RTP/AVP/TCP;unicast;interleaved={rtp_channel}-{rtcp_channel}"),
+    ))
+}
+
+fn runtime_io_error(error: rtsp_runtime::Error) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+}
+
+fn serialize_message(message: &Message<Vec<u8>>) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    message
+        .write(&mut bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    Ok(bytes)
+}
+
+fn customize_response(
+    bytes: Vec<u8>,
+    method: &Method,
+    request: &Request<Vec<u8>>,
+    sdp: Option<&str>,
+    setup_transport: Option<&str>,
+) -> io::Result<Vec<u8>> {
+    let (message, consumed) = Message::<Vec<u8>>::parse(&bytes).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("RTSP session returned an invalid response: {error}"),
+        )
+    })?;
+    if consumed != bytes.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "RTSP session returned trailing response bytes",
+        ));
     }
-    Ok(rtp_channel)
+    let Message::Response(mut response) = message else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "RTSP session did not return a response",
+        ));
+    };
+
+    response.insert_header(headers::SERVER, RTSP_SERVER_NAME);
+    if response.status() == StatusCode::Ok {
+        response.set_reason_phrase("OK");
+    }
+    match method {
+        Method::Options => {
+            response.insert_header(headers::PUBLIC, SUPPORTED_METHODS);
+        }
+        Method::Describe => {
+            let sdp = sdp.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "DESCRIBE response has no SDP")
+            })?;
+            let uri = request.request_uri().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "DESCRIBE request has no URI")
+            })?;
+            response.insert_header(headers::CONTENT_BASE, content_base(uri));
+            response.insert_header(headers::CONTENT_TYPE, "application/sdp");
+            response = response.replace_body(sdp.as_bytes().to_vec());
+        }
+        Method::Setup => {
+            let transport = setup_transport.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "SETUP response has no transport",
+                )
+            })?;
+            response.insert_header(headers::TRANSPORT, transport);
+        }
+        _ => {}
+    }
+
+    serialize_message(&Message::from(response))
+}
+
+async fn send_error(
+    writer: &Arc<Mutex<OwnedWriteHalf>>,
+    request: &Request<Vec<u8>>,
+    status: StatusCode,
+) -> io::Result<()> {
+    let cseq = request
+        .header(&headers::CSEQ)
+        .map(|value| value.as_str())
+        .unwrap_or("0");
+    let response = Response::builder(Version::V1_0, status)
+        .header(headers::CSEQ, cseq)
+        .header(headers::SERVER, RTSP_SERVER_NAME)
+        .build(Vec::<u8>::new());
+    let bytes = serialize_message(&Message::from(response))?;
+    let mut writer = writer.lock().await;
+    writer.write_all(&bytes).await
+}
+
+fn content_base(uri: &rtsp_types::Url) -> String {
+    if uri.as_str().ends_with('/') {
+        uri.as_str().to_string()
+    } else {
+        format!("{}/", uri.as_str())
+    }
 }
 
 fn build_sdp_from_inner(inner: &RtspServerInner) -> Option<String> {

@@ -7,6 +7,8 @@ edition = "2024"
 base64 = { workspace = true }
 bytes = { workspace = true }
 rtp = { workspace = true }
+rtsp-runtime = { workspace = true, features = ["tokio"] }
+rtsp-types = { workspace = true }
 tokio = { workspace = true, features = ["net", "io-util", "macros", "rt-multi-thread", "sync", "time", "signal"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }

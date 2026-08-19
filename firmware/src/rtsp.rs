@@ -1,8 +1,9 @@
-//! Camera-local RTSP video service.
+//! Camera-local RTSP media service.
 //!
 //! The server accepts RTSP 1.0 control requests and sends the encoded Annex-B
-//! access units received from the camera media engine as RTP interleaved over
-//! TCP. The RTP packetization follows RFC 6184 (H.264) and RFC 7798 (H.265).
+//! video access units and optional PCMA microphone frames received from the
+//! camera media engine as RTP interleaved over TCP. The RTP packetization
+//! follows RFC 3551 (PCMA), RFC 6184 (H.264), and RFC 7798 (H.265).
 //!
 //! This module is part of the custom camera firmware. It has no Eufy/P2P
 //! protocol handling. The 2K dimensions and the H.265 default are based on the
@@ -50,6 +51,24 @@ pub const RTP_VIDEO_TIMESTAMP_INCREMENT: u32 = 4_500;
 
 /// Dynamic RTP payload type used for the single video track.
 pub const RTP_VIDEO_PAYLOAD_TYPE: u8 = 96;
+
+/// Static RTP payload type for G.711 A-law audio (RFC 3551).
+pub const RTP_AUDIO_PAYLOAD_TYPE: u8 = 8;
+
+/// RTP clock rate for the validated microphone path.
+pub const RTP_AUDIO_CLOCK_RATE: u32 = 8_000;
+
+/// RTP timestamp increment for one 20 ms microphone frame.
+const RTP_AUDIO_TIMESTAMP_INCREMENT: u32 = 160;
+
+/// One native microphone record contains 20 ms of 8 kHz mono PCMA.
+const AUDIO_FRAME_LEN: usize = 160;
+
+/// Duration of one native microphone frame, in microseconds.
+const AUDIO_FRAME_DURATION_US: u64 = 20_000;
+
+/// Maximum audio payload accepted from the native companion.
+const MAX_AUDIO_RECORD_LEN: usize = 4 * 1024;
 
 /// Maximum RTP payload before the codec payloader fragments a NAL unit.
 /// 1,200 bytes keeps interleaved RTP packets below the common Ethernet MTU.
@@ -119,6 +138,8 @@ pub struct RtspServerConfig {
     pub video_width: u32,
     /// Encoded video height advertised in SDP.
     pub video_height: u32,
+    /// Whether the validated PCMA microphone track is advertised and served.
+    pub audio_enabled: bool,
 }
 
 impl RtspServerConfig {
@@ -128,6 +149,7 @@ impl RtspServerConfig {
             path: DEFAULT_RTSP_PATH.to_string(),
             video_width: DEFAULT_VIDEO_WIDTH,
             video_height: DEFAULT_VIDEO_HEIGHT,
+            audio_enabled: false,
         }
     }
 }
@@ -137,6 +159,8 @@ impl RtspServerConfig {
 pub struct RtspStats {
     pub video_access_units_published: u64,
     pub video_access_units_sent: u64,
+    pub audio_frames_published: u64,
+    pub audio_frames_sent: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -144,6 +168,12 @@ struct VideoFrame {
     data: Arc<[u8]>,
     keyframe: bool,
     codec: VideoCodec,
+    timestamp_us: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+struct AudioFrame {
+    data: Arc<[u8]>,
     timestamp_us: Option<u64>,
 }
 
@@ -168,7 +198,9 @@ struct RtspServerInner {
     path: String,
     video_width: u32,
     video_height: u32,
+    audio_enabled: bool,
     media_tx: broadcast::Sender<VideoFrame>,
+    audio_tx: broadcast::Sender<AudioFrame>,
     codec: RwLock<CodecState>,
     codec_ready: Notify,
     shutdown: Notify,
@@ -176,14 +208,17 @@ struct RtspServerInner {
     next_ssrc: AtomicU32,
     video_access_units_published: AtomicU64,
     video_access_units_sent: AtomicU64,
+    audio_frames_published: AtomicU64,
+    audio_frames_sent: AtomicU64,
 }
 
 /// Multi-client camera-local RTSP server.
 ///
 /// The server never reads the sensor itself. The media engine owns capture and
 /// encoding; callers publish complete Annex-B access units with
-/// [`RtspServer::push_video_frame`]. Each client receives an independent RTP
-/// sequence space and packetizer, so a slow client cannot stall another one.
+/// [`RtspServer::push_video_frame`] and validated PCMA frames with
+/// [`RtspServer::push_audio_frame`]. Each client receives independent RTP
+/// sequence spaces and packetizers, so a slow client cannot stall another one.
 pub struct RtspServer {
     inner: Arc<RtspServerInner>,
     handles: Arc<AtomicUsize>,
@@ -227,11 +262,14 @@ impl RtspServer {
         })?;
 
         let (media_tx, _) = broadcast::channel(MEDIA_BUS_CAPACITY);
+        let (audio_tx, _) = broadcast::channel(MEDIA_BUS_CAPACITY);
         let inner = Arc::new(RtspServerInner {
             path,
             video_width: config.video_width,
             video_height: config.video_height,
+            audio_enabled: config.audio_enabled,
             media_tx,
+            audio_tx,
             codec: RwLock::new(CodecState::default()),
             codec_ready: Notify::new(),
             shutdown: Notify::new(),
@@ -239,6 +277,8 @@ impl RtspServer {
             next_ssrc: AtomicU32::new(FIRST_RTP_SSRC),
             video_access_units_published: AtomicU64::new(0),
             video_access_units_sent: AtomicU64::new(0),
+            audio_frames_published: AtomicU64::new(0),
+            audio_frames_sent: AtomicU64::new(0),
         });
         let handles = Arc::new(AtomicUsize::new(1));
         let accept_inner = Arc::clone(&inner);
@@ -320,10 +360,73 @@ impl RtspServer {
         )
     }
 
+    /// Publish one 20 ms block of G.711 A-law microphone samples.
+    pub fn push_audio_frame(&self, pcma: &[u8], timestamp_us: Option<u64>) -> io::Result<()> {
+        if !self.inner.audio_enabled {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "RTSP audio track is disabled",
+            ));
+        }
+        if pcma.len() != AUDIO_FRAME_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "PCMA frame has {} samples; expected {AUDIO_FRAME_LEN}",
+                    pcma.len()
+                ),
+            ));
+        }
+
+        let frame = AudioFrame {
+            data: Arc::<[u8]>::from(pcma.to_vec()),
+            timestamp_us,
+        };
+        self.inner
+            .audio_frames_published
+            .fetch_add(1, Ordering::Relaxed);
+        let _ = self.inner.audio_tx.send(frame);
+        Ok(())
+    }
+
+    /// Publish one or more native PCMA frames from the camera-local media ABI.
+    pub fn push_audio_record(&self, record: &MediaRecord) -> io::Result<()> {
+        if record.kind != RecordKind::AUDIO_CAPTURE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "media record is not an audio-capture record",
+            ));
+        }
+        if record.payload.is_empty()
+            || record.payload.len() > MAX_AUDIO_RECORD_LEN
+            || !record.payload.len().is_multiple_of(AUDIO_FRAME_LEN)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "audio record payload must contain 20 ms PCMA frames and be at most {MAX_AUDIO_RECORD_LEN} bytes"
+                ),
+            ));
+        }
+
+        for (index, frame) in record.payload.chunks(AUDIO_FRAME_LEN).enumerate() {
+            let timestamp_us = record
+                .timestamp_us
+                .saturating_add((index as u64).saturating_mul(AUDIO_FRAME_DURATION_US));
+            self.push_audio_frame(frame, Some(timestamp_us))?;
+        }
+        Ok(())
+    }
+
     /// Return the current SDP once the encoder's parameter sets are known.
     pub fn sdp(&self) -> Option<String> {
         let codec = self.inner.codec.read().ok()?.clone();
-        build_sdp(&codec, self.inner.video_width, self.inner.video_height)
+        build_sdp(
+            &codec,
+            self.inner.video_width,
+            self.inner.video_height,
+            self.inner.audio_enabled,
+        )
     }
 
     pub fn video_codec(&self) -> Option<VideoCodec> {
@@ -337,6 +440,8 @@ impl RtspServer {
                 .video_access_units_published
                 .load(Ordering::Relaxed),
             video_access_units_sent: self.inner.video_access_units_sent.load(Ordering::Relaxed),
+            audio_frames_published: self.inner.audio_frames_published.load(Ordering::Relaxed),
+            audio_frames_sent: self.inner.audio_frames_sent.load(Ordering::Relaxed),
         }
     }
 }
@@ -367,14 +472,25 @@ async fn accept_loop(listener: TcpListener, inner: Arc<RtspServerInner>) {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MediaTrack {
+    Video,
+    Audio,
+}
+
 struct ClientState {
     video_channel: Option<u8>,
+    audio_channel: Option<u8>,
     media_task: Option<JoinHandle<()>>,
+    audio_task: Option<JoinHandle<()>>,
 }
 
 impl ClientState {
     fn stop_media(&mut self) {
         if let Some(task) = self.media_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.audio_task.take() {
             task.abort();
         }
     }
@@ -387,7 +503,9 @@ async fn handle_connection(stream: TcpStream, inner: Arc<RtspServerInner>) -> io
     let mut session = ServerSession::new().with_session_seed(session_seed);
     let mut state = ClientState {
         video_channel: None,
+        audio_channel: None,
         media_task: None,
+        audio_task: None,
     };
     let mut buffer = Vec::new();
 
@@ -419,7 +537,7 @@ async fn handle_request(
         send_error(writer, &request.parsed, StatusCode::NotImplemented).await?;
         return Ok(false);
     }
-    if !request_path_allowed(&request.parsed, &method, &inner.path) {
+    if !request_path_allowed(&request.parsed, &method, &inner.path, inner.audio_enabled) {
         send_error(writer, &request.parsed, StatusCode::NotFound).await?;
         return Ok(false);
     }
@@ -429,8 +547,12 @@ async fn handle_request(
     }
 
     let setup = if method == Method::Setup {
+        let Some(track) = setup_track(&request.parsed, &inner.path, inner.audio_enabled) else {
+            send_error(writer, &request.parsed, StatusCode::NotFound).await?;
+            return Ok(false);
+        };
         match parse_setup_transport(&request.parsed) {
-            Ok(setup) => Some(setup),
+            Ok((channel, transport)) => Some((track, channel, transport)),
             Err(()) => {
                 send_error(writer, &request.parsed, StatusCode::UnsupportedTransport).await?;
                 return Ok(false);
@@ -464,7 +586,7 @@ async fn handle_request(
         &method,
         &request.parsed,
         sdp.as_deref(),
-        setup.as_ref().map(|(_, transport)| transport.as_str()),
+        setup.as_ref().map(|(_, _, transport)| transport.as_str()),
     )?;
     {
         let mut writer = writer.lock().await;
@@ -480,26 +602,37 @@ async fn handle_request(
 
     match method {
         Method::Setup => {
-            if let Some((channel, _)) = setup {
-                state.video_channel = Some(channel);
+            if let Some((track, channel, _)) = setup {
+                match track {
+                    MediaTrack::Video => state.video_channel = Some(channel),
+                    MediaTrack::Audio => state.audio_channel = Some(channel),
+                }
             }
         }
         Method::Play => {
             state.stop_media();
-            let Some(channel) = state.video_channel else {
-                return Ok(false);
-            };
-            let receiver = inner.media_tx.subscribe();
-            let media_inner = Arc::clone(inner);
-            let media_writer = Arc::clone(writer);
-            state.media_task = Some(tokio::spawn(async move {
-                media_loop(media_inner, media_writer, channel, receiver).await;
-            }));
+            if let Some(channel) = state.video_channel {
+                let receiver = inner.media_tx.subscribe();
+                let media_inner = Arc::clone(inner);
+                let media_writer = Arc::clone(writer);
+                state.media_task = Some(tokio::spawn(async move {
+                    media_loop(media_inner, media_writer, channel, receiver).await;
+                }));
+            }
+            if let Some(channel) = state.audio_channel {
+                let receiver = inner.audio_tx.subscribe();
+                let media_inner = Arc::clone(inner);
+                let media_writer = Arc::clone(writer);
+                state.audio_task = Some(tokio::spawn(async move {
+                    audio_media_loop(media_inner, media_writer, channel, receiver).await;
+                }));
+            }
         }
         Method::Pause => state.stop_media(),
         Method::Teardown => {
             state.stop_media();
             state.video_channel = None;
+            state.audio_channel = None;
             return Ok(true);
         }
         _ => {}
@@ -586,6 +719,76 @@ async fn media_loop(
         inner
             .video_access_units_sent
             .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+struct AudioPacketizer {
+    sequence: u16,
+    timestamp_value: u32,
+    timestamp_base: u32,
+    source_base_us: Option<u64>,
+    last_source_us: Option<u64>,
+    ssrc: u32,
+}
+
+impl AudioPacketizer {
+    fn new(ssrc: u32) -> Self {
+        Self {
+            sequence: 0,
+            timestamp_value: 0,
+            timestamp_base: 0,
+            source_base_us: None,
+            last_source_us: None,
+            ssrc,
+        }
+    }
+
+    fn packetize(&mut self, frame: &AudioFrame) -> Vec<u8> {
+        let sequence = self.sequence;
+        self.sequence = self.sequence.wrapping_add(1);
+        let timestamp = timestamp_from_source_at_rate(
+            &mut self.timestamp_value,
+            &mut self.timestamp_base,
+            &mut self.source_base_us,
+            &mut self.last_source_us,
+            frame.timestamp_us,
+            RTP_AUDIO_CLOCK_RATE,
+            RTP_AUDIO_TIMESTAMP_INCREMENT,
+        );
+        rtp_packet(
+            RTP_AUDIO_PAYLOAD_TYPE,
+            false,
+            sequence,
+            timestamp,
+            self.ssrc,
+            &frame.data,
+        )
+    }
+}
+
+async fn audio_media_loop(
+    inner: Arc<RtspServerInner>,
+    writer: Arc<Mutex<OwnedWriteHalf>>,
+    channel: u8,
+    mut receiver: broadcast::Receiver<AudioFrame>,
+) {
+    let ssrc = inner.next_ssrc.fetch_add(1, Ordering::Relaxed);
+    let mut packetizer = AudioPacketizer::new(ssrc);
+
+    loop {
+        let frame = tokio::select! {
+            _ = inner.shutdown.notified() => break,
+            received = receiver.recv() => match received {
+                Ok(frame) => frame,
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            },
+        };
+        let packet = packetizer.packetize(&frame);
+        if write_interleaved(&writer, channel, &packet).await.is_err() {
+            break;
+        }
+        inner.audio_frames_sent.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -698,12 +901,26 @@ fn request_path(request: &Request<Vec<u8>>) -> Option<&str> {
     request.request_uri().map(|uri| uri_path(uri.as_str()))
 }
 
-fn request_path_allowed(request: &Request<Vec<u8>>, method: &Method, path: &str) -> bool {
+fn setup_track(request: &Request<Vec<u8>>, path: &str, audio_enabled: bool) -> Option<MediaTrack> {
+    let value = request_path(request)?;
+    if value == format!("{path}/trackID=0") {
+        Some(MediaTrack::Video)
+    } else if audio_enabled && value == format!("{path}/trackID=1") {
+        Some(MediaTrack::Audio)
+    } else {
+        None
+    }
+}
+
+fn request_path_allowed(
+    request: &Request<Vec<u8>>,
+    method: &Method,
+    path: &str,
+    audio_enabled: bool,
+) -> bool {
     match method {
         Method::Describe => request_path(request) == Some(path),
-        Method::Setup => {
-            request_path(request).is_some_and(|value| value == format!("{path}/trackID=0"))
-        }
+        Method::Setup => setup_track(request, path, audio_enabled).is_some(),
         _ => true,
     }
 }
@@ -860,10 +1077,15 @@ fn content_base(uri: &rtsp_types::Url) -> String {
 
 fn build_sdp_from_inner(inner: &RtspServerInner) -> Option<String> {
     let codec = inner.codec.read().ok()?.clone();
-    build_sdp(&codec, inner.video_width, inner.video_height)
+    build_sdp(
+        &codec,
+        inner.video_width,
+        inner.video_height,
+        inner.audio_enabled,
+    )
 }
 
-fn build_sdp(codec: &CodecState, width: u32, height: u32) -> Option<String> {
+fn build_sdp(codec: &CodecState, width: u32, height: u32, audio_enabled: bool) -> Option<String> {
     if !codec.has_parameters() {
         return None;
     }
@@ -914,6 +1136,14 @@ fn build_sdp(codec: &CodecState, width: u32, height: u32) -> Option<String> {
         }
     }
     sdp.push_str("a=control:trackID=0\r\na=sendonly\r\n");
+    if audio_enabled {
+        sdp.push_str(&format!(
+            "m=audio 0 RTP/AVP {RTP_AUDIO_PAYLOAD_TYPE}\r\n\
+             a=rtpmap:{RTP_AUDIO_PAYLOAD_TYPE} PCMA/{RTP_AUDIO_CLOCK_RATE}/1\r\n\
+             a=ptime:20\r\n\
+             a=control:trackID=1\r\n"
+        ));
+    }
     Some(sdp)
 }
 
@@ -1246,9 +1476,29 @@ fn timestamp_from_source(
     last_source_us: &mut Option<u64>,
     source_us: Option<u64>,
 ) -> u32 {
+    timestamp_from_source_at_rate(
+        current,
+        base_rtp,
+        source_base_us,
+        last_source_us,
+        source_us,
+        RTP_VIDEO_CLOCK_RATE,
+        RTP_VIDEO_TIMESTAMP_INCREMENT,
+    )
+}
+
+fn timestamp_from_source_at_rate(
+    current: &mut u32,
+    base_rtp: &mut u32,
+    source_base_us: &mut Option<u64>,
+    last_source_us: &mut Option<u64>,
+    source_us: Option<u64>,
+    clock_rate: u32,
+    fallback_increment: u32,
+) -> u32 {
     let Some(source_us) = source_us else {
         let timestamp = *current;
-        *current = current.wrapping_add(RTP_VIDEO_TIMESTAMP_INCREMENT);
+        *current = current.wrapping_add(fallback_increment);
         return timestamp;
     };
 
@@ -1259,7 +1509,11 @@ fn timestamp_from_source(
     *last_source_us = Some(monotonic_source);
     let base = *source_base_us.get_or_insert(monotonic_source);
     let elapsed = monotonic_source.saturating_sub(base);
-    let ticks = elapsed / 100 * 9 + (elapsed % 100) * 9 / 100;
+    let seconds = elapsed / 1_000_000;
+    let remainder = elapsed % 1_000_000;
+    let ticks = seconds
+        .saturating_mul(u64::from(clock_rate))
+        .saturating_add(remainder.saturating_mul(u64::from(clock_rate)) / 1_000_000);
     let mut timestamp = base_rtp.wrapping_add(ticks as u32);
     if previous.is_some() && timestamp <= *current {
         timestamp = current.wrapping_add(1);
@@ -1405,24 +1659,136 @@ mod tests {
     }
 
     #[test]
+    fn pcma_packetizer_uses_8khz_rtp_timestamps() {
+        let mut packetizer = AudioPacketizer::new(0x1234_5678);
+        let first = AudioFrame {
+            data: Arc::<[u8]>::from(vec![0xaa; AUDIO_FRAME_LEN]),
+            timestamp_us: Some(1_000_000),
+        };
+        let second = AudioFrame {
+            data: Arc::<[u8]>::from(vec![0xbb; AUDIO_FRAME_LEN]),
+            timestamp_us: Some(1_020_000),
+        };
+
+        let first_packet = packetizer.packetize(&first);
+        let second_packet = packetizer.packetize(&second);
+
+        assert_eq!(first_packet.len(), 12 + AUDIO_FRAME_LEN);
+        assert_eq!(first_packet[1], RTP_AUDIO_PAYLOAD_TYPE);
+        assert_eq!(u16::from_be_bytes([first_packet[2], first_packet[3]]), 0);
+        assert_eq!(
+            u32::from_be_bytes(first_packet[4..8].try_into().unwrap()),
+            0
+        );
+        assert_eq!(
+            u32::from_be_bytes(second_packet[4..8].try_into().unwrap()),
+            160
+        );
+        assert_eq!(&first_packet[12..], &[0xaa; AUDIO_FRAME_LEN]);
+    }
+
+    #[test]
     fn sdp_includes_codec_parameter_sets() {
-        let config = RtspServerConfig::new(SocketAddr::V4(SocketAddrV4::new(
+        let mut config = RtspServerConfig::new(SocketAddr::V4(SocketAddrV4::new(
             Ipv4Addr::LOCALHOST,
             DEFAULT_RTSP_PORT,
         )));
+        config.audio_enabled = true;
         let state = CodecState {
             codec: VideoCodec::H264,
             sps: Some(vec![0x67, 0x42, 0x00, 0x1f]),
             pps: Some(vec![0x68, 0xce, 0x06, 0xe2]),
             ..CodecState::default()
         };
-        let sdp = build_sdp(&state, config.video_width, config.video_height)
-            .expect("complete parameter sets should produce SDP");
+        let sdp = build_sdp(
+            &state,
+            config.video_width,
+            config.video_height,
+            config.audio_enabled,
+        )
+        .expect("complete parameter sets should produce SDP");
 
         assert!(sdp.contains("m=video 0 RTP/AVP 96\r\n"));
         assert!(sdp.contains("a=rtpmap:96 H264/90000\r\n"));
         assert!(sdp.contains("sprop-parameter-sets="));
         assert!(sdp.contains("a=control:trackID=0\r\n"));
+        assert!(sdp.contains("a=rtpmap:8 PCMA/8000/1\r\n"));
+        assert!(sdp.contains("a=control:trackID=1\r\n"));
+    }
+
+    #[tokio::test]
+    async fn rtsp_audio_setup_and_play_uses_negotiated_channel() {
+        let mut config =
+            RtspServerConfig::new(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)));
+        config.audio_enabled = true;
+        let server = RtspServer::start(config).expect("RTSP server should start");
+        server
+            .push_video_frame(
+                &h264_parameter_frame(),
+                true,
+                VideoCodec::H264,
+                Some(1_000_000),
+            )
+            .expect("video parameters should publish");
+
+        let mut socket = tokio::net::TcpStream::connect(server.local_addr())
+            .await
+            .expect("client should connect");
+        socket
+            .write_all(b"DESCRIBE rtsp://127.0.0.1/live RTSP/1.0\r\nCSeq: 1\r\n\r\n")
+            .await
+            .expect("DESCRIBE should write");
+        assert!(
+            read_response(&mut socket)
+                .await
+                .starts_with("RTSP/1.0 200 OK")
+        );
+
+        socket
+            .write_all(b"SETUP rtsp://127.0.0.1/live/trackID=1 RTSP/1.0\r\nCSeq: 2\r\nTransport: RTP/AVP/TCP;unicast;interleaved=6-7\r\n\r\n")
+            .await
+            .expect("audio SETUP should write");
+        let response = read_response(&mut socket).await;
+        assert!(response.starts_with("RTSP/1.0 200 OK"));
+        let session = response
+            .lines()
+            .find_map(|line| line.strip_prefix("Session: "))
+            .expect("audio SETUP should return a session")
+            .to_string();
+
+        let play =
+            format!("PLAY rtsp://127.0.0.1/live RTSP/1.0\r\nCSeq: 3\r\nSession: {session}\r\n\r\n");
+        socket
+            .write_all(play.as_bytes())
+            .await
+            .expect("PLAY should write");
+        assert!(
+            read_response(&mut socket)
+                .await
+                .starts_with("RTSP/1.0 200 OK")
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        server
+            .push_audio_frame(&[0x55; AUDIO_FRAME_LEN], Some(1_000_000))
+            .expect("audio frame should publish after PLAY");
+        let mut interleaved_header = [0_u8; 4];
+        socket
+            .read_exact(&mut interleaved_header)
+            .await
+            .expect("PLAY should receive audio RTP");
+        assert_eq!(interleaved_header[0], b'$');
+        assert_eq!(interleaved_header[1], 6);
+        let payload_len =
+            u16::from_be_bytes([interleaved_header[2], interleaved_header[3]]) as usize;
+        assert_eq!(payload_len, 12 + AUDIO_FRAME_LEN);
+        let mut packet = vec![0_u8; payload_len];
+        socket
+            .read_exact(&mut packet)
+            .await
+            .expect("audio RTP packet should be complete");
+        assert_eq!(packet[1], RTP_AUDIO_PAYLOAD_TYPE);
+        assert_eq!(&packet[12..], &[0x55; AUDIO_FRAME_LEN]);
     }
 
     #[tokio::test]

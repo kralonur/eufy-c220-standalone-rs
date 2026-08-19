@@ -12,6 +12,7 @@ use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -51,6 +52,15 @@ const SIGKILL: i32 = 9;
 /// POSIX error returned when a process no longer exists.
 const ESRCH: i32 = 3;
 
+/// Maximum raw PCM16 payload accepted by the native speaker path.
+const MAX_SPEAKER_PCM_PAYLOAD: usize = 64 * 1024;
+
+/// Maximum AAC payload accepted by the native decoder path.
+const MAX_SPEAKER_AAC_PAYLOAD: usize = 48 * 1024;
+
+/// Maximum volume accepted by the native AO implementation.
+const MAX_SPEAKER_VOLUME: u32 = 100;
+
 /// Configuration for the camera-local media companion.
 #[derive(Clone, Debug)]
 pub struct MediaEngineConfig {
@@ -87,6 +97,18 @@ impl Default for MediaEngineConfig {
 pub struct MediaEngine {
     child: Child,
     socket: UnixStream,
+    commands: MediaEngineHandle,
+}
+
+/// Thread-safe writer for commands sent to the media companion.
+///
+/// The companion's Unix socket is full duplex: its reader emits capture records
+/// while its writer accepts speaker and camera-control records. All command
+/// writes share one lock so a control request cannot interleave its header or
+/// payload with a talkback frame.
+#[derive(Clone)]
+pub struct MediaEngineHandle {
+    socket: Arc<Mutex<UnixStream>>,
 }
 
 impl MediaEngine {
@@ -108,7 +130,22 @@ impl MediaEngine {
             }
         };
 
-        Ok(Self { child, socket })
+        let command_socket = match socket.try_clone() {
+            Ok(command_socket) => command_socket,
+            Err(error) => {
+                let _ = socket.shutdown(Shutdown::Both);
+                let _ = terminate_child(&mut child);
+                return Err(error);
+            }
+        };
+
+        Ok(Self {
+            child,
+            socket,
+            commands: MediaEngineHandle {
+                socket: Arc::new(Mutex::new(command_socket)),
+            },
+        })
     }
 
     /// Read the next record emitted by the companion.
@@ -116,20 +153,19 @@ impl MediaEngine {
         MediaRecord::read_from(&mut self.socket)
     }
 
+    /// Return the command writer used by control and talkback services.
+    pub fn command_handle(&self) -> MediaEngineHandle {
+        self.commands.clone()
+    }
+
     /// Send one command record to the companion.
     pub fn write_record(&mut self, record: &MediaRecord) -> io::Result<()> {
-        record.write_to(&mut self.socket)
+        self.commands.write_record(record)
     }
 
     /// Request the camera speaker to discard queued playback.
     pub fn clear_speaker(&mut self) -> io::Result<()> {
-        self.write_record(&MediaRecord {
-            kind: RecordKind::SPEAKER_CLEAR,
-            codec: 0,
-            keyframe: false,
-            timestamp_us: 0,
-            payload: Vec::new(),
-        })
+        self.commands.clear_speaker()
     }
 
     /// Stop the companion and reap it before returning.
@@ -148,6 +184,100 @@ impl MediaEngine {
 impl Drop for MediaEngine {
     fn drop(&mut self) {
         let _ = self.shutdown();
+    }
+}
+
+impl MediaEngineHandle {
+    /// Send one command record to the companion.
+    pub fn write_record(&self, record: &MediaRecord) -> io::Result<()> {
+        let mut socket = self
+            .socket
+            .lock()
+            .map_err(|_| io::Error::other("media command socket lock poisoned"))?;
+        record.write_to(&mut *socket)
+    }
+
+    /// Request the camera speaker to discard queued playback.
+    pub fn clear_speaker(&self) -> io::Result<()> {
+        self.write_record(&MediaRecord {
+            kind: RecordKind::SPEAKER_CLEAR,
+            codec: 0,
+            keyframe: false,
+            timestamp_us: 0,
+            payload: Vec::new(),
+        })
+    }
+
+    /// Send signed little-endian PCM16 samples to the native speaker path.
+    pub fn send_speaker_pcm(&self, pcm: &[u8], timestamp_us: u64) -> io::Result<()> {
+        if pcm.is_empty() || pcm.len() > MAX_SPEAKER_PCM_PAYLOAD || !pcm.len().is_multiple_of(2) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "speaker PCM must be non-empty, even-sized, and at most {MAX_SPEAKER_PCM_PAYLOAD} bytes"
+                ),
+            ));
+        }
+        self.write_record(&MediaRecord {
+            kind: RecordKind::SPEAKER_PCM,
+            codec: 0,
+            keyframe: true,
+            timestamp_us,
+            payload: pcm.to_vec(),
+        })
+    }
+
+    /// Send one native AAC access unit to the speaker decoder.
+    pub fn send_speaker_aac(&self, aac: &[u8], timestamp_us: u64) -> io::Result<()> {
+        if aac.is_empty() || aac.len() > MAX_SPEAKER_AAC_PAYLOAD {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "speaker AAC must be non-empty and at most {MAX_SPEAKER_AAC_PAYLOAD} bytes"
+                ),
+            ));
+        }
+        self.write_record(&MediaRecord {
+            kind: RecordKind::SPEAKER_PCM,
+            codec: 0,
+            keyframe: false,
+            timestamp_us,
+            payload: aac.to_vec(),
+        })
+    }
+
+    /// Set the native AO volume in its validated 0..=100 range.
+    pub fn set_speaker_volume(&self, volume: u32) -> io::Result<()> {
+        if volume > MAX_SPEAKER_VOLUME {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("speaker volume {volume} exceeds {MAX_SPEAKER_VOLUME}"),
+            ));
+        }
+        self.write_record(&MediaRecord {
+            kind: RecordKind::SPEAKER_VOLUME,
+            codec: 0,
+            keyframe: false,
+            timestamp_us: 0,
+            payload: volume.to_le_bytes().to_vec(),
+        })
+    }
+
+    /// Set the native night-mode target: 0=auto, 1=night, 2=day.
+    pub fn set_night_mode(&self, mode: u8) -> io::Result<()> {
+        if mode > 2 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("night mode {mode} is not one of auto/night/day"),
+            ));
+        }
+        self.write_record(&MediaRecord {
+            kind: RecordKind::NIGHT_MODE,
+            codec: 0,
+            keyframe: false,
+            timestamp_us: 0,
+            payload: vec![mode],
+        })
     }
 }
 
@@ -258,5 +388,75 @@ mod tests {
         assert_eq!(config.video_device, Path::new(DEFAULT_VIDEO_DEVICE));
         assert_eq!(config.audio_card, DEFAULT_AUDIO_CARD);
         assert_eq!(config.iq_directory, Path::new(DEFAULT_IQ_DIRECTORY));
+    }
+
+    #[test]
+    fn command_handle_frames_speaker_controls_without_interleaving() {
+        let (mut companion, daemon) = UnixStream::pair().expect("Unix pair should create");
+        let handle = MediaEngineHandle {
+            socket: Arc::new(Mutex::new(daemon)),
+        };
+
+        handle
+            .send_speaker_pcm(&[1, 2], 7)
+            .expect("PCM command should write");
+        handle
+            .send_speaker_aac(&[3, 4], 9)
+            .expect("AAC command should write");
+        handle
+            .set_speaker_volume(42)
+            .expect("volume command should write");
+        handle
+            .set_night_mode(1)
+            .expect("night-mode command should write");
+        handle.clear_speaker().expect("clear command should write");
+
+        assert_eq!(
+            MediaRecord::read_from(&mut companion)
+                .expect("PCM command should read")
+                .expect("PCM command should be present"),
+            MediaRecord {
+                kind: RecordKind::SPEAKER_PCM,
+                codec: 0,
+                keyframe: true,
+                timestamp_us: 7,
+                payload: vec![1, 2],
+            }
+        );
+        assert_eq!(
+            MediaRecord::read_from(&mut companion)
+                .expect("AAC command should read")
+                .expect("AAC command should be present"),
+            MediaRecord {
+                kind: RecordKind::SPEAKER_PCM,
+                codec: 0,
+                keyframe: false,
+                timestamp_us: 9,
+                payload: vec![3, 4],
+            }
+        );
+        assert_eq!(
+            MediaRecord::read_from(&mut companion)
+                .expect("volume command should read")
+                .expect("volume command should be present")
+                .payload,
+            42_u32.to_le_bytes().to_vec()
+        );
+        assert_eq!(
+            MediaRecord::read_from(&mut companion)
+                .expect("night-mode command should read")
+                .expect("night-mode command should be present")
+                .payload,
+            vec![1]
+        );
+        assert_eq!(
+            MediaRecord::read_from(&mut companion)
+                .expect("clear command should read")
+                .expect("clear command should be present")
+                .kind,
+            RecordKind::SPEAKER_CLEAR
+        );
+        assert!(handle.set_speaker_volume(101).is_err());
+        assert!(handle.set_night_mode(3).is_err());
     }
 }

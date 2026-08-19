@@ -1,5 +1,6 @@
 use std::error::Error;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -16,6 +17,12 @@ const DEFAULT_RTSP_BIND_ADDRESS: &str = "0.0.0.0:554";
 
 /// Environment override for development and board-specific port selection.
 const RTSP_BIND_ADDRESS_ENV: &str = "RTSP_BIND_ADDRESS";
+
+/// Explicit audio enable override used during board bring-up.
+const STANDALONE_AUDIO_ENV: &str = "STANDALONE_AUDIO";
+
+/// Persistent marker that opts deployed camera boots into microphone RTSP.
+const STANDALONE_AUDIO_MARKER: &str = "/home/nvram/system/.standalone_audio_enable";
 
 fn main() {
     initialize_logging();
@@ -46,8 +53,16 @@ async fn run_firmware() -> Result<(), Box<dyn Error + Send + Sync>> {
     let bind_address = std::env::var(RTSP_BIND_ADDRESS_ENV)
         .unwrap_or_else(|_| DEFAULT_RTSP_BIND_ADDRESS.to_string())
         .parse::<SocketAddr>()?;
-    let rtsp = RtspServer::start(RtspServerConfig::new(bind_address))?;
-    tracing::info!(address = %rtsp.local_addr(), path = rtsp.path(), "RTSP service listening");
+    let mut rtsp_config = RtspServerConfig::new(bind_address);
+    let audio_enabled = audio_enabled();
+    rtsp_config.audio_enabled = audio_enabled;
+    let rtsp = RtspServer::start(rtsp_config)?;
+    tracing::info!(
+        address = %rtsp.local_addr(),
+        path = rtsp.path(),
+        audio_enabled,
+        "RTSP service listening"
+    );
 
     let stop = Arc::new(AtomicBool::new(false));
     let media_stop = Arc::clone(&stop);
@@ -81,6 +96,16 @@ async fn run_firmware() -> Result<(), Box<dyn Error + Send + Sync>> {
     Ok(())
 }
 
+fn audio_enabled() -> bool {
+    if let Ok(value) = std::env::var(STANDALONE_AUDIO_ENV) {
+        return matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        );
+    }
+    Path::new(STANDALONE_AUDIO_MARKER).is_file()
+}
+
 fn run_media_loop(
     rtsp: RtspServer,
     config: MediaEngineConfig,
@@ -89,8 +114,11 @@ fn run_media_loop(
     let mut engine = MediaEngine::start(config)?;
     while !stop.load(Ordering::Acquire) {
         match engine.read_record()? {
-            Some(record) if record.kind == RecordKind::Video => {
+            Some(record) if record.kind.is_video() => {
                 rtsp.push_video_record(&record)?;
+            }
+            Some(record) if record.kind == RecordKind::AudioCapture => {
+                rtsp.push_audio_record(&record)?;
             }
             Some(_) => {}
             None => break,

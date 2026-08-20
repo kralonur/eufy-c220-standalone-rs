@@ -6,7 +6,7 @@
 //! socket. Authentication and TLS belong to a later deployment module.
 
 use crate::media_engine::MediaEngineHandle;
-use crate::motor::{HardwareMotor, PAN_MAX_DEGREES, PtzDirection};
+use crate::ptz::{PAN_MAX_DEGREES, PtzController, PtzDirection};
 use std::io;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -101,7 +101,7 @@ impl ControlServer {
     pub fn start(
         config: ControlServerConfig,
         media: MediaEngineSlot,
-        motor: Option<Arc<HardwareMotor>>,
+        ptz: Option<Arc<PtzController>>,
     ) -> io::Result<Self> {
         let listener = StdTcpListener::bind(config.bind_address)?;
         listener.set_nonblocking(true)?;
@@ -112,12 +112,12 @@ impl ControlServer {
         })?;
         let inner = Arc::new(ControlInner {
             media,
-            motor,
+            ptz,
             active: AtomicBool::new(false),
             next_timestamp_us: AtomicU64::new(0),
             volume: AtomicU32::new(DEFAULT_VOLUME),
             command_lock: Mutex::new(()),
-            motor_lock: Mutex::new(()),
+            ptz_lock: Mutex::new(()),
             shutdown: Notify::new(),
         });
         let accept_inner = Arc::clone(&inner);
@@ -140,12 +140,12 @@ impl Drop for ControlServer {
 
 struct ControlInner {
     media: MediaEngineSlot,
-    motor: Option<Arc<HardwareMotor>>,
+    ptz: Option<Arc<PtzController>>,
     active: AtomicBool,
     next_timestamp_us: AtomicU64,
     volume: AtomicU32,
     command_lock: Mutex<()>,
-    motor_lock: Mutex<()>,
+    ptz_lock: Mutex<()>,
     shutdown: Notify,
 }
 
@@ -418,13 +418,13 @@ async fn night_mode(inner: &Arc<ControlInner>, body: &[u8]) -> Vec<u8> {
 }
 
 async fn ptz_position(inner: &Arc<ControlInner>) -> Vec<u8> {
-    match send_motor(inner, |motor| motor.position()).await {
+    match send_ptz(inner, |ptz| ptz.position()).await {
         Ok((pan, tilt)) => json_response(
             200,
             "OK",
             &format!(r#"{{"status":"ok","pan":{pan},"tilt":{tilt}}}"#),
         ),
-        Err(error) => motor_error_response(error),
+        Err(error) => ptz_error_response(error),
     }
 }
 
@@ -447,14 +447,14 @@ async fn ptz_move(inner: &Arc<ControlInner>, body: &[u8]) -> Vec<u8> {
         Err(error) => return error_response(400, &error),
     };
 
-    let operation = move |motor: &HardwareMotor| {
+    let operation = move |ptz: &PtzController| {
         if direction == PtzDirection::Stop {
-            motor.stop()
+            ptz.stop()
         } else {
-            motor.move_step(direction, degrees, speed)
+            ptz.move_step(direction, degrees, speed)
         }
     };
-    match send_motor(inner, operation).await {
+    match send_ptz(inner, operation).await {
         Ok(()) => json_response(
             200,
             "OK",
@@ -462,21 +462,21 @@ async fn ptz_move(inner: &Arc<ControlInner>, body: &[u8]) -> Vec<u8> {
                 r#"{{"status":"ok","direction":"{direction}","degrees":{degrees},"speed":{speed}}}"#
             ),
         ),
-        Err(error) => motor_error_response(error),
+        Err(error) => ptz_error_response(error),
     }
 }
 
 async fn ptz_stop(inner: &Arc<ControlInner>) -> Vec<u8> {
-    match send_motor(inner, |motor| motor.stop()).await {
+    match send_ptz(inner, |ptz| ptz.stop()).await {
         Ok(()) => json_response(200, "OK", r#"{"status":"ok"}"#),
-        Err(error) => motor_error_response(error),
+        Err(error) => ptz_error_response(error),
     }
 }
 
 async fn ptz_center(inner: &Arc<ControlInner>) -> Vec<u8> {
-    match send_motor(inner, |motor| {
-        motor.center(5)?;
-        motor.position()
+    match send_ptz(inner, |ptz| {
+        ptz.center(5)?;
+        ptz.position()
     })
     .await
     {
@@ -485,7 +485,7 @@ async fn ptz_center(inner: &Arc<ControlInner>) -> Vec<u8> {
             "OK",
             &format!(r#"{{"status":"ok","pan":{pan},"tilt":{tilt}}}"#),
         ),
-        Err(error) => motor_error_response(error),
+        Err(error) => ptz_error_response(error),
     }
 }
 
@@ -535,42 +535,42 @@ where
     .map_err(|error| CommandFailure::Unavailable(format!("command worker failed: {error}")))?
 }
 
-async fn send_motor<F, T>(inner: &Arc<ControlInner>, operation: F) -> Result<T, MotorFailure>
+async fn send_ptz<F, T>(inner: &Arc<ControlInner>, operation: F) -> Result<T, PtzFailure>
 where
-    F: FnOnce(&HardwareMotor) -> io::Result<T> + Send + 'static,
+    F: FnOnce(&PtzController) -> io::Result<T> + Send + 'static,
     T: Send + 'static,
 {
-    let motor = inner
-        .motor
+    let ptz = inner
+        .ptz
         .clone()
-        .ok_or_else(|| MotorFailure::Unavailable("PTZ motor is not available".to_string()))?;
-    let motor_inner = Arc::clone(inner);
+        .ok_or_else(|| PtzFailure::Unavailable("PTZ controller is not available".to_string()))?;
+    let ptz_inner = Arc::clone(inner);
     tokio::task::spawn_blocking(move || {
-        let _lock = motor_inner
-            .motor_lock
+        let _lock = ptz_inner
+            .ptz_lock
             .lock()
-            .map_err(|_| MotorFailure::Unavailable("PTZ motor lock poisoned".to_string()))?;
-        operation(&motor).map_err(|error| match error.kind() {
+            .map_err(|_| PtzFailure::Unavailable("PTZ lock poisoned".to_string()))?;
+        operation(&ptz).map_err(|error| match error.kind() {
             io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData => {
-                MotorFailure::Rejected(error.to_string())
+                PtzFailure::Rejected(error.to_string())
             }
-            _ => MotorFailure::Unavailable(error.to_string()),
+            _ => PtzFailure::Unavailable(error.to_string()),
         })
     })
     .await
-    .map_err(|error| MotorFailure::Unavailable(format!("PTZ worker failed: {error}")))?
+    .map_err(|error| PtzFailure::Unavailable(format!("PTZ worker failed: {error}")))?
 }
 
 #[derive(Debug)]
-enum MotorFailure {
+enum PtzFailure {
     Rejected(String),
     Unavailable(String),
 }
 
-fn motor_error_response(error: MotorFailure) -> Vec<u8> {
+fn ptz_error_response(error: PtzFailure) -> Vec<u8> {
     match error {
-        MotorFailure::Rejected(message) => error_response(400, &message),
-        MotorFailure::Unavailable(message) => error_response(503, &message),
+        PtzFailure::Rejected(message) => error_response(400, &message),
+        PtzFailure::Unavailable(message) => error_response(503, &message),
     }
 }
 

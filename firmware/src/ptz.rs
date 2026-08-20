@@ -1,4 +1,4 @@
-//! Camera-local PTZ motor control through the preserved `/dev/motor` driver.
+//! Camera-local PTZ control through the preserved `/dev/motor` driver.
 //!
 //! The ioctl numbers, initialization array, axis limits, GPIO assignments, and
 //! speed mapping are reverse-engineered from the C220's `motor_drv.ko` path.
@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use tracing::info;
 
 /// Default PTZ character device exposed by the camera kernel module.
-pub const DEFAULT_MOTOR_DEVICE: &str = "/dev/motor";
+pub const DEFAULT_PTZ_DEVICE: &str = "/dev/motor";
 
 /// Calibrated horizontal travel in degrees.
 pub const PAN_MAX_DEGREES: i32 = 355;
@@ -30,18 +30,18 @@ pub const PAN_CENTER_DEGREES: i32 = 178;
 pub const TILT_CENTER_DEGREES: i32 = 38;
 
 /// Driver ioctl request values observed from `motor_drv.ko`.
-const MOTOR_IOC_INIT: u32 = 0x6d01;
-const MOTOR_IOC_GET_POS: u32 = 0x6d02;
-const MOTOR_IOC_MOVE: u32 = 0x6d03;
-const MOTOR_IOC_STOP: u32 = 0x6d05;
+const PTZ_IOC_INIT: u32 = 0x6d01;
+const PTZ_IOC_GET_POS: u32 = 0x6d02;
+const PTZ_IOC_MOVE: u32 = 0x6d03;
+const PTZ_IOC_STOP: u32 = 0x6d05;
 
 /// The driver accepts only these two timing selectors. Other values report a
 /// move without energizing the coils.
-const MOTOR_SPEED_SLOW: i32 = 0;
-const MOTOR_SPEED_FAST: i32 = 1;
+const PTZ_SPEED_SLOW: i32 = 0;
+const PTZ_SPEED_FAST: i32 = 1;
 
 /// Caller speeds at or above this value use the driver's fast timing pair.
-const MOTOR_SPEED_FAST_THRESHOLD: u8 = 4;
+const PTZ_SPEED_FAST_THRESHOLD: u8 = 4;
 
 /// Poll interval while a finite driver move reaches its target.
 const POSITION_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -55,7 +55,7 @@ const VENDOR_INIT: [i32; 20] = [
     355, 75, 0, 0, 355, 75, 8533, 11377, 55, 59, 54, 58, 4, 57, 34, 56, 300, 300, 600, 400,
 ];
 
-/// Direction understood by the local motor driver.
+/// Direction understood by the local PTZ driver.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PtzDirection {
     Left,
@@ -94,44 +94,44 @@ impl std::fmt::Display for PtzDirection {
 
 /// Translate the public 0..10 speed scale to one of the two driver values.
 pub const fn driver_speed(speed: u8) -> i32 {
-    if speed >= MOTOR_SPEED_FAST_THRESHOLD {
-        MOTOR_SPEED_FAST
+    if speed >= PTZ_SPEED_FAST_THRESHOLD {
+        PTZ_SPEED_FAST
     } else {
-        MOTOR_SPEED_SLOW
+        PTZ_SPEED_SLOW
     }
 }
 
-/// Open, initialize, and serialize access to the camera motor driver.
+/// Open, initialize, and serialize access to the camera PTZ driver.
 #[derive(Debug)]
-pub struct HardwareMotor {
+pub struct PtzController {
     file: Mutex<File>,
 }
 
-impl HardwareMotor {
-    /// Open and initialize the camera's default motor device.
+impl PtzController {
+    /// Open and initialize the camera's default PTZ device.
     pub fn open() -> io::Result<Self> {
-        Self::open_path(DEFAULT_MOTOR_DEVICE)
+        Self::open_path(DEFAULT_PTZ_DEVICE)
     }
 
     /// Open and initialize a caller-supplied device path.
     pub fn open_path(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref();
         let file = OpenOptions::new().read(true).write(true).open(path)?;
-        let motor = Self {
+        let ptz = Self {
             file: Mutex::new(file),
         };
-        motor.initialize()?;
-        info!(path = %path.display(), "hardware PTZ motor initialized");
-        Ok(motor)
+        ptz.initialize()?;
+        info!(path = %path.display(), "PTZ controller initialized");
+        Ok(ptz)
     }
 
     fn initialize(&self) -> io::Result<()> {
         let file = self
             .file
             .lock()
-            .map_err(|_| io::Error::other("motor device lock poisoned"))?;
-        let result = unsafe { ioctl(file.as_raw_fd(), MOTOR_IOC_INIT, VENDOR_INIT.as_ptr()) };
-        check_ioctl(result, "motor initialization")
+            .map_err(|_| io::Error::other("PTZ device lock poisoned"))?;
+        let result = unsafe { ioctl(file.as_raw_fd(), PTZ_IOC_INIT, VENDOR_INIT.as_ptr()) };
+        check_ioctl(result, "PTZ initialization")
     }
 
     /// Return the native direction code used by the driver.
@@ -165,7 +165,7 @@ impl HardwareMotor {
             io::Error::new(io::ErrorKind::InvalidInput, "stop is not a move direction")
         })?;
         let move_arg = [1_i32, direction_code, driver_speed(speed), -1_i32];
-        self.move_ioctl(&move_arg, "continuous motor move")
+        self.move_ioctl(&move_arg, "continuous PTZ move")
     }
 
     /// Move by a bounded number of degrees, respecting the current software
@@ -177,7 +177,7 @@ impl HardwareMotor {
         if degrees <= 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "motor step must be positive",
+                "PTZ step must be positive",
             ));
         }
         let direction_code = Self::direction_code(direction).ok_or_else(|| {
@@ -196,26 +196,26 @@ impl HardwareMotor {
         };
         let steps = degrees.min(remaining).max(1);
         let move_arg = [1_i32, direction_code, driver_speed(speed), steps];
-        self.move_ioctl(&move_arg, "finite motor move")
+        self.move_ioctl(&move_arg, "finite PTZ move")
     }
 
     fn move_ioctl(&self, move_arg: &[i32; 4], operation: &str) -> io::Result<()> {
         let file = self
             .file
             .lock()
-            .map_err(|_| io::Error::other("motor device lock poisoned"))?;
-        let result = unsafe { ioctl(file.as_raw_fd(), MOTOR_IOC_MOVE, move_arg.as_ptr()) };
+            .map_err(|_| io::Error::other("PTZ device lock poisoned"))?;
+        let result = unsafe { ioctl(file.as_raw_fd(), PTZ_IOC_MOVE, move_arg.as_ptr()) };
         check_ioctl(result, operation)
     }
 
-    /// Stop all motor motion.
+    /// Stop all PTZ motion.
     pub fn stop(&self) -> io::Result<()> {
         let file = self
             .file
             .lock()
-            .map_err(|_| io::Error::other("motor device lock poisoned"))?;
-        let result = unsafe { ioctl(file.as_raw_fd(), MOTOR_IOC_STOP, 0) };
-        check_ioctl(result, "motor stop")
+            .map_err(|_| io::Error::other("PTZ device lock poisoned"))?;
+        let result = unsafe { ioctl(file.as_raw_fd(), PTZ_IOC_STOP, 0) };
+        check_ioctl(result, "PTZ stop")
     }
 
     /// Read current position as `(pan, tilt)` degrees.
@@ -223,10 +223,10 @@ impl HardwareMotor {
         let file = self
             .file
             .lock()
-            .map_err(|_| io::Error::other("motor device lock poisoned"))?;
+            .map_err(|_| io::Error::other("PTZ device lock poisoned"))?;
         let mut position = [0_i32; 4];
-        let result = unsafe { ioctl(file.as_raw_fd(), MOTOR_IOC_GET_POS, position.as_mut_ptr()) };
-        check_ioctl(result, "motor position read")?;
+        let result = unsafe { ioctl(file.as_raw_fd(), PTZ_IOC_GET_POS, position.as_mut_ptr()) };
+        check_ioctl(result, "PTZ position read")?;
         Ok((position[2], position[3]))
     }
 
@@ -287,14 +287,14 @@ impl HardwareMotor {
                 let _ = self.stop();
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    format!("motor did not reach {target} degrees; current position {position}"),
+                    format!("PTZ did not reach {target} degrees; current position {position}"),
                 ));
             }
         }
     }
 }
 
-impl Drop for HardwareMotor {
+impl Drop for PtzController {
     fn drop(&mut self) {
         let _ = self.stop();
     }
@@ -331,28 +331,28 @@ mod tests {
 
     #[test]
     fn maps_driver_direction_codes() {
-        assert_eq!(HardwareMotor::direction_code(PtzDirection::Left), Some(1));
-        assert_eq!(HardwareMotor::direction_code(PtzDirection::Right), Some(2));
-        assert_eq!(HardwareMotor::direction_code(PtzDirection::Up), Some(3));
-        assert_eq!(HardwareMotor::direction_code(PtzDirection::Down), Some(4));
-        assert_eq!(HardwareMotor::direction_code(PtzDirection::Stop), None);
+        assert_eq!(PtzController::direction_code(PtzDirection::Left), Some(1));
+        assert_eq!(PtzController::direction_code(PtzDirection::Right), Some(2));
+        assert_eq!(PtzController::direction_code(PtzDirection::Up), Some(3));
+        assert_eq!(PtzController::direction_code(PtzDirection::Down), Some(4));
+        assert_eq!(PtzController::direction_code(PtzDirection::Stop), None);
     }
 
     #[test]
     fn detects_calibrated_limits() {
-        assert!(HardwareMotor::at_limit(PtzDirection::Left, 0, 38));
-        assert!(HardwareMotor::at_limit(
+        assert!(PtzController::at_limit(PtzDirection::Left, 0, 38));
+        assert!(PtzController::at_limit(
             PtzDirection::Right,
             PAN_MAX_DEGREES - 1,
             38
         ));
-        assert!(HardwareMotor::at_limit(PtzDirection::Up, 178, 0));
-        assert!(HardwareMotor::at_limit(
+        assert!(PtzController::at_limit(PtzDirection::Up, 178, 0));
+        assert!(PtzController::at_limit(
             PtzDirection::Down,
             178,
             TILT_MAX_DEGREES - 1
         ));
-        assert!(!HardwareMotor::at_limit(PtzDirection::Right, 177, 38));
+        assert!(!PtzController::at_limit(PtzDirection::Right, 177, 38));
     }
 
     #[test]
@@ -360,15 +360,15 @@ mod tests {
         for speed in 0..=u8::MAX {
             assert!(matches!(
                 driver_speed(speed),
-                MOTOR_SPEED_SLOW | MOTOR_SPEED_FAST
+                PTZ_SPEED_SLOW | PTZ_SPEED_FAST
             ));
         }
-        assert_eq!(driver_speed(3), MOTOR_SPEED_SLOW);
-        assert_eq!(driver_speed(4), MOTOR_SPEED_FAST);
+        assert_eq!(driver_speed(3), PTZ_SPEED_SLOW);
+        assert_eq!(driver_speed(4), PTZ_SPEED_FAST);
     }
 
     #[test]
     fn nonexistent_device_returns_error() {
-        assert!(HardwareMotor::open_path("/tmp/c220-nonexistent-motor").is_err());
+        assert!(PtzController::open_path("/tmp/c220-nonexistent-ptz").is_err());
     }
 }

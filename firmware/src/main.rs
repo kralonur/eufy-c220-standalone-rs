@@ -7,13 +7,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use control::{ControlServer, ControlServerConfig, MediaEngineSlot};
 use media::RecordKind;
 use media_engine::{MediaEngine, MediaEngineConfig};
-use motor::HardwareMotor;
+use ptz::PtzController;
 use rtsp::{RtspServer, RtspServerConfig};
 
 pub mod control;
 pub mod media;
 pub mod media_engine;
-pub mod motor;
+pub mod ptz;
 pub mod rtsp;
 
 /// Default camera-local RTSP bind address.
@@ -75,17 +75,17 @@ async fn run_firmware() -> Result<(), Box<dyn Error + Send + Sync>> {
         .unwrap_or_else(|_| format!("0.0.0.0:{}", control::DEFAULT_CONTROL_PORT))
         .parse::<SocketAddr>()?;
     let media_slot = MediaEngineSlot::default();
-    let motor = match HardwareMotor::open() {
-        Ok(motor) => Some(Arc::new(motor)),
+    let ptz = match PtzController::open() {
+        Ok(ptz) => Some(Arc::new(ptz)),
         Err(error) => {
-            tracing::warn!(%error, "hardware PTZ motor unavailable; PTZ control disabled");
+            tracing::warn!(%error, "PTZ device unavailable; PTZ control disabled");
             None
         }
     };
     let control = ControlServer::start(
         ControlServerConfig::new(control_address),
         media_slot.clone(),
-        motor,
+        ptz,
     )?;
     tracing::info!(address = %control.local_addr(), "HTTP control service listening");
 
@@ -144,7 +144,12 @@ fn run_media_loop(
     media_slot: MediaEngineSlot,
 ) -> std::io::Result<()> {
     let mut engine = MediaEngine::start(config)?;
-    media_slot.set(engine.command_handle())?;
+    let command_handle = engine.command_handle();
+    media_slot.set(command_handle.clone())?;
+    if let Err(error) = rtsp.set_talkback_sink(Arc::new(command_handle)) {
+        let _ = media_slot.clear();
+        return Err(error);
+    }
     let result = (|| -> std::io::Result<()> {
         while !stop.load(Ordering::Acquire) {
             match engine.read_record()? {
@@ -160,9 +165,11 @@ fn run_media_loop(
         }
         Ok(())
     })();
+    let talkback_clear_result = rtsp.clear_talkback_sink();
     let clear_result = media_slot.clear();
     let shutdown_result = engine.shutdown();
     result?;
+    talkback_clear_result?;
     clear_result?;
     shutdown_result
 }

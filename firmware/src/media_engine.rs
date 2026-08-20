@@ -188,6 +188,13 @@ impl Drop for MediaEngine {
 }
 
 impl MediaEngineHandle {
+    #[cfg(test)]
+    pub(crate) fn from_socket_for_test(socket: UnixStream) -> Self {
+        Self {
+            socket: Arc::new(Mutex::new(socket)),
+        }
+    }
+
     /// Send one command record to the companion.
     pub fn write_record(&self, record: &MediaRecord) -> io::Result<()> {
         let mut socket = self

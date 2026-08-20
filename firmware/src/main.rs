@@ -4,10 +4,12 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use control::{ControlServer, ControlServerConfig, MediaEngineSlot};
 use media::RecordKind;
 use media_engine::{MediaEngine, MediaEngineConfig};
 use rtsp::{RtspServer, RtspServerConfig};
 
+pub mod control;
 pub mod media;
 pub mod media_engine;
 pub mod rtsp;
@@ -17,6 +19,9 @@ const DEFAULT_RTSP_BIND_ADDRESS: &str = "0.0.0.0:554";
 
 /// Environment override for development and board-specific port selection.
 const RTSP_BIND_ADDRESS_ENV: &str = "RTSP_BIND_ADDRESS";
+
+/// Environment override for the camera-local HTTP control listener.
+const CONTROL_BIND_ADDRESS_ENV: &str = "CONTROL_BIND_ADDRESS";
 
 /// Explicit audio enable override used during board bring-up.
 const STANDALONE_AUDIO_ENV: &str = "STANDALONE_AUDIO";
@@ -64,11 +69,27 @@ async fn run_firmware() -> Result<(), Box<dyn Error + Send + Sync>> {
         "RTSP service listening"
     );
 
+    let control_address = std::env::var(CONTROL_BIND_ADDRESS_ENV)
+        .unwrap_or_else(|_| format!("0.0.0.0:{}", control::DEFAULT_CONTROL_PORT))
+        .parse::<SocketAddr>()?;
+    let media_slot = MediaEngineSlot::default();
+    let control = ControlServer::start(
+        ControlServerConfig::new(control_address),
+        media_slot.clone(),
+    )?;
+    tracing::info!(address = %control.local_addr(), "HTTP control service listening");
+
     let stop = Arc::new(AtomicBool::new(false));
     let media_stop = Arc::clone(&stop);
     let media_rtsp = rtsp.clone();
+    let media_slot_for_task = media_slot.clone();
     let mut media_task = tokio::task::spawn_blocking(move || {
-        run_media_loop(media_rtsp, MediaEngineConfig::default(), media_stop)
+        run_media_loop(
+            media_rtsp,
+            MediaEngineConfig::default(),
+            media_stop,
+            media_slot_for_task,
+        )
     });
 
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -110,19 +131,28 @@ fn run_media_loop(
     rtsp: RtspServer,
     config: MediaEngineConfig,
     stop: Arc<AtomicBool>,
+    media_slot: MediaEngineSlot,
 ) -> std::io::Result<()> {
     let mut engine = MediaEngine::start(config)?;
-    while !stop.load(Ordering::Acquire) {
-        match engine.read_record()? {
-            Some(record) if record.kind.is_video() => {
-                rtsp.push_video_record(&record)?;
+    media_slot.set(engine.command_handle())?;
+    let result = (|| -> std::io::Result<()> {
+        while !stop.load(Ordering::Acquire) {
+            match engine.read_record()? {
+                Some(record) if record.kind.is_video() => {
+                    rtsp.push_video_record(&record)?;
+                }
+                Some(record) if record.kind == RecordKind::AudioCapture => {
+                    rtsp.push_audio_record(&record)?;
+                }
+                Some(_) => {}
+                None => break,
             }
-            Some(record) if record.kind == RecordKind::AudioCapture => {
-                rtsp.push_audio_record(&record)?;
-            }
-            Some(_) => {}
-            None => break,
         }
-    }
-    engine.shutdown()
+        Ok(())
+    })();
+    let clear_result = media_slot.clear();
+    let shutdown_result = engine.shutdown();
+    result?;
+    clear_result?;
+    shutdown_result
 }

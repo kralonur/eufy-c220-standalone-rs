@@ -7,11 +7,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use control::{ControlServer, ControlServerConfig, MediaEngineSlot};
 use media::RecordKind;
 use media_engine::{MediaEngine, MediaEngineConfig};
+use motor::HardwareMotor;
 use rtsp::{RtspServer, RtspServerConfig};
 
 pub mod control;
 pub mod media;
 pub mod media_engine;
+pub mod motor;
 pub mod rtsp;
 
 /// Default camera-local RTSP bind address.
@@ -73,9 +75,17 @@ async fn run_firmware() -> Result<(), Box<dyn Error + Send + Sync>> {
         .unwrap_or_else(|_| format!("0.0.0.0:{}", control::DEFAULT_CONTROL_PORT))
         .parse::<SocketAddr>()?;
     let media_slot = MediaEngineSlot::default();
+    let motor = match HardwareMotor::open() {
+        Ok(motor) => Some(Arc::new(motor)),
+        Err(error) => {
+            tracing::warn!(%error, "hardware PTZ motor unavailable; PTZ control disabled");
+            None
+        }
+    };
     let control = ControlServer::start(
         ControlServerConfig::new(control_address),
         media_slot.clone(),
+        motor,
     )?;
     tracing::info!(address = %control.local_addr(), "HTTP control service listening");
 

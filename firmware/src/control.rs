@@ -6,6 +6,7 @@
 //! socket. Authentication and TLS belong to a later deployment module.
 
 use crate::media_engine::MediaEngineHandle;
+use crate::motor::{HardwareMotor, PAN_MAX_DEGREES, PtzDirection};
 use std::io;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -97,7 +98,11 @@ impl std::fmt::Debug for ControlServer {
 
 impl ControlServer {
     /// Start the HTTP control listener on the current Tokio runtime.
-    pub fn start(config: ControlServerConfig, media: MediaEngineSlot) -> io::Result<Self> {
+    pub fn start(
+        config: ControlServerConfig,
+        media: MediaEngineSlot,
+        motor: Option<Arc<HardwareMotor>>,
+    ) -> io::Result<Self> {
         let listener = StdTcpListener::bind(config.bind_address)?;
         listener.set_nonblocking(true)?;
         let local_addr = listener.local_addr()?;
@@ -107,10 +112,12 @@ impl ControlServer {
         })?;
         let inner = Arc::new(ControlInner {
             media,
+            motor,
             active: AtomicBool::new(false),
             next_timestamp_us: AtomicU64::new(0),
             volume: AtomicU32::new(DEFAULT_VOLUME),
             command_lock: Mutex::new(()),
+            motor_lock: Mutex::new(()),
             shutdown: Notify::new(),
         });
         let accept_inner = Arc::clone(&inner);
@@ -133,10 +140,12 @@ impl Drop for ControlServer {
 
 struct ControlInner {
     media: MediaEngineSlot,
+    motor: Option<Arc<HardwareMotor>>,
     active: AtomicBool,
     next_timestamp_us: AtomicU64,
     volume: AtomicU32,
     command_lock: Mutex<()>,
+    motor_lock: Mutex<()>,
     shutdown: Notify,
 }
 
@@ -292,6 +301,10 @@ async fn dispatch(inner: &Arc<ControlInner>, request: HttpRequest) -> Vec<u8> {
         ("POST", "/talkback/audio") => talkback_audio(inner, request.body).await,
         ("POST", "/talkback/volume") => talkback_volume(inner, &request.body).await,
         ("POST", "/night_mode") => night_mode(inner, &request.body).await,
+        ("GET", "/ptz/position") | ("GET", "/ptz/status") => ptz_position(inner).await,
+        ("POST", "/ptz/move") => ptz_move(inner, &request.body).await,
+        ("POST", "/ptz/stop") => ptz_stop(inner).await,
+        ("POST", "/ptz/center") => ptz_center(inner).await,
         _ => error_response(404, "control endpoint not found"),
     }
 }
@@ -404,6 +417,78 @@ async fn night_mode(inner: &Arc<ControlInner>, body: &[u8]) -> Vec<u8> {
     }
 }
 
+async fn ptz_position(inner: &Arc<ControlInner>) -> Vec<u8> {
+    match send_motor(inner, |motor| motor.position()).await {
+        Ok((pan, tilt)) => json_response(
+            200,
+            "OK",
+            &format!(r#"{{"status":"ok","pan":{pan},"tilt":{tilt}}}"#),
+        ),
+        Err(error) => motor_error_response(error),
+    }
+}
+
+async fn ptz_move(inner: &Arc<ControlInner>, body: &[u8]) -> Vec<u8> {
+    let direction = match parse_json_string_field(body, "direction")
+        .ok()
+        .and_then(|value| PtzDirection::parse(&value))
+    {
+        Some(direction) => direction,
+        None => return error_response(400, "PTZ direction must be left, right, up, or down"),
+    };
+    let degrees = match parse_optional_json_u32_field(body, "degrees", 1) {
+        Ok(degrees) if (1..=PAN_MAX_DEGREES as u32).contains(&degrees) => degrees as i32,
+        Ok(_) => return error_response(400, "PTZ degrees must be between 1 and 355"),
+        Err(error) => return error_response(400, &error),
+    };
+    let speed = match parse_optional_json_u32_field(body, "speed", 5) {
+        Ok(speed) if speed <= 10 => speed as u8,
+        Ok(_) => return error_response(400, "PTZ speed must be between 0 and 10"),
+        Err(error) => return error_response(400, &error),
+    };
+
+    let operation = move |motor: &HardwareMotor| {
+        if direction == PtzDirection::Stop {
+            motor.stop()
+        } else {
+            motor.move_step(direction, degrees, speed)
+        }
+    };
+    match send_motor(inner, operation).await {
+        Ok(()) => json_response(
+            200,
+            "OK",
+            &format!(
+                r#"{{"status":"ok","direction":"{direction}","degrees":{degrees},"speed":{speed}}}"#
+            ),
+        ),
+        Err(error) => motor_error_response(error),
+    }
+}
+
+async fn ptz_stop(inner: &Arc<ControlInner>) -> Vec<u8> {
+    match send_motor(inner, |motor| motor.stop()).await {
+        Ok(()) => json_response(200, "OK", r#"{"status":"ok"}"#),
+        Err(error) => motor_error_response(error),
+    }
+}
+
+async fn ptz_center(inner: &Arc<ControlInner>) -> Vec<u8> {
+    match send_motor(inner, |motor| {
+        motor.center(5)?;
+        motor.position()
+    })
+    .await
+    {
+        Ok((pan, tilt)) => json_response(
+            200,
+            "OK",
+            &format!(r#"{{"status":"ok","pan":{pan},"tilt":{tilt}}}"#),
+        ),
+        Err(error) => motor_error_response(error),
+    }
+}
+
 fn reserve_timestamp(inner: &ControlInner, duration_us: u64) -> u64 {
     loop {
         let current = inner.next_timestamp_us.load(Ordering::Acquire);
@@ -450,6 +535,45 @@ where
     .map_err(|error| CommandFailure::Unavailable(format!("command worker failed: {error}")))?
 }
 
+async fn send_motor<F, T>(inner: &Arc<ControlInner>, operation: F) -> Result<T, MotorFailure>
+where
+    F: FnOnce(&HardwareMotor) -> io::Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    let motor = inner
+        .motor
+        .clone()
+        .ok_or_else(|| MotorFailure::Unavailable("PTZ motor is not available".to_string()))?;
+    let motor_inner = Arc::clone(inner);
+    tokio::task::spawn_blocking(move || {
+        let _lock = motor_inner
+            .motor_lock
+            .lock()
+            .map_err(|_| MotorFailure::Unavailable("PTZ motor lock poisoned".to_string()))?;
+        operation(&motor).map_err(|error| match error.kind() {
+            io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData => {
+                MotorFailure::Rejected(error.to_string())
+            }
+            _ => MotorFailure::Unavailable(error.to_string()),
+        })
+    })
+    .await
+    .map_err(|error| MotorFailure::Unavailable(format!("PTZ worker failed: {error}")))?
+}
+
+#[derive(Debug)]
+enum MotorFailure {
+    Rejected(String),
+    Unavailable(String),
+}
+
+fn motor_error_response(error: MotorFailure) -> Vec<u8> {
+    match error {
+        MotorFailure::Rejected(message) => error_response(400, &message),
+        MotorFailure::Unavailable(message) => error_response(503, &message),
+    }
+}
+
 #[derive(Debug)]
 enum CommandFailure {
     Inactive,
@@ -488,6 +612,38 @@ fn talkback_status_response(inner: &ControlInner) -> Vec<u8> {
         "OK",
         &format!(r#"{{"status":"ok","talking":{talking},"ready":{ready},"volume":{volume}}}"#),
     )
+}
+
+fn parse_optional_json_u32_field(body: &[u8], field: &str, default: u32) -> Result<u32, String> {
+    let text = std::str::from_utf8(body).map_err(|_| "JSON body is not UTF-8".to_string())?;
+    if !text.contains(&format!("\"{field}\"")) {
+        Ok(default)
+    } else {
+        parse_json_u32_field(body, field)
+    }
+}
+
+fn parse_json_string_field(body: &[u8], field: &str) -> Result<String, String> {
+    let text = std::str::from_utf8(body).map_err(|_| "JSON body is not UTF-8".to_string())?;
+    let key = format!("\"{field}\"");
+    let value = text
+        .split_once(&key)
+        .ok_or_else(|| format!("JSON field {field} is missing"))?
+        .1
+        .trim_start()
+        .strip_prefix(':')
+        .ok_or_else(|| format!("JSON field {field} must have a value"))?
+        .trim_start();
+    let value = value
+        .strip_prefix('"')
+        .ok_or_else(|| format!("JSON field {field} must be a string"))?;
+    let end = value
+        .find('"')
+        .ok_or_else(|| format!("JSON field {field} has an unterminated string"))?;
+    if end == 0 {
+        return Err(format!("JSON field {field} must not be empty"));
+    }
+    Ok(value[..end].to_string())
 }
 
 fn parse_json_u32_field(body: &[u8], field: &str) -> Result<u32, String> {
@@ -593,6 +749,7 @@ mod tests {
         let server = ControlServer::start(
             ControlServerConfig::new(SocketAddr::from(([127, 0, 0, 1], 0))),
             slot,
+            None,
         )
         .expect("control server should start");
 

@@ -19,7 +19,7 @@ use rtsp_types::{Message, Method, Request, Response, StatusCode, Version, header
 use std::io;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -81,6 +81,15 @@ const MEDIA_BUS_CAPACITY: usize = 256;
 /// Maximum RTSP request/control buffer accepted from one client.
 const MAX_REQUEST_BUFFER: usize = 64 * 1024;
 
+/// Maximum PCMA payload accepted in one incoming RTP backchannel packet.
+const MAX_TALKBACK_PCMA_PAYLOAD: usize = 4 * 1024;
+
+/// Maximum complete RTP packet accepted from one RTSP client.
+const MAX_TALKBACK_RTP_PACKET_LEN: usize = 8 * 1024;
+
+/// Fixed RTP header size before CSRC, extension, and padding fields.
+const RTP_HEADER_LEN: usize = 12;
+
 /// Maximum time DESCRIBE waits for the encoder's parameter sets.
 const CODEC_READY_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -124,6 +133,49 @@ impl VideoCodec {
             Self::H264 => "H264",
             Self::H265 => "H265",
         }
+    }
+}
+
+/// Sink for incoming RTSP backchannel audio.
+///
+/// The server decodes RTP PCMA and expands it to mono 16 kHz signed PCM16
+/// before calling this sink. Implementations must keep each method bounded;
+/// RTSP session tasks call them from blocking workers.
+pub trait TalkbackSink: Send + Sync {
+    fn start_talkback(&self) -> io::Result<()>;
+    fn send_pcm(&self, pcm_bytes: &[u8]) -> io::Result<()>;
+    fn stop_talkback(&self) -> io::Result<()>;
+}
+
+#[derive(Clone, Default)]
+struct TalkbackSinkSlot {
+    sink: Arc<StdMutex<Option<Arc<dyn TalkbackSink>>>>,
+}
+
+impl TalkbackSinkSlot {
+    fn set(&self, sink: Arc<dyn TalkbackSink>) -> io::Result<()> {
+        let mut current = self
+            .sink
+            .lock()
+            .map_err(|_| io::Error::other("RTSP talkback sink lock poisoned"))?;
+        *current = Some(sink);
+        Ok(())
+    }
+
+    fn clear(&self) -> io::Result<()> {
+        let mut current = self
+            .sink
+            .lock()
+            .map_err(|_| io::Error::other("RTSP talkback sink lock poisoned"))?;
+        *current = None;
+        Ok(())
+    }
+
+    fn current(&self) -> io::Result<Option<Arc<dyn TalkbackSink>>> {
+        self.sink
+            .lock()
+            .map_err(|_| io::Error::other("RTSP talkback sink lock poisoned"))
+            .map(|current| current.clone())
     }
 }
 
@@ -201,6 +253,7 @@ struct RtspServerInner {
     audio_enabled: bool,
     media_tx: broadcast::Sender<VideoFrame>,
     audio_tx: broadcast::Sender<AudioFrame>,
+    talkback: TalkbackSinkSlot,
     codec: RwLock<CodecState>,
     codec_ready: Notify,
     shutdown: Notify,
@@ -270,6 +323,7 @@ impl RtspServer {
             audio_enabled: config.audio_enabled,
             media_tx,
             audio_tx,
+            talkback: TalkbackSinkSlot::default(),
             codec: RwLock::new(CodecState::default()),
             codec_ready: Notify::new(),
             shutdown: Notify::new(),
@@ -298,6 +352,16 @@ impl RtspServer {
 
     pub fn path(&self) -> &str {
         &self.inner.path
+    }
+
+    /// Attach the camera speaker used by RTSP backchannel sessions.
+    pub fn set_talkback_sink(&self, sink: Arc<dyn TalkbackSink>) -> io::Result<()> {
+        self.inner.talkback.set(sink)
+    }
+
+    /// Detach the speaker before the media engine is shut down.
+    pub fn clear_talkback_sink(&self) -> io::Result<()> {
+        self.inner.talkback.clear()
     }
 
     /// Publish one encoded Annex-B access unit.
@@ -426,6 +490,7 @@ impl RtspServer {
             self.inner.video_width,
             self.inner.video_height,
             self.inner.audio_enabled,
+            self.inner.talkback.current().ok().flatten().is_some(),
         )
     }
 
@@ -476,22 +541,28 @@ async fn accept_loop(listener: TcpListener, inner: Arc<RtspServerInner>) {
 enum MediaTrack {
     Video,
     Audio,
+    Backchannel,
 }
 
 struct ClientState {
     video_channel: Option<u8>,
     audio_channel: Option<u8>,
+    backchannel_channel: Option<u8>,
+    backchannel_sink: Option<Arc<dyn TalkbackSink>>,
     media_task: Option<JoinHandle<()>>,
     audio_task: Option<JoinHandle<()>>,
 }
 
 impl ClientState {
-    fn stop_media(&mut self) {
+    async fn stop_media(&mut self) {
         if let Some(task) = self.media_task.take() {
             task.abort();
         }
         if let Some(task) = self.audio_task.take() {
             task.abort();
+        }
+        if let Some(sink) = self.backchannel_sink.take() {
+            let _ = tokio::task::spawn_blocking(move || sink.stop_talkback()).await;
         }
     }
 }
@@ -504,23 +575,32 @@ async fn handle_connection(stream: TcpStream, inner: Arc<RtspServerInner>) -> io
     let mut state = ClientState {
         video_channel: None,
         audio_channel: None,
+        backchannel_channel: None,
+        backchannel_sink: None,
         media_task: None,
         audio_task: None,
     };
     let mut buffer = Vec::new();
 
     loop {
-        let request = tokio::select! {
+        let message = tokio::select! {
             _ = inner.shutdown.notified() => break,
             result = read_request(&mut reader, &mut buffer) => result?,
         };
-        let Some(request) = request else { break };
-        if handle_request(&inner, &writer, &mut session, &mut state, request).await? {
-            break;
+        let Some(message) = message else { break };
+        match message {
+            InboundMessage::Request(request) => {
+                if handle_request(&inner, &writer, &mut session, &mut state, request).await? {
+                    break;
+                }
+            }
+            InboundMessage::Interleaved(frame) => {
+                handle_interleaved(&mut state, frame).await?;
+            }
         }
     }
 
-    state.stop_media();
+    state.stop_media().await;
     Ok(())
 }
 
@@ -537,7 +617,14 @@ async fn handle_request(
         send_error(writer, &request.parsed, StatusCode::NotImplemented).await?;
         return Ok(false);
     }
-    if !request_path_allowed(&request.parsed, &method, &inner.path, inner.audio_enabled) {
+    let talkback_enabled = inner.talkback.current().ok().flatten().is_some();
+    if !request_path_allowed(
+        &request.parsed,
+        &method,
+        &inner.path,
+        inner.audio_enabled,
+        talkback_enabled,
+    ) {
         send_error(writer, &request.parsed, StatusCode::NotFound).await?;
         return Ok(false);
     }
@@ -547,7 +634,12 @@ async fn handle_request(
     }
 
     let setup = if method == Method::Setup {
-        let Some(track) = setup_track(&request.parsed, &inner.path, inner.audio_enabled) else {
+        let Some(track) = setup_track(
+            &request.parsed,
+            &inner.path,
+            inner.audio_enabled,
+            talkback_enabled,
+        ) else {
             send_error(writer, &request.parsed, StatusCode::NotFound).await?;
             return Ok(false);
         };
@@ -581,6 +673,32 @@ async fn handle_request(
     let (response, events) = session
         .handle_request(&request.raw)
         .map_err(runtime_io_error)?;
+    let accepted = events
+        .iter()
+        .any(|event| matches!(event, ServerEvent::RequestAccepted { .. }));
+
+    if accepted && method == Method::Play {
+        state.stop_media().await;
+        if state.backchannel_channel.is_some() {
+            let Some(sink) = inner.talkback.current().ok().flatten() else {
+                send_error(writer, &request.parsed, StatusCode::ServiceUnavailable).await?;
+                return Ok(false);
+            };
+            let start_sink = Arc::clone(&sink);
+            let start_result = tokio::task::spawn_blocking(move || start_sink.start_talkback())
+                .await
+                .map_err(|error| {
+                    io::Error::other(format!("RTSP talkback worker failed: {error}"))
+                })?;
+            if let Err(error) = start_result {
+                tracing::warn!(%error, "RTSP talkback start failed");
+                send_error(writer, &request.parsed, StatusCode::ServiceUnavailable).await?;
+                return Ok(false);
+            }
+            state.backchannel_sink = Some(sink);
+        }
+    }
+
     let response = customize_response(
         response,
         &method,
@@ -593,9 +711,6 @@ async fn handle_request(
         writer.write_all(&response).await?;
     }
 
-    let accepted = events
-        .iter()
-        .any(|event| matches!(event, ServerEvent::RequestAccepted { .. }));
     if !accepted {
         return Ok(false);
     }
@@ -606,11 +721,11 @@ async fn handle_request(
                 match track {
                     MediaTrack::Video => state.video_channel = Some(channel),
                     MediaTrack::Audio => state.audio_channel = Some(channel),
+                    MediaTrack::Backchannel => state.backchannel_channel = Some(channel),
                 }
             }
         }
         Method::Play => {
-            state.stop_media();
             if let Some(channel) = state.video_channel {
                 let receiver = inner.media_tx.subscribe();
                 let media_inner = Arc::clone(inner);
@@ -628,16 +743,156 @@ async fn handle_request(
                 }));
             }
         }
-        Method::Pause => state.stop_media(),
+        Method::Pause => state.stop_media().await,
         Method::Teardown => {
-            state.stop_media();
+            state.stop_media().await;
             state.video_channel = None;
             state.audio_channel = None;
+            state.backchannel_channel = None;
             return Ok(true);
         }
         _ => {}
     }
     Ok(false)
+}
+
+async fn handle_interleaved(state: &mut ClientState, frame: InterleavedFrame) -> io::Result<()> {
+    let Some(channel) = state.backchannel_channel else {
+        return Ok(());
+    };
+    if frame.channel != channel {
+        return Ok(());
+    }
+    let Some(sink) = state.backchannel_sink.clone() else {
+        return Ok(());
+    };
+    let pcm = decode_pcma_rtp(&frame.payload)?;
+    tokio::task::spawn_blocking(move || sink.send_pcm(&pcm))
+        .await
+        .map_err(|error| io::Error::other(format!("RTSP talkback worker failed: {error}")))?
+}
+
+/// Decode one RTP/PCMA packet to the 16 kHz PCM16 format expected by AO.
+fn decode_pcma_rtp(packet: &[u8]) -> io::Result<Vec<u8>> {
+    if packet.len() < RTP_HEADER_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "RTSP talkback RTP packet is shorter than its header",
+        ));
+    }
+    if packet.len() > MAX_TALKBACK_RTP_PACKET_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "RTSP talkback RTP packet exceeds the configured limit",
+        ));
+    }
+    if packet[0] >> 6 != 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "RTSP talkback RTP version is not 2",
+        ));
+    }
+    if packet[1] & 0x7f != RTP_AUDIO_PAYLOAD_TYPE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "RTSP talkback RTP payload is not PCMA",
+        ));
+    }
+
+    let csrc_len = usize::from(packet[0] & 0x0f)
+        .checked_mul(4)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid RTP CSRC count"))?;
+    let mut payload_start = RTP_HEADER_LEN
+        .checked_add(csrc_len)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid RTP header length"))?;
+    if payload_start > packet.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "RTSP talkback RTP CSRC list is truncated",
+        ));
+    }
+
+    if packet[0] & 0x10 != 0 {
+        if payload_start + 4 > packet.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "RTSP talkback RTP extension header is truncated",
+            ));
+        }
+        let extension_words = usize::from(u16::from_be_bytes([
+            packet[payload_start + 2],
+            packet[payload_start + 3],
+        ]));
+        let extension_len = 4_usize
+            .checked_add(extension_words.checked_mul(4).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid RTP extension length")
+            })?)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid RTP extension length")
+            })?;
+        payload_start = payload_start.checked_add(extension_len).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "invalid RTP header length")
+        })?;
+        if payload_start > packet.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "RTSP talkback RTP extension is truncated",
+            ));
+        }
+    }
+
+    let mut payload_end = packet.len();
+    if packet[0] & 0x20 != 0 {
+        let padding_len = usize::from(*packet.last().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "RTSP talkback RTP padding is empty",
+            )
+        })?);
+        if padding_len == 0 || padding_len > payload_end.saturating_sub(payload_start) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "RTSP talkback RTP padding is invalid",
+            ));
+        }
+        payload_end -= padding_len;
+    }
+
+    let pcma = &packet[payload_start..payload_end];
+    if pcma.is_empty() || pcma.len() > MAX_TALKBACK_PCMA_PAYLOAD {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "RTSP talkback PCMA payload has an invalid length",
+        ));
+    }
+
+    let mut pcm = Vec::with_capacity(pcma.len().saturating_mul(4));
+    for &sample in pcma {
+        let sample = alaw_to_pcm(sample).to_le_bytes();
+        // The native AO path is configured for 16 kHz input. Duplicate each
+        // decoded 8 kHz sample rather than silently playing back at half speed.
+        pcm.extend_from_slice(&sample);
+        pcm.extend_from_slice(&sample);
+    }
+    Ok(pcm)
+}
+
+/// Decode one ITU-T G.711 A-law byte to signed linear PCM16.
+pub fn alaw_to_pcm(sample: u8) -> i16 {
+    let sample = sample ^ 0x55;
+    let sign = sample & 0x80 != 0;
+    let exponent = (sample >> 4) & 0x07;
+    let mantissa = sample & 0x0f;
+    let magnitude = if exponent == 0 {
+        (i32::from(mantissa) << 4) + 8
+    } else {
+        ((i32::from(mantissa) << 4) + 0x108) << (exponent - 1)
+    };
+    if sign {
+        magnitude as i16
+    } else {
+        -(magnitude as i16)
+    }
 }
 
 async fn wait_for_codec(inner: &RtspServerInner) -> bool {
@@ -807,6 +1062,12 @@ async fn write_interleaved(
 }
 
 #[derive(Debug)]
+enum InboundMessage {
+    Request(InboundRequest),
+    Interleaved(InterleavedFrame),
+}
+
+#[derive(Debug)]
 struct InboundRequest {
     raw: Vec<u8>,
     parsed: Request<Vec<u8>>,
@@ -815,13 +1076,13 @@ struct InboundRequest {
 async fn read_request(
     reader: &mut OwnedReadHalf,
     buffer: &mut Vec<u8>,
-) -> io::Result<Option<InboundRequest>> {
+) -> io::Result<Option<InboundMessage>> {
     loop {
         if buffer.first() == Some(&b'$') {
             match InterleavedFrame::parse(buffer) {
-                Ok(Some((_frame, consumed))) => {
+                Ok(Some((frame, consumed))) => {
                     buffer.drain(..consumed);
-                    continue;
+                    return Ok(Some(InboundMessage::Interleaved(frame)));
                 }
                 Ok(None) => {}
                 Err(error) => {
@@ -835,7 +1096,10 @@ async fn read_request(
             match Message::<Vec<u8>>::parse(buffer) {
                 Ok((Message::Request(parsed), consumed)) => {
                     let raw = buffer.drain(..consumed).collect();
-                    return Ok(Some(InboundRequest { raw, parsed }));
+                    return Ok(Some(InboundMessage::Request(InboundRequest {
+                        raw,
+                        parsed,
+                    })));
                 }
                 Ok((_, _)) => {
                     return Err(io::Error::new(
@@ -901,12 +1165,19 @@ fn request_path(request: &Request<Vec<u8>>) -> Option<&str> {
     request.request_uri().map(|uri| uri_path(uri.as_str()))
 }
 
-fn setup_track(request: &Request<Vec<u8>>, path: &str, audio_enabled: bool) -> Option<MediaTrack> {
+fn setup_track(
+    request: &Request<Vec<u8>>,
+    path: &str,
+    audio_enabled: bool,
+    talkback_enabled: bool,
+) -> Option<MediaTrack> {
     let value = request_path(request)?;
     if value == format!("{path}/trackID=0") {
         Some(MediaTrack::Video)
     } else if audio_enabled && value == format!("{path}/trackID=1") {
         Some(MediaTrack::Audio)
+    } else if talkback_enabled && value == format!("{path}/backchannel") {
+        Some(MediaTrack::Backchannel)
     } else {
         None
     }
@@ -917,10 +1188,11 @@ fn request_path_allowed(
     method: &Method,
     path: &str,
     audio_enabled: bool,
+    talkback_enabled: bool,
 ) -> bool {
     match method {
         Method::Describe => request_path(request) == Some(path),
-        Method::Setup => setup_track(request, path, audio_enabled).is_some(),
+        Method::Setup => setup_track(request, path, audio_enabled, talkback_enabled).is_some(),
         _ => true,
     }
 }
@@ -1082,10 +1354,17 @@ fn build_sdp_from_inner(inner: &RtspServerInner) -> Option<String> {
         inner.video_width,
         inner.video_height,
         inner.audio_enabled,
+        inner.talkback.current().ok().flatten().is_some(),
     )
 }
 
-fn build_sdp(codec: &CodecState, width: u32, height: u32, audio_enabled: bool) -> Option<String> {
+fn build_sdp(
+    codec: &CodecState,
+    width: u32,
+    height: u32,
+    audio_enabled: bool,
+    talkback_enabled: bool,
+) -> Option<String> {
     if !codec.has_parameters() {
         return None;
     }
@@ -1141,7 +1420,17 @@ fn build_sdp(codec: &CodecState, width: u32, height: u32, audio_enabled: bool) -
             "m=audio 0 RTP/AVP {RTP_AUDIO_PAYLOAD_TYPE}\r\n\
              a=rtpmap:{RTP_AUDIO_PAYLOAD_TYPE} PCMA/{RTP_AUDIO_CLOCK_RATE}/1\r\n\
              a=ptime:20\r\n\
-             a=control:trackID=1\r\n"
+             a=control:trackID=1\r\n\
+             a=sendonly\r\n"
+        ));
+    }
+    if talkback_enabled {
+        sdp.push_str(&format!(
+            "m=audio 0 RTP/AVP {RTP_AUDIO_PAYLOAD_TYPE}\r\n\
+             a=rtpmap:{RTP_AUDIO_PAYLOAD_TYPE} PCMA/{RTP_AUDIO_CLOCK_RATE}/1\r\n\
+             a=ptime:20\r\n\
+             a=control:backchannel\r\n\
+             a=recvonly\r\n"
         ));
     }
     Some(sdp)
@@ -1609,6 +1898,8 @@ fn rtp_packet(
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, SocketAddrV4};
+    use std::sync::Mutex as TestMutex;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     fn h264_parameter_frame() -> Vec<u8> {
         [
@@ -1627,6 +1918,42 @@ mod tests {
             vec![0, 0, 0, 1, 0x26, 0x01, 0xdd],
         ]
         .concat()
+    }
+
+    struct TestTalkbackSink {
+        starts: AtomicUsize,
+        pcm: TestMutex<Vec<u8>>,
+        ready: Arc<tokio::sync::Notify>,
+    }
+
+    impl Default for TestTalkbackSink {
+        fn default() -> Self {
+            Self {
+                starts: AtomicUsize::new(0),
+                pcm: TestMutex::new(Vec::new()),
+                ready: Arc::new(tokio::sync::Notify::new()),
+            }
+        }
+    }
+
+    impl TalkbackSink for TestTalkbackSink {
+        fn start_talkback(&self) -> io::Result<()> {
+            self.starts.fetch_add(1, AtomicOrdering::Relaxed);
+            Ok(())
+        }
+
+        fn send_pcm(&self, pcm_bytes: &[u8]) -> io::Result<()> {
+            self.pcm
+                .lock()
+                .expect("test sink lock")
+                .extend_from_slice(pcm_bytes);
+            self.ready.notify_one();
+            Ok(())
+        }
+
+        fn stop_talkback(&self) -> io::Result<()> {
+            Ok(())
+        }
     }
 
     #[test]
@@ -1656,6 +1983,20 @@ mod tests {
         assert_eq!((packets[0][0] >> 1) & 0x3f, 48);
         assert!(packets.len() >= 2);
         assert_eq!((packets[1][0] >> 1) & 0x3f, 19);
+    }
+
+    #[test]
+    fn pcma_decoder_expands_to_16khz_pcm16() {
+        let packet = rtp_packet(RTP_AUDIO_PAYLOAD_TYPE, false, 1, 0, 0x1234_5678, &[0, 128]);
+        let pcm = decode_pcma_rtp(&packet).expect("valid PCMA RTP should decode");
+
+        assert_eq!(alaw_to_pcm(0), -5504);
+        assert_eq!(alaw_to_pcm(128), 5504);
+        let expected = [-5504_i16, -5504, 5504, 5504]
+            .into_iter()
+            .flat_map(|sample| sample.to_le_bytes())
+            .collect::<Vec<_>>();
+        assert_eq!(pcm, expected);
     }
 
     #[test]
@@ -1705,6 +2046,7 @@ mod tests {
             config.video_width,
             config.video_height,
             config.audio_enabled,
+            true,
         )
         .expect("complete parameter sets should produce SDP");
 
@@ -1714,6 +2056,8 @@ mod tests {
         assert!(sdp.contains("a=control:trackID=0\r\n"));
         assert!(sdp.contains("a=rtpmap:8 PCMA/8000/1\r\n"));
         assert!(sdp.contains("a=control:trackID=1\r\n"));
+        assert!(sdp.contains("a=control:backchannel\r\n"));
+        assert!(sdp.contains("a=recvonly\r\n"));
     }
 
     #[tokio::test]
@@ -1789,6 +2133,79 @@ mod tests {
             .expect("audio RTP packet should be complete");
         assert_eq!(packet[1], RTP_AUDIO_PAYLOAD_TYPE);
         assert_eq!(&packet[12..], &[0x55; AUDIO_FRAME_LEN]);
+    }
+
+    #[tokio::test]
+    async fn rtsp_backchannel_decodes_and_forwards_pcma() {
+        let config =
+            RtspServerConfig::new(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)));
+        let server = RtspServer::start(config).expect("RTSP server should start");
+        let sink = Arc::new(TestTalkbackSink::default());
+        server
+            .set_talkback_sink(sink.clone())
+            .expect("talkback sink should attach");
+        server
+            .push_video_frame(
+                &h264_parameter_frame(),
+                true,
+                VideoCodec::H264,
+                Some(1_000_000),
+            )
+            .expect("video parameters should publish");
+
+        let mut socket = tokio::net::TcpStream::connect(server.local_addr())
+            .await
+            .expect("client should connect");
+        socket
+            .write_all(b"DESCRIBE rtsp://127.0.0.1/live RTSP/1.0\r\nCSeq: 1\r\n\r\n")
+            .await
+            .expect("DESCRIBE should write");
+        let description = read_response(&mut socket).await;
+        assert!(description.contains("a=control:backchannel\r\n"));
+
+        socket
+            .write_all(b"SETUP rtsp://127.0.0.1/live/backchannel RTSP/1.0\r\nCSeq: 2\r\nTransport: RTP/AVP/TCP;unicast;interleaved=2-3\r\n\r\n")
+            .await
+            .expect("backchannel SETUP should write");
+        let response = read_response(&mut socket).await;
+        assert!(response.starts_with("RTSP/1.0 200 OK"));
+        let session = response
+            .lines()
+            .find_map(|line| line.strip_prefix("Session: "))
+            .expect("backchannel SETUP should return a session")
+            .to_string();
+
+        let play =
+            format!("PLAY rtsp://127.0.0.1/live RTSP/1.0\r\nCSeq: 3\r\nSession: {session}\r\n\r\n");
+        socket
+            .write_all(play.as_bytes())
+            .await
+            .expect("PLAY should write");
+        assert!(
+            read_response(&mut socket)
+                .await
+                .starts_with("RTSP/1.0 200 OK")
+        );
+        assert_eq!(sink.starts.load(AtomicOrdering::Relaxed), 1);
+
+        let packet = rtp_packet(RTP_AUDIO_PAYLOAD_TYPE, false, 1, 0, 0x1234_5678, &[0, 128]);
+        let mut interleaved = vec![b'$', 2];
+        interleaved.extend_from_slice(&(packet.len() as u16).to_be_bytes());
+        interleaved.extend_from_slice(&packet);
+        socket
+            .write_all(&interleaved)
+            .await
+            .expect("backchannel RTP should write");
+        tokio::time::timeout(Duration::from_secs(1), sink.ready.notified())
+            .await
+            .expect("backchannel PCM should reach the sink");
+
+        let pcm = sink.pcm.lock().expect("test sink lock").clone();
+        let expected = [-5504_i16, -5504, 5504, 5504]
+            .into_iter()
+            .flat_map(|sample| sample.to_le_bytes())
+            .collect::<Vec<_>>();
+        assert_eq!(pcm, expected);
     }
 
     #[tokio::test]

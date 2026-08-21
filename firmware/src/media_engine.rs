@@ -12,6 +12,7 @@ use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -61,6 +62,12 @@ const MAX_SPEAKER_AAC_PAYLOAD: usize = 48 * 1024;
 /// Maximum volume accepted by the native AO implementation.
 const MAX_SPEAKER_VOLUME: u32 = 100;
 
+/// Sample rate expected by the native AO resampler for direct PCM playback.
+const SPEAKER_PCM_SAMPLE_RATE: u64 = 16_000;
+
+/// Number of microseconds in one second for speaker timestamps.
+const MICROSECONDS_PER_SECOND: u64 = 1_000_000;
+
 /// Configuration for the camera-local media companion.
 #[derive(Clone, Debug)]
 pub struct MediaEngineConfig {
@@ -109,6 +116,7 @@ pub struct MediaEngine {
 #[derive(Clone)]
 pub struct MediaEngineHandle {
     socket: Arc<Mutex<UnixStream>>,
+    next_speaker_timestamp_us: Arc<AtomicU64>,
 }
 
 impl MediaEngine {
@@ -144,6 +152,7 @@ impl MediaEngine {
             socket,
             commands: MediaEngineHandle {
                 socket: Arc::new(Mutex::new(command_socket)),
+                next_speaker_timestamp_us: Arc::new(AtomicU64::new(0)),
             },
         })
     }
@@ -192,6 +201,7 @@ impl MediaEngineHandle {
     pub(crate) fn from_socket_for_test(socket: UnixStream) -> Self {
         Self {
             socket: Arc::new(Mutex::new(socket)),
+            next_speaker_timestamp_us: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -285,6 +295,45 @@ impl MediaEngineHandle {
             timestamp_us: 0,
             payload: vec![mode],
         })
+    }
+
+    fn reserve_speaker_timestamp(&self, duration_us: u64) -> u64 {
+        let mut current = self.next_speaker_timestamp_us.load(Ordering::Relaxed);
+        loop {
+            let next = current.saturating_add(duration_us);
+            match self.next_speaker_timestamp_us.compare_exchange(
+                current,
+                next,
+                Ordering::SeqCst,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return current,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
+impl crate::rtsp::TalkbackSink for MediaEngineHandle {
+    fn start_talkback(&self) -> io::Result<()> {
+        self.clear_speaker()
+    }
+
+    fn send_pcm(&self, pcm_bytes: &[u8]) -> io::Result<()> {
+        let sample_count = u64::try_from(pcm_bytes.len() / 2).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "talkback PCM sample count overflows",
+            )
+        })?;
+        let duration_us =
+            sample_count.saturating_mul(MICROSECONDS_PER_SECOND) / SPEAKER_PCM_SAMPLE_RATE;
+        let timestamp_us = self.reserve_speaker_timestamp(duration_us);
+        self.send_speaker_pcm(pcm_bytes, timestamp_us)
+    }
+
+    fn stop_talkback(&self) -> io::Result<()> {
+        self.clear_speaker()
     }
 }
 
@@ -398,10 +447,47 @@ mod tests {
     }
 
     #[test]
+    fn talkback_sink_assigns_contiguous_pcm_timestamps() {
+        let (mut companion, daemon) = UnixStream::pair().expect("Unix pair should create");
+        let handle = MediaEngineHandle {
+            socket: Arc::new(Mutex::new(daemon)),
+            next_speaker_timestamp_us: Arc::new(AtomicU64::new(0)),
+        };
+        let sink: &dyn crate::rtsp::TalkbackSink = &handle;
+
+        sink.start_talkback().expect("talkback should start");
+        sink.send_pcm(&[0; 320]).expect("first PCM should write");
+        sink.send_pcm(&[0; 320]).expect("second PCM should write");
+
+        assert_eq!(
+            MediaRecord::read_from(&mut companion)
+                .expect("clear command should read")
+                .expect("clear command should be present")
+                .kind,
+            RecordKind::SPEAKER_CLEAR
+        );
+        assert_eq!(
+            MediaRecord::read_from(&mut companion)
+                .expect("first PCM command should read")
+                .expect("first PCM command should be present")
+                .timestamp_us,
+            0
+        );
+        assert_eq!(
+            MediaRecord::read_from(&mut companion)
+                .expect("second PCM command should read")
+                .expect("second PCM command should be present")
+                .timestamp_us,
+            10_000
+        );
+    }
+
+    #[test]
     fn command_handle_frames_speaker_controls_without_interleaving() {
         let (mut companion, daemon) = UnixStream::pair().expect("Unix pair should create");
         let handle = MediaEngineHandle {
             socket: Arc::new(Mutex::new(daemon)),
+            next_speaker_timestamp_us: Arc::new(AtomicU64::new(0)),
         };
 
         handle

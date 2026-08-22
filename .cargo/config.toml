@@ -1,0 +1,2 @@
+[target.armv7-unknown-linux-musleabihf]
+linker = "native/arm-linker.sh"

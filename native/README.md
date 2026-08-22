@@ -15,10 +15,10 @@ split helper daemons and are not part of the deployed runtime.
 
 ## Build inputs
 
-The source and build logic are contained in this repository, but the binary
-must link against the factory ARM libraries that remain on the camera. Place
-a copy of the extracted camera library tree at `native/camera-rootfs/`, or set
-`CAMERA_ROOT` to a directory with this layout:
+The source, build logic, and minimum factory ARM library/IQ bundle are
+contained in this repository under `native/camera-rootfs/`. Set `CAMERA_ROOT`
+to another compatible extraction when building for a different factory
+firmware revision. The expected layout is:
 
 ```text
 <CAMERA_ROOT>/rootfs/lib/libc.so.0
@@ -28,9 +28,10 @@ a copy of the extracted camera library tree at `native/camera-rootfs/`, or set
 <CAMERA_ROOT>/home/lib/libfdk-aac.so.1
 ```
 
-The complete transitive library closure must be present in the same extracted
-rootfs. These factory binaries are local build inputs and are ignored by Git;
-they are not reimplemented or replaced by the companion.
+The checked-in bundle contains the complete transitive library closure for
+the validated camera revision. These factory libraries are not reimplemented
+or replaced by the companion; they are linked dynamically and must remain at
+their matching paths in the deployed camera image.
 
 Build the companion with:
 
@@ -40,4 +41,4 @@ CAMERA_ROOT="$PWD/native/camera-rootfs" ./native/build-c220-media-engine.sh
 
 The output defaults to `dist/c220-media-engine`. Copy that binary into the
 camera image as `/home/c220-media-engine`; the Rust firmware uses that path by
-default.
+default. The boot/startup integration is still a separate step.

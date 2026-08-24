@@ -6,9 +6,16 @@ edition = "2024"
 [dependencies]
 base64 = { workspace = true }
 bytes = { workspace = true }
+hmac = { workspace = true }
+libc = { workspace = true }
+md-5 = { workspace = true }
 rtp = { workspace = true }
 rtsp-runtime = { workspace = true, features = ["tokio"] }
 rtsp-types = { workspace = true }
-tokio = { workspace = true, features = ["net", "io-util", "macros", "rt-multi-thread", "sync", "time", "signal"] }
+rustls = { workspace = true, features = ["ring", "std"] }
+rustls-pki-types = { workspace = true, features = ["std"] }
+sha2 = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-rustls = { workspace = true, features = ["ring"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }

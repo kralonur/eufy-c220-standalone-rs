@@ -1,2 +1,7 @@
 [target.armv7-unknown-linux-musleabihf]
 linker = "native/arm-linker.sh"
+
+[env]
+# ring is a C-backed rustls provider; use the camera's clang/musl ABI wrapper
+# when cc-rs builds it for the ARM target.
+CC_armv7_unknown_linux_musleabihf = { value = "native/arm-cc.sh", relative = true }

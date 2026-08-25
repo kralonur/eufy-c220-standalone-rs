@@ -20,14 +20,20 @@ use std::io;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock};
-use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::{TcpListener, TcpStream};
+use std::time::{Duration, SystemTime};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
+use tokio::net::TcpListener;
 use tokio::sync::{Mutex, Notify, broadcast};
 use tokio::task::JoinHandle;
+use tokio_rustls::TlsAcceptor;
 
+use crate::digest::{Algorithm, DigestAuth, Lockout, Outcome};
 use crate::media::{MediaRecord, RecordKind};
+
+/// A boxed TCP or TLS stream used by one RTSP session.
+pub trait SessionTransport: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> SessionTransport for T {}
+type Session = Box<dyn SessionTransport>;
 
 /// Default RTSP listener port for the camera-local endpoint.
 pub const DEFAULT_RTSP_PORT: u16 = 554;
@@ -179,11 +185,33 @@ impl TalkbackSinkSlot {
     }
 }
 
+/// RTSPS listener configuration. It uses the same RTSP session protocol over
+/// a TLS stream and therefore also encrypts interleaved RTP media.
+#[derive(Clone)]
+pub struct RtspsConfig {
+    pub port: u16,
+    pub acceptor: TlsAcceptor,
+}
+
+impl std::fmt::Debug for RtspsConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RtspsConfig")
+            .field("port", &self.port)
+            .field("acceptor", &"[CONFIGURED]")
+            .finish()
+    }
+}
+
 /// RTSP listener configuration.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct RtspServerConfig {
-    /// Local address on which the camera serves RTSP.
+    /// Local address on which the camera serves plaintext RTSP.
     pub bind_address: SocketAddr,
+    /// Whether to bind the plaintext listener. A disabled listener keeps the
+    /// address for diagnostics while allowing port 0 to remain an ephemeral
+    /// port for library callers and tests.
+    pub plaintext_enabled: bool,
     /// Resource path advertised by DESCRIBE.
     pub path: String,
     /// Encoded video width advertised in SDP.
@@ -192,16 +220,43 @@ pub struct RtspServerConfig {
     pub video_height: u32,
     /// Whether the validated PCMA microphone track is advertised and served.
     pub audio_enabled: bool,
+    /// Optional Digest credentials for the RTSP control channel.
+    pub auth: Option<Arc<DigestAuth>>,
+    /// Shared per-client failed-login lockout.
+    pub lockout: Arc<Lockout>,
+    /// Optional encrypted listener, normally on port 322.
+    pub rtsps: Option<RtspsConfig>,
+}
+
+impl std::fmt::Debug for RtspServerConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RtspServerConfig")
+            .field("bind_address", &self.bind_address)
+            .field("plaintext_enabled", &self.plaintext_enabled)
+            .field("path", &self.path)
+            .field("video_width", &self.video_width)
+            .field("video_height", &self.video_height)
+            .field("audio_enabled", &self.audio_enabled)
+            .field("auth", &self.auth.as_ref().map(|_| "[CONFIGURED]"))
+            .field("lockout", &"[CONFIGURED]")
+            .field("rtsps", &self.rtsps)
+            .finish()
+    }
 }
 
 impl RtspServerConfig {
     pub fn new(bind_address: SocketAddr) -> Self {
         Self {
             bind_address,
+            plaintext_enabled: true,
             path: DEFAULT_RTSP_PATH.to_string(),
             video_width: DEFAULT_VIDEO_WIDTH,
             video_height: DEFAULT_VIDEO_HEIGHT,
             audio_enabled: false,
+            auth: None,
+            lockout: Arc::new(Lockout::new()),
+            rtsps: None,
         }
     }
 }
@@ -251,6 +306,8 @@ struct RtspServerInner {
     video_width: u32,
     video_height: u32,
     audio_enabled: bool,
+    auth: Option<Arc<DigestAuth>>,
+    lockout: Arc<Lockout>,
     media_tx: broadcast::Sender<VideoFrame>,
     audio_tx: broadcast::Sender<AudioFrame>,
     talkback: TalkbackSinkSlot,
@@ -306,10 +363,14 @@ impl RtspServer {
     /// sessions and the accept loop are asynchronous.
     pub fn start(config: RtspServerConfig) -> io::Result<Self> {
         let path = normalize_path(&config.path)?;
-        let listener = StdTcpListener::bind(config.bind_address)?;
-        listener.set_nonblocking(true)?;
-        let local_addr = listener.local_addr()?;
-        let listener = TcpListener::from_std(listener)?;
+        let (listener, local_addr) = if config.plaintext_enabled {
+            let listener = StdTcpListener::bind(config.bind_address)?;
+            listener.set_nonblocking(true)?;
+            let local_addr = listener.local_addr()?;
+            (Some(TcpListener::from_std(listener)?), local_addr)
+        } else {
+            (None, config.bind_address)
+        };
         let runtime = tokio::runtime::Handle::try_current().map_err(|error| {
             io::Error::other(format!("RTSP server requires a Tokio runtime: {error}"))
         })?;
@@ -321,6 +382,8 @@ impl RtspServer {
             video_width: config.video_width,
             video_height: config.video_height,
             audio_enabled: config.audio_enabled,
+            auth: config.auth,
+            lockout: config.lockout,
             media_tx,
             audio_tx,
             talkback: TalkbackSinkSlot::default(),
@@ -335,8 +398,25 @@ impl RtspServer {
             audio_frames_sent: AtomicU64::new(0),
         });
         let handles = Arc::new(AtomicUsize::new(1));
-        let accept_inner = Arc::clone(&inner);
-        runtime.spawn(async move { accept_loop(listener, accept_inner).await });
+        if let Some(listener) = listener {
+            let accept_inner = Arc::clone(&inner);
+            runtime.spawn(async move { accept_loop(listener, accept_inner, None).await });
+        }
+        if let Some(rtsps) = config.rtsps {
+            if rtsps.port == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "RTSPS port must be non-zero",
+                ));
+            }
+            let rtsps_listener = StdTcpListener::bind(("0.0.0.0", rtsps.port))?;
+            rtsps_listener.set_nonblocking(true)?;
+            let rtsps_listener = TcpListener::from_std(rtsps_listener)?;
+            let tls_inner = Arc::clone(&inner);
+            runtime.spawn(async move {
+                accept_loop(rtsps_listener, tls_inner, Some(rtsps.acceptor)).await
+            });
+        }
 
         Ok(Self {
             inner,
@@ -519,18 +599,31 @@ impl Drop for RtspServer {
     }
 }
 
-async fn accept_loop(listener: TcpListener, inner: Arc<RtspServerInner>) {
+async fn accept_loop(listener: TcpListener, inner: Arc<RtspServerInner>, tls: Option<TlsAcceptor>) {
     loop {
         tokio::select! {
             _ = inner.shutdown.notified() => break,
             accepted = listener.accept() => {
-                let Ok((stream, _peer)) = accepted else { break };
+                let Ok((stream, peer)) = accepted else { break };
                 if stream.set_nodelay(true).is_err() {
                     continue;
                 }
                 let client_inner = Arc::clone(&inner);
+                let acceptor = tls.clone();
                 tokio::spawn(async move {
-                    let _ = handle_connection(stream, client_inner).await;
+                    let result = match acceptor {
+                        Some(acceptor) => match acceptor.accept(stream).await {
+                            Ok(stream) => handle_connection(Box::new(stream), peer, client_inner).await,
+                            Err(error) => Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("TLS handshake failed: {error}"),
+                            )),
+                        },
+                        None => handle_connection(Box::new(stream), peer, client_inner).await,
+                    };
+                    if let Err(error) = result {
+                        tracing::debug!(%peer, %error, "RTSP client connection ended");
+                    }
                 });
             }
         }
@@ -567,8 +660,12 @@ impl ClientState {
     }
 }
 
-async fn handle_connection(stream: TcpStream, inner: Arc<RtspServerInner>) -> io::Result<()> {
-    let (mut reader, writer) = stream.into_split();
+async fn handle_connection(
+    stream: Session,
+    peer: SocketAddr,
+    inner: Arc<RtspServerInner>,
+) -> io::Result<()> {
+    let (mut reader, writer) = tokio::io::split(stream);
     let writer = Arc::new(Mutex::new(writer));
     let session_seed = inner.next_session.fetch_add(1, Ordering::Relaxed);
     let mut session = ServerSession::new().with_session_seed(session_seed);
@@ -590,7 +687,7 @@ async fn handle_connection(stream: TcpStream, inner: Arc<RtspServerInner>) -> io
         let Some(message) = message else { break };
         match message {
             InboundMessage::Request(request) => {
-                if handle_request(&inner, &writer, &mut session, &mut state, request).await? {
+                if handle_request(&inner, &writer, &mut session, &mut state, request, peer).await? {
                     break;
                 }
             }
@@ -606,12 +703,40 @@ async fn handle_connection(stream: TcpStream, inner: Arc<RtspServerInner>) -> io
 
 async fn handle_request(
     inner: &Arc<RtspServerInner>,
-    writer: &Arc<Mutex<OwnedWriteHalf>>,
+    writer: &Arc<Mutex<WriteHalf<Session>>>,
     session: &mut ServerSession,
     state: &mut ClientState,
     request: InboundRequest,
+    peer: SocketAddr,
 ) -> io::Result<bool> {
     let method = request.parsed.method().clone();
+
+    if let Some(auth) = inner.auth.as_ref() {
+        if inner.lockout.is_locked(peer.ip()).await {
+            send_error(writer, &request.parsed, StatusCode::Forbidden).await?;
+            return Ok(false);
+        }
+        let uri = request
+            .parsed
+            .request_uri()
+            .map(|value| value.as_str())
+            .unwrap_or("");
+        let authorization = authorization_header(&request.raw).unwrap_or_default();
+        let outcome = auth.authorize(
+            &method_name(&method),
+            uri,
+            &authorization,
+            SystemTime::now(),
+        );
+        if outcome != Outcome::Authorized {
+            if outcome == Outcome::Denied && !authorization.is_empty() {
+                inner.lockout.record_failure(peer.ip()).await;
+            }
+            send_unauthorized(writer, &request.parsed, auth, outcome == Outcome::Stale).await?;
+            return Ok(false);
+        }
+        inner.lockout.record_success(peer.ip()).await;
+    }
 
     if !method_supported(&method) {
         send_error(writer, &request.parsed, StatusCode::NotImplemented).await?;
@@ -928,7 +1053,7 @@ async fn wait_for_codec(inner: &RtspServerInner) -> bool {
 
 async fn media_loop(
     inner: Arc<RtspServerInner>,
-    writer: Arc<Mutex<OwnedWriteHalf>>,
+    writer: Arc<Mutex<WriteHalf<Session>>>,
     channel: u8,
     mut receiver: broadcast::Receiver<VideoFrame>,
 ) {
@@ -1023,7 +1148,7 @@ impl AudioPacketizer {
 
 async fn audio_media_loop(
     inner: Arc<RtspServerInner>,
-    writer: Arc<Mutex<OwnedWriteHalf>>,
+    writer: Arc<Mutex<WriteHalf<Session>>>,
     channel: u8,
     mut receiver: broadcast::Receiver<AudioFrame>,
 ) {
@@ -1048,7 +1173,7 @@ async fn audio_media_loop(
 }
 
 async fn write_interleaved(
-    writer: &Arc<Mutex<OwnedWriteHalf>>,
+    writer: &Arc<Mutex<WriteHalf<Session>>>,
     channel: u8,
     payload: &[u8],
 ) -> io::Result<()> {
@@ -1073,8 +1198,43 @@ struct InboundRequest {
     parsed: Request<Vec<u8>>,
 }
 
+/// Recover the raw Authorization header before rtsp-types discards headers.
+fn authorization_header(raw: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(raw).ok()?;
+    for line in text.split("\r\n").skip(1) {
+        if line.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':')
+            && name.eq_ignore_ascii_case("authorization")
+        {
+            return Some(value.trim().to_string());
+        }
+    }
+    None
+}
+
+/// Return the exact RTSP method token used in the Digest calculation.
+fn method_name(method: &Method) -> String {
+    match method {
+        Method::Describe => "DESCRIBE".to_string(),
+        Method::GetParameter => "GET_PARAMETER".to_string(),
+        Method::Options => "OPTIONS".to_string(),
+        Method::Pause => "PAUSE".to_string(),
+        Method::Play => "PLAY".to_string(),
+        Method::PlayNotify => "PLAY_NOTIFY".to_string(),
+        Method::Redirect => "REDIRECT".to_string(),
+        Method::Setup => "SETUP".to_string(),
+        Method::SetParameter => "SET_PARAMETER".to_string(),
+        Method::Announce => "ANNOUNCE".to_string(),
+        Method::Record => "RECORD".to_string(),
+        Method::Teardown => "TEARDOWN".to_string(),
+        Method::Extension(name) => name.clone(),
+    }
+}
+
 async fn read_request(
-    reader: &mut OwnedReadHalf,
+    reader: &mut ReadHalf<Session>,
     buffer: &mut Vec<u8>,
 ) -> io::Result<Option<InboundMessage>> {
     loop {
@@ -1322,7 +1482,7 @@ fn customize_response(
 }
 
 async fn send_error(
-    writer: &Arc<Mutex<OwnedWriteHalf>>,
+    writer: &Arc<Mutex<WriteHalf<Session>>>,
     request: &Request<Vec<u8>>,
     status: StatusCode,
 ) -> io::Result<()> {
@@ -1333,6 +1493,32 @@ async fn send_error(
     let response = Response::builder(Version::V1_0, status)
         .header(headers::CSEQ, cseq)
         .header(headers::SERVER, RTSP_SERVER_NAME)
+        .build(Vec::<u8>::new());
+    let bytes = serialize_message(&Message::from(response))?;
+    let mut writer = writer.lock().await;
+    writer.write_all(&bytes).await
+}
+
+async fn send_unauthorized(
+    writer: &Arc<Mutex<WriteHalf<Session>>>,
+    request: &Request<Vec<u8>>,
+    auth: &DigestAuth,
+    stale: bool,
+) -> io::Result<()> {
+    let cseq = request
+        .header(&headers::CSEQ)
+        .map(|value| value.as_str())
+        .unwrap_or("0");
+    let challenge = auth.challenge(SystemTime::now(), Algorithm::Md5);
+    let challenge = if stale {
+        format!("{challenge}, stale=true")
+    } else {
+        challenge
+    };
+    let response = Response::builder(Version::V1_0, StatusCode::Unauthorized)
+        .header(headers::CSEQ, cseq)
+        .header(headers::SERVER, RTSP_SERVER_NAME)
+        .header(headers::WWW_AUTHENTICATE, challenge)
         .build(Vec::<u8>::new());
     let bytes = serialize_message(&Message::from(response))?;
     let mut writer = writer.lock().await;
@@ -2206,6 +2392,27 @@ mod tests {
             .flat_map(|sample| sample.to_le_bytes())
             .collect::<Vec<_>>();
         assert_eq!(pcm, expected);
+    }
+
+    #[tokio::test]
+    async fn authenticated_rtsp_challenges_anonymous_clients() {
+        let mut config =
+            RtspServerConfig::new(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)));
+        config.auth = Some(Arc::new(
+            DigestAuth::new("camera", "test-password").expect("test entropy should be available"),
+        ));
+        let server = RtspServer::start(config).expect("RTSP server should start");
+        let mut socket = tokio::net::TcpStream::connect(server.local_addr())
+            .await
+            .expect("client should connect");
+        socket
+            .write_all(b"OPTIONS rtsp://127.0.0.1/live RTSP/1.0\r\nCSeq: 1\r\n\r\n")
+            .await
+            .expect("OPTIONS should write");
+        let response = read_response(&mut socket).await;
+        assert!(response.starts_with("RTSP/1.0 401 Unauthorized"));
+        assert!(response.contains("WWW-Authenticate: Digest"));
+        assert!(response.contains("algorithm=MD5"));
     }
 
     #[tokio::test]

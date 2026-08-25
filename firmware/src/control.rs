@@ -1,19 +1,28 @@
 //! Camera-local HTTP control and talkback service.
 //!
-//! This service is deliberately small and plaintext for the first camera
-//! bring-up slice. It accepts bounded HTTP/1.1 requests and forwards only
-//! validated speaker/night-mode commands through the shared `C220` media
-//! socket. Authentication and TLS belong to a later deployment module.
+//! This service is deliberately small and accepts bounded HTTP/1.1 requests.
+//! It forwards only validated speaker/night-mode commands through the shared
+//! `C220` media socket. Digest authentication is applied before endpoint
+//! dispatch, and production startup requires the listener to use TLS.
 
+use crate::digest::{DigestAuth, Lockout, Outcome};
 use crate::media_engine::MediaEngineHandle;
 use crate::ptz::{PAN_MAX_DEGREES, PtzController, PtzDirection};
 use std::io;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use std::time::SystemTime;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpListener;
 use tokio::sync::Notify;
+use tokio_rustls::TlsAcceptor;
+
+/// A boxed plaintext or TLS control connection.
+pub trait ControlTransport: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> ControlTransport for T {}
+type ControlStream = Box<dyn ControlTransport>;
 
 /// Default camera-local HTTP control port.
 pub const DEFAULT_CONTROL_PORT: u16 = 8_080;
@@ -23,6 +32,11 @@ const MAX_HEADER_LEN: usize = 8 * 1024;
 
 /// Maximum request body accepted by the control service.
 const MAX_BODY_LEN: usize = 64 * 1024;
+
+/// Existing factory telnetd invocation used for a deliberate one-boot shell.
+const TELNETD_PATH: &str = "/usr/sbin/telnetd";
+const TELNETD_PORT: &str = "23";
+const MAINTENANCE_SHELL_PATH: &str = "/bin/sh";
 
 /// AAC talkback access units use the validated 64 ms native cadence.
 const AAC_FRAME_DURATION_US: u64 = 64_000;
@@ -69,15 +83,39 @@ impl MediaEngineSlot {
 }
 
 /// HTTP listener configuration.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ControlServerConfig {
-    /// Local address on which the plaintext control API listens.
+    /// Local address on which the control API listens.
     pub bind_address: SocketAddr,
+    /// Digest credentials. `/healthz` remains public; production startup
+    /// requires this field to be configured.
+    pub auth: Option<Arc<DigestAuth>>,
+    /// Shared per-client failed-login lockout.
+    pub lockout: Arc<Lockout>,
+    /// TLS acceptor for the control listener in production.
+    pub tls_acceptor: Option<TlsAcceptor>,
+}
+
+impl std::fmt::Debug for ControlServerConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ControlServerConfig")
+            .field("bind_address", &self.bind_address)
+            .field("auth", &self.auth.as_ref().map(|_| "[CONFIGURED]"))
+            .field("lockout", &"[CONFIGURED]")
+            .field("tls", &self.tls_acceptor.as_ref().map(|_| "[CONFIGURED]"))
+            .finish()
+    }
 }
 
 impl ControlServerConfig {
-    pub const fn new(bind_address: SocketAddr) -> Self {
-        Self { bind_address }
+    pub fn new(bind_address: SocketAddr) -> Self {
+        Self {
+            bind_address,
+            auth: None,
+            lockout: Arc::new(Lockout::new()),
+            tls_acceptor: None,
+        }
     }
 }
 
@@ -110,9 +148,15 @@ impl ControlServer {
         let runtime = tokio::runtime::Handle::try_current().map_err(|error| {
             io::Error::other(format!("control server requires a Tokio runtime: {error}"))
         })?;
+        let maintenance_available = config.tls_acceptor.is_some() && config.auth.is_some();
+        let tls_acceptor = config.tls_acceptor;
         let inner = Arc::new(ControlInner {
             media,
             ptz,
+            auth: config.auth,
+            lockout: config.lockout,
+            maintenance_available,
+            maintenance_telnet_started: AtomicBool::new(false),
             active: AtomicBool::new(false),
             next_timestamp_us: AtomicU64::new(0),
             volume: AtomicU32::new(DEFAULT_VOLUME),
@@ -121,7 +165,7 @@ impl ControlServer {
             shutdown: Notify::new(),
         });
         let accept_inner = Arc::clone(&inner);
-        runtime.spawn(async move { accept_loop(listener, accept_inner).await });
+        runtime.spawn(async move { accept_loop(listener, accept_inner, tls_acceptor).await });
 
         Ok(Self { inner, local_addr })
     }
@@ -141,6 +185,11 @@ impl Drop for ControlServer {
 struct ControlInner {
     media: MediaEngineSlot,
     ptz: Option<Arc<PtzController>>,
+    auth: Option<Arc<DigestAuth>>,
+    lockout: Arc<Lockout>,
+    /// The shell route is exposed only on the authenticated TLS listener.
+    maintenance_available: bool,
+    maintenance_telnet_started: AtomicBool,
     active: AtomicBool,
     next_timestamp_us: AtomicU64,
     volume: AtomicU32,
@@ -149,24 +198,44 @@ struct ControlInner {
     shutdown: Notify,
 }
 
-async fn accept_loop(listener: TcpListener, inner: Arc<ControlInner>) {
+async fn accept_loop(listener: TcpListener, inner: Arc<ControlInner>, tls: Option<TlsAcceptor>) {
     loop {
         tokio::select! {
             _ = inner.shutdown.notified() => break,
             accepted = listener.accept() => {
-                let Ok((stream, _peer)) = accepted else { break };
+                let Ok((stream, peer)) = accepted else { break };
                 let client_inner = Arc::clone(&inner);
+                let acceptor = tls.clone();
                 tokio::spawn(async move {
-                    let _ = handle_connection(stream, client_inner).await;
+                    let result = match acceptor {
+                        Some(acceptor) => match acceptor.accept(stream).await {
+                            Ok(stream) => handle_connection(Box::new(stream), peer, client_inner).await,
+                            Err(error) => Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("TLS handshake failed: {error}"),
+                            )),
+                        },
+                        None => handle_connection(Box::new(stream), peer, client_inner).await,
+                    };
+                    if let Err(error) = result {
+                        tracing::debug!(%peer, %error, "control client connection ended");
+                    }
                 });
             }
         }
     }
 }
 
-async fn handle_connection(mut stream: TcpStream, inner: Arc<ControlInner>) -> io::Result<()> {
+async fn handle_connection(
+    mut stream: ControlStream,
+    peer: SocketAddr,
+    inner: Arc<ControlInner>,
+) -> io::Result<()> {
     let response = match read_request(&mut stream).await {
-        Ok(request) => dispatch(&inner, request).await,
+        Ok(request) => match authorize_request(&inner, &request, peer).await {
+            Ok(()) => dispatch(&inner, request).await,
+            Err(response) => response,
+        },
         Err(error) => error_response(400, &error.to_string()),
     };
     stream.write_all(&response).await
@@ -174,11 +243,15 @@ async fn handle_connection(mut stream: TcpStream, inner: Arc<ControlInner>) -> i
 
 struct HttpRequest {
     method: String,
+    /// Request path without the query string, used for routing.
     path: String,
+    /// Exact request target, used for Digest URI binding.
+    uri: String,
+    authorization: Option<String>,
     body: Vec<u8>,
 }
 
-async fn read_request(stream: &mut TcpStream) -> io::Result<HttpRequest> {
+async fn read_request(stream: &mut ControlStream) -> io::Result<HttpRequest> {
     let mut data = Vec::new();
     let header_end = loop {
         if let Some(index) = find_bytes(&data, b"\r\n\r\n") {
@@ -232,6 +305,7 @@ async fn read_request(stream: &mut TcpStream) -> io::Result<HttpRequest> {
     }
 
     let mut content_length = None;
+    let mut authorization = None;
     for line in lines {
         let Some((name, value)) = line.split_once(':') else {
             return Err(io::Error::new(
@@ -252,6 +326,8 @@ async fn read_request(stream: &mut TcpStream) -> io::Result<HttpRequest> {
                     "conflicting HTTP Content-Length headers",
                 ));
             }
+        } else if name.eq_ignore_ascii_case("authorization") {
+            authorization = Some(value.trim().to_string());
         } else if name.eq_ignore_ascii_case("transfer-encoding") && !value.trim().is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -281,6 +357,8 @@ async fn read_request(stream: &mut TcpStream) -> io::Result<HttpRequest> {
     Ok(HttpRequest {
         method: method.to_string(),
         path: target.split('?').next().unwrap_or(target).to_string(),
+        uri: target.to_string(),
+        authorization,
         body,
     })
 }
@@ -288,6 +366,57 @@ async fn read_request(stream: &mut TcpStream) -> io::Result<HttpRequest> {
 fn find_bytes(data: &[u8], needle: &[u8]) -> Option<usize> {
     data.windows(needle.len())
         .position(|window| window == needle)
+}
+
+async fn authorize_request(
+    inner: &ControlInner,
+    request: &HttpRequest,
+    peer: SocketAddr,
+) -> Result<(), Vec<u8>> {
+    let Some(auth) = inner.auth.as_ref() else {
+        return Ok(());
+    };
+    if request.method == "GET" && request.path == "/healthz" {
+        return Ok(());
+    }
+    if inner.lockout.is_locked(peer.ip()).await {
+        return Err(error_response(403, "authentication temporarily locked"));
+    }
+
+    let authorization = request.authorization.as_deref().unwrap_or("");
+    let outcome = auth.authorize(
+        &request.method,
+        &request.uri,
+        authorization,
+        SystemTime::now(),
+    );
+    if outcome == Outcome::Authorized {
+        inner.lockout.record_success(peer.ip()).await;
+        Ok(())
+    } else {
+        if outcome == Outcome::Denied && !authorization.is_empty() {
+            inner.lockout.record_failure(peer.ip()).await;
+        }
+        Err(unauthorized_response(auth, outcome == Outcome::Stale))
+    }
+}
+
+fn unauthorized_response(auth: &DigestAuth, stale: bool) -> Vec<u8> {
+    let challenges = auth.challenges(SystemTime::now());
+    let stale = if stale { ", stale=true" } else { "" };
+    let body = b"authentication required";
+    format!(
+        "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: {}{}\r\nWWW-Authenticate: {}{}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        challenges[0],
+        stale,
+        challenges[1],
+        stale,
+        body.len()
+    )
+    .into_bytes()
+    .into_iter()
+    .chain(body.iter().copied())
+    .collect()
 }
 
 async fn dispatch(inner: &Arc<ControlInner>, request: HttpRequest) -> Vec<u8> {
@@ -301,11 +430,65 @@ async fn dispatch(inner: &Arc<ControlInner>, request: HttpRequest) -> Vec<u8> {
         ("POST", "/talkback/audio") => talkback_audio(inner, request.body).await,
         ("POST", "/talkback/volume") => talkback_volume(inner, &request.body).await,
         ("POST", "/night_mode") => night_mode(inner, &request.body).await,
+        ("POST", "/maintenance/enable") => maintenance_enable(inner),
         ("GET", "/ptz/position") | ("GET", "/ptz/status") => ptz_position(inner).await,
         ("POST", "/ptz/move") => ptz_move(inner, &request.body).await,
         ("POST", "/ptz/stop") => ptz_stop(inner).await,
         ("POST", "/ptz/center") => ptz_center(inner).await,
         _ => error_response(404, "control endpoint not found"),
+    }
+}
+
+fn maintenance_enable(inner: &Arc<ControlInner>) -> Vec<u8> {
+    if !inner.maintenance_available {
+        return error_response(
+            404,
+            "maintenance endpoint requires TLS and Digest authentication",
+        );
+    }
+    if inner
+        .maintenance_telnet_started
+        .swap(true, Ordering::AcqRel)
+    {
+        return json_response(
+            200,
+            "OK",
+            r#"{"status":"ok","maintenance":"telnet","enabled":true,"port":23}"#,
+        );
+    }
+
+    let result = Command::new(TELNETD_PATH)
+        .args(["-p", TELNETD_PORT, "-l", MAINTENANCE_SHELL_PATH])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    match result {
+        Ok(mut child) => {
+            let pid = child.id();
+            // telnetd daemonises: the process spawned here exits almost
+            // immediately, so without this wait it stays a zombie for the rest
+            // of the boot. Nothing depends on the result.
+            tokio::task::spawn_blocking(move || {
+                let _ = child.wait();
+            });
+            tracing::warn!(
+                pid,
+                "TLS/Digest-authorized maintenance Telnet enabled for the current boot"
+            );
+            json_response(
+                202,
+                "Accepted",
+                r#"{"status":"ok","maintenance":"telnet","enabled":true,"port":23}"#,
+            )
+        }
+        Err(error) => {
+            inner
+                .maintenance_telnet_started
+                .store(false, Ordering::Release);
+            tracing::error!(%error, "could not start maintenance Telnet");
+            error_response(503, "maintenance Telnet could not be started")
+        }
     }
 }
 
@@ -687,7 +870,9 @@ fn error_response(status: u16, message: &str) -> Vec<u8> {
     );
     let reason = match status {
         400 => "Bad Request",
+        403 => "Forbidden",
         404 => "Not Found",
+        429 => "Too Many Requests",
         409 => "Conflict",
         503 => "Service Unavailable",
         _ => "Error",
@@ -708,6 +893,7 @@ mod tests {
     use super::*;
     use crate::media::{MediaRecord, RecordKind};
     use std::os::unix::net::UnixStream;
+    use tokio::net::TcpStream;
 
     async fn post(server: SocketAddr, path: &str, body: &[u8]) -> String {
         let mut socket = TcpStream::connect(server)
@@ -738,6 +924,64 @@ mod tests {
         assert_eq!(parse_json_u32_field(br#"{"volume":42}"#, "volume"), Ok(42));
         assert!(parse_json_u32_field(br#"{"volume":101}"#, "volume").is_ok());
         assert!(parse_json_u32_field(br#"{"volume":-1}"#, "volume").is_err());
+    }
+
+    #[tokio::test]
+    async fn maintenance_route_is_hidden_without_tls() {
+        let server = ControlServer::start(
+            ControlServerConfig::new(SocketAddr::from(([127, 0, 0, 1], 0))),
+            MediaEngineSlot::default(),
+            None,
+        )
+        .expect("control server should start");
+        let response = post(server.local_addr(), "/maintenance/enable", &[]).await;
+        assert!(response.starts_with("HTTP/1.1 404 Not Found"));
+    }
+
+    #[tokio::test]
+    async fn authenticated_control_leaves_only_health_public() {
+        let mut config = ControlServerConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)));
+        config.auth = Some(Arc::new(
+            DigestAuth::new("admin", "test-password").expect("test entropy should be available"),
+        ));
+        let server = ControlServer::start(config, MediaEngineSlot::default(), None)
+            .expect("control server should start");
+
+        let response = post(server.local_addr(), "/maintenance/enable", &[]).await;
+        assert!(response.starts_with("HTTP/1.1 401 Unauthorized"));
+
+        let mut socket = TcpStream::connect(server.local_addr())
+            .await
+            .expect("control client should connect");
+        socket
+            .write_all(
+                b"GET /talkback/status HTTP/1.1\r\nHost: camera\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .expect("protected request should write");
+        let mut response = Vec::new();
+        socket
+            .read_to_end(&mut response)
+            .await
+            .expect("protected response should read");
+        let response = String::from_utf8(response).expect("response should be UTF-8");
+        assert!(response.starts_with("HTTP/1.1 401 Unauthorized"));
+        assert_eq!(response.matches("WWW-Authenticate:").count(), 2);
+
+        let mut socket = TcpStream::connect(server.local_addr())
+            .await
+            .expect("health client should connect");
+        socket
+            .write_all(b"GET /healthz HTTP/1.1\r\nHost: camera\r\n\r\n")
+            .await
+            .expect("health request should write");
+        let mut response = Vec::new();
+        socket
+            .read_to_end(&mut response)
+            .await
+            .expect("health response should read");
+        let response = String::from_utf8(response).expect("health response should be UTF-8");
+        assert!(response.starts_with("HTTP/1.1 503 Service Unavailable"));
     }
 
     #[tokio::test]

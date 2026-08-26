@@ -23,6 +23,14 @@ cat >>"$TEMP" <<'EOF'
 
 # C220 standalone firmware services. Keep the factory boot setup above this
 # hook; c220-startup supervises the Rust daemon and its native media child.
+#
+# Bounded card recovery runs first and synchronously: it is the only path that
+# works with no network and no valid configuration, and wifi.txt has to be
+# applied before the Wi-Fi bootstrap reads the profile it writes.
+if [ -x /home/script/c220-recovery.sh ]; then
+    /home/script/c220-recovery.sh
+fi
+
 if [ -x /home/script/c220-startup.sh ]; then
     /home/script/c220-startup.sh &
 fi

@@ -3,7 +3,8 @@ set -eu
 
 # Build both camera-side executables and stage the files that belong in /home.
 # A preserved factory /home can be supplied with BASE_HOME; without it, the
-# result is a minimal overlay rather than a bootable replacement image.
+# result is a minimal overlay rather than a bootable replacement image. Secure
+# deployment is the default; set SECURE_DEPLOYMENT=0 only for board bring-up.
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 TARGET=${TARGET:-armv7-unknown-linux-musleabihf}
@@ -17,6 +18,7 @@ STRIP=${STRIP:-llvm-strip}
 SQUASHFS_OUT=${SQUASHFS_OUT:-}
 INSTALL_STARTUP_HOOK=${INSTALL_STARTUP_HOOK:-0}
 REMOVE_LEGACY_MEDIA=${REMOVE_LEGACY_MEDIA:-1}
+SECURE_DEPLOYMENT=${SECURE_DEPLOYMENT:-1}
 HOME_PARTITION_BYTES=4915200
 
 if [ -n "$BASE_HOME" ]; then
@@ -25,12 +27,36 @@ if [ -n "$BASE_HOME" ]; then
         exit 1
     fi
 fi
+case "$SECURE_DEPLOYMENT" in
+    0|1) ;;
+    *) echo "SECURE_DEPLOYMENT must be 0 or 1" >&2; exit 1 ;;
+esac
+case "$REMOVE_LEGACY_MEDIA" in
+    0|1) ;;
+    *) echo "REMOVE_LEGACY_MEDIA must be 0 or 1" >&2; exit 1 ;;
+esac
+if [ "$SECURE_DEPLOYMENT" = 1 ] && [ "$REMOVE_LEGACY_MEDIA" != 1 ]; then
+    echo "SECURE_DEPLOYMENT=1 requires REMOVE_LEGACY_MEDIA=1" >&2
+    exit 1
+fi
 
 rm -rf "$STAGE"
 mkdir -p "$STAGE/script" "$STAGE/lib"
 if [ -n "$BASE_HOME" ]; then
     cp -a "$BASE_HOME"/. "$STAGE"/
+    if [ "$SECURE_DEPLOYMENT" = 1 ] && [ -f "$STAGE/script/app.sh" ]; then
+        "$SCRIPT_DIR/harden-preserved-app.sh" "$STAGE/script/app.sh"
+    fi
 fi
+
+# `/home/nvram` must stay a real directory: the preserved boot script mounts the
+# writable jffs2 NVRAM partition onto that exact path. Replacing it with a
+# symlink breaks the mount (the factory rootfs has no `/nvram` to point at), and
+# the camera then boots with no credentials, no Wi-Fi profile and no services.
+# Mounting over a directory inside a read-only squashfs is fine, so an empty
+# directory is the correct placeholder.
+rm -rf "$STAGE/nvram"
+mkdir -p "$STAGE/nvram"
 
 if [ "$REMOVE_LEGACY_MEDIA" = 1 ]; then
     # These standalone helper names belong to the superseded split daemon;
@@ -43,16 +69,49 @@ if [ "$REMOVE_LEGACY_MEDIA" = 1 ]; then
         "$STAGE"/c220-hw-speaker
 fi
 
+if [ "$SECURE_DEPLOYMENT" = 1 ] && [ -n "$BASE_HOME" ]; then
+    # The standalone stack does not use the vendor cloud/P2P applications or
+    # their bundled certificate/private key. Keep tinymix because the preserved
+    # boot setup still uses that hardware utility; sn_write is not needed after
+    # the secure app hardening removes its SD-card device-info export.
+    rm -f "$STAGE"/app/GoDaddyCA.crt \
+        "$STAGE"/app/anker_t8w11 \
+        "$STAGE"/app/anker_t8w11_systemd \
+        "$STAGE"/app/anker_t8w11_watchdog \
+        "$STAGE"/app/cert.pem \
+        "$STAGE"/app/ipclink_eufy \
+        "$STAGE"/app/priv.key \
+        "$STAGE"/app/sn_write \
+        "$STAGE"/tools/iwpriv \
+        "$STAGE"/script/auto_rescue.sh \
+        "$STAGE"/watchdog_cfg.json \
+        "$STAGE"/lib/libaec_bf_process.so \
+        "$STAGE"/lib/libcore.so \
+        "$STAGE"/lib/librkaudio_common.so \
+        "$STAGE"/lib/librkaudio_detect.so \
+        "$STAGE"/lib/model_cfg.json
+    rm -rf "$STAGE"/audio_file "$STAGE"/font "$STAGE"/logo \
+        "$STAGE"/lib/model_zoo "$STAGE"/vqefiles
+fi
+
 (
     cd "$REPO_ROOT"
-    cargo build --release --locked --target "$TARGET"
+    # rustls' ring provider is compiled by cc-rs as part of the ARM build.
+    # Use the same clang-based ABI wrapper as the Rust linker; without this,
+    # cc-rs looks for an uninstalled arm-linux-musleabihf-gcc.
+    CC_armv7_unknown_linux_musleabihf="${CC_armv7_unknown_linux_musleabihf:-$REPO_ROOT/native/arm-cc.sh}" \
+        cargo build --release --locked --target "$TARGET"
 )
 cp "$REPO_ROOT/target/$TARGET/release/c220-firmware" "$STAGE/c220-firmware"
 "$STRIP" -s "$STAGE/c220-firmware"
 
 "$SCRIPT_DIR/build-c220-media-engine.sh" "$STAGE/c220-media-engine"
 cp "$SCRIPT_DIR/c220-startup.sh" "$STAGE/script/c220-startup.sh"
-chmod 755 "$STAGE/c220-firmware" "$STAGE/c220-media-engine" "$STAGE/script/c220-startup.sh"
+cp "$SCRIPT_DIR/c220-wifi.sh" "$STAGE/script/c220-wifi.sh"
+cp "$SCRIPT_DIR/c220-recovery.sh" "$STAGE/script/c220-recovery.sh"
+chmod 755 "$STAGE/c220-firmware" "$STAGE/c220-media-engine" \
+    "$STAGE/script/c220-startup.sh" "$STAGE/script/c220-wifi.sh" \
+    "$STAGE/script/c220-recovery.sh"
 
 # These are the only files from the local factory bundle that belong in /home.
 # The loader, libc, Rockchip, and C++ libraries stay in their preserved factory
@@ -74,7 +133,9 @@ if [ -n "$SQUASHFS_OUT" ]; then
         exit 1
     fi
     mkdir -p "$(dirname -- "$SQUASHFS_OUT")"
-    mksquashfs "$STAGE" "$SQUASHFS_OUT" -comp xz -b 131072 -noappend
+    # The extracted factory tree may have been unpacked by an unprivileged
+    # builder. Firmware files must still be root-owned on the target.
+    mksquashfs "$STAGE" "$SQUASHFS_OUT" -comp xz -b 131072 -noappend -all-root
     squashfs_size=$(stat -c '%s' "$SQUASHFS_OUT")
     if [ "$squashfs_size" -gt "$HOME_PARTITION_BYTES" ]; then
         echo "refusing oversized /home image: $squashfs_size > $HOME_PARTITION_BYTES bytes" >&2

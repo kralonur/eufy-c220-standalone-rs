@@ -12,7 +12,7 @@ use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -81,6 +81,8 @@ pub struct MediaEngineConfig {
     pub audio_card: String,
     /// Directory containing the AIQ calibration/configuration files.
     pub iq_directory: PathBuf,
+    /// Whether the native companion should open the microphone capture path.
+    pub audio_enabled: bool,
 }
 
 impl Default for MediaEngineConfig {
@@ -91,6 +93,51 @@ impl Default for MediaEngineConfig {
             video_device: PathBuf::from(DEFAULT_VIDEO_DEVICE),
             audio_card: DEFAULT_AUDIO_CARD.to_string(),
             iq_directory: PathBuf::from(DEFAULT_IQ_DIRECTORY),
+            audio_enabled: true,
+        }
+    }
+}
+
+/// A cross-task shutdown request for a media companion owned by a blocking
+/// task.
+#[derive(Clone, Default)]
+pub struct MediaEngineStopHandle {
+    child_pid: Arc<AtomicU32>,
+    socket: Arc<Mutex<Option<UnixStream>>>,
+}
+
+impl MediaEngineStopHandle {
+    fn set_child(&self, child: &Child) {
+        self.child_pid.store(child.id(), Ordering::Release);
+    }
+
+    fn set_socket(&self, socket: &UnixStream) -> io::Result<()> {
+        let socket = socket.try_clone()?;
+        let mut current = self
+            .socket
+            .lock()
+            .map_err(|_| io::Error::other("media stop socket lock poisoned"))?;
+        *current = Some(socket);
+        Ok(())
+    }
+
+    fn clear(&self) {
+        self.child_pid.store(0, Ordering::Release);
+        if let Ok(mut socket) = self.socket.lock() {
+            *socket = None;
+        }
+    }
+
+    /// Wake a blocked media read and ask the companion to terminate.
+    pub fn request_shutdown(&self) {
+        if let Ok(socket) = self.socket.lock()
+            && let Some(socket) = socket.as_ref()
+        {
+            let _ = socket.shutdown(Shutdown::Both);
+        }
+        let child_pid = self.child_pid.load(Ordering::Acquire);
+        if child_pid != 0 {
+            let _ = send_signal(child_pid, SIGTERM);
         }
     }
 }
@@ -105,6 +152,7 @@ pub struct MediaEngine {
     child: Child,
     socket: UnixStream,
     commands: MediaEngineHandle,
+    stop_handle: MediaEngineStopHandle,
 }
 
 /// Thread-safe writer for commands sent to the media companion.
@@ -121,14 +169,20 @@ pub struct MediaEngineHandle {
 
 impl MediaEngine {
     /// Launch the companion and connect to its private socket.
-    pub fn start(config: MediaEngineConfig) -> io::Result<Self> {
+    pub fn start(
+        config: MediaEngineConfig,
+        stop_handle: MediaEngineStopHandle,
+    ) -> io::Result<Self> {
         let mut child = launch(&config)?;
+        stop_handle.set_child(&child);
         let socket = match connect_until_ready(&config.socket_path, &mut child) {
             Ok(socket) => socket,
             Err(error) => {
                 let error_kind = error.kind();
                 let message = format!("media engine failed to become ready: {error}");
-                if let Err(cleanup_error) = terminate_child(&mut child) {
+                let cleanup_result = terminate_child(&mut child);
+                stop_handle.clear();
+                if let Err(cleanup_error) = cleanup_result {
                     return Err(io::Error::new(
                         error_kind,
                         format!("{message}; failed to terminate child: {cleanup_error}"),
@@ -143,9 +197,16 @@ impl MediaEngine {
             Err(error) => {
                 let _ = socket.shutdown(Shutdown::Both);
                 let _ = terminate_child(&mut child);
+                stop_handle.clear();
                 return Err(error);
             }
         };
+        if let Err(error) = stop_handle.set_socket(&socket) {
+            let _ = socket.shutdown(Shutdown::Both);
+            let _ = terminate_child(&mut child);
+            stop_handle.clear();
+            return Err(error);
+        }
 
         Ok(Self {
             child,
@@ -154,6 +215,7 @@ impl MediaEngine {
                 socket: Arc::new(Mutex::new(command_socket)),
                 next_speaker_timestamp_us: Arc::new(AtomicU64::new(0)),
             },
+            stop_handle,
         })
     }
 
@@ -182,11 +244,13 @@ impl MediaEngine {
         let socket_result = self.socket.shutdown(Shutdown::Both);
         let child_result = terminate_child(&mut self.child);
 
-        match (socket_result, child_result) {
+        let result = match (socket_result, child_result) {
             (_, Err(error)) => Err(error),
             (Err(error), Ok(())) => Err(error),
             (Ok(()), Ok(())) => Ok(()),
-        }
+        };
+        self.stop_handle.clear();
+        result
     }
 }
 
@@ -338,7 +402,8 @@ impl crate::rtsp::TalkbackSink for MediaEngineHandle {
 }
 
 fn launch(config: &MediaEngineConfig) -> io::Result<Child> {
-    Command::new(&config.program)
+    let mut command = Command::new(&config.program);
+    command
         .arg("--socket")
         .arg(&config.socket_path)
         .arg("--video-device")
@@ -346,7 +411,11 @@ fn launch(config: &MediaEngineConfig) -> io::Result<Child> {
         .arg("--card")
         .arg(&config.audio_card)
         .arg("--iq-dir")
-        .arg(&config.iq_directory)
+        .arg(&config.iq_directory);
+    if !config.audio_enabled {
+        command.arg("--no-audio");
+    }
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
@@ -444,6 +513,7 @@ mod tests {
         assert_eq!(config.video_device, Path::new(DEFAULT_VIDEO_DEVICE));
         assert_eq!(config.audio_card, DEFAULT_AUDIO_CARD);
         assert_eq!(config.iq_directory, Path::new(DEFAULT_IQ_DIRECTORY));
+        assert!(config.audio_enabled);
     }
 
     #[test]

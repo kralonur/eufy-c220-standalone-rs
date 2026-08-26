@@ -14,6 +14,7 @@
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -410,6 +411,7 @@ static int video_fps = DEFAULT_VIDEO_FPS;
 static int video_bitrate_kbps = DEFAULT_VIDEO_BITRATE_KBPS;
 
 static int video_fd = -1;
+static int audio_capture_enabled = 1;
 static int venc_channel = 1;
 static int streaming;
 static int aiq_started;
@@ -420,6 +422,7 @@ static int night_thread_started;
 static int current_night_mode = 0;   /* 0 = day, 1 = night */
 static int night_mode_target = -1;  /* -1 = auto, 0 = force day, 1 = force night */
 static pthread_mutex_t night_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t pts_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static int write_gpio_file(const char *path, const char *value);
 static int send_record(int kind, const unsigned char *payload, size_t length,
@@ -487,8 +490,12 @@ static void apply_night_mode(int is_night) {
 
     /* 4. Notify daemon client */
     unsigned char payload[2];
+    int target;
+    pthread_mutex_lock(&night_lock);
+    target = night_mode_target;
+    pthread_mutex_unlock(&night_lock);
     payload[0] = (unsigned char)(is_night != 0);
-    payload[1] = (unsigned char)(night_mode_target < 0 ? 0 : 1);
+    payload[1] = (unsigned char)(target < 0 ? 0 : 1);
     (void)send_record(KIND_NIGHT_MODE, payload, sizeof(payload), next_pts(), 0);
 }
 
@@ -655,8 +662,12 @@ static int xioctl(int fd, unsigned long request, void *arg) {
 
 static uint64_t next_pts(void) {
     static uint64_t pts;
+    uint64_t result;
+    pthread_mutex_lock(&pts_lock);
     pts += 50000;
-    return pts;
+    result = pts;
+    pthread_mutex_unlock(&pts_lock);
+    return result;
 }
 
 static uint64_t capture_pts_us(const struct v4l2_buffer *buffer) {
@@ -1614,6 +1625,10 @@ static int read_exact(int descriptor, unsigned char *buffer, size_t length) {
             if (stopping) return 0;
             continue;
         }
+        if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            if (stopping) return 0;
+            continue;
+        }
         if (count == 0) return 0;
         if (count < 0) return -1;
         buffer += count;
@@ -1624,7 +1639,7 @@ static int read_exact(int descriptor, unsigned char *buffer, size_t length) {
 
 static int serve_client(int descriptor) {
     unsigned char header[FRAME_HEADER_LEN];
-    unsigned char *payload = malloc(MAX_AAC_PAYLOAD);
+    unsigned char *payload = malloc(MAX_PCM_PAYLOAD);
 
     if (!payload) return -1;
     while (!stopping) {
@@ -1637,13 +1652,19 @@ static int serve_client(int descriptor) {
         uint32_t length = get_le32(&header[4]);
         uint64_t timestamp = get_le64(&header[8]);
         unsigned int kind = header[17];
+        size_t max_payload = MAX_AAC_PAYLOAD;
+        if (kind == KIND_SPEAKER_PCM && header[16] == 1) {
+            max_payload = MAX_PCM_PAYLOAD;
+        }
 
         if (kind == KIND_SPEAKER_CLEAR) {
+            if (length > MAX_PCM_PAYLOAD) break;
+            if (length > 0 && read_exact(descriptor, payload, length) <= 0) break;
             speaker_clear();
             continue;
         }
         if (kind == KIND_SPEAKER_VOLUME) {
-            if (length != 4) continue;
+            if (length != 4) break;
             if (read_exact(descriptor, payload, 4) <= 0) break;
             uint32_t volume = get_le32(payload);
             if (volume <= MAX_AO_VOLUME &&
@@ -1655,7 +1676,7 @@ static int serve_client(int descriptor) {
             continue;
         }
         if (kind == KIND_NIGHT_MODE) {
-            if (length < 1) continue;
+            if (length == 0 || length > MAX_PCM_PAYLOAD) break;
             if (read_exact(descriptor, payload, length) <= 0) break;
             int mode = payload[0];
             if (mode == 0) {
@@ -1679,11 +1700,11 @@ static int serve_client(int descriptor) {
             continue;
         }
         if (kind != KIND_SPEAKER_PCM) {
-            if (length > MAX_AAC_PAYLOAD) break;
+            if (length > MAX_PCM_PAYLOAD) break;
             if (length > 0 && read_exact(descriptor, payload, length) <= 0) break;
             continue;
         }
-        if (length == 0 || length > MAX_AAC_PAYLOAD) break;
+        if (length == 0 || length > max_payload) break;
         if (read_exact(descriptor, payload, length) <= 0) break;
         if (header[16] == 1) {
             (void)speaker_send_pcm16(payload, length, timestamp);
@@ -1711,6 +1732,11 @@ static void *audio_out_thread(void *argument) {
             if (stopping) break;
             usleep(10000);
             continue;
+        }
+        {
+            struct timeval receive_timeout = { 1, 0 };
+            (void)setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO,
+                             &receive_timeout, sizeof(receive_timeout));
         }
         fprintf(stderr, "media_client_connected=1\n");
         client_replace(descriptor);
@@ -1759,12 +1785,14 @@ int main(int argc, char **argv) {
     struct sigaction action;
     pthread_t video, audio, speaker;
     pthread_attr_t thread_attr;
+    int audio_started = 0;
 
     for (int index = 1; index < argc; ++index) {
         if (strcmp(argv[index], "--socket") == 0 && index + 1 < argc) socket_path = argv[++index];
         else if (strcmp(argv[index], "--video-device") == 0 && index + 1 < argc) video_device = argv[++index];
         else if (strcmp(argv[index], "--card") == 0 && index + 1 < argc) audio_card = argv[++index];
         else if (strcmp(argv[index], "--iq-dir") == 0 && index + 1 < argc) iq_dir = argv[++index];
+        else if (strcmp(argv[index], "--no-audio") == 0) audio_capture_enabled = 0;
         else if (strcmp(argv[index], "--sub") == 0) sub_enabled = 1;
         else if (strcmp(argv[index], "--sub-dry") == 0) {
             /* Diagnose the cost split: scale only, never feed the encoder. */
@@ -1825,9 +1853,14 @@ int main(int argc, char **argv) {
         report_error("video_thread", -1);
         _exit(2);
     }
-    if (pthread_create(&audio, &thread_attr, audio_thread, NULL) != 0) {
-        report_error("audio_thread", -1);
-        _exit(2);
+    if (audio_capture_enabled) {
+        if (pthread_create(&audio, &thread_attr, audio_thread, NULL) != 0) {
+            report_error("audio_thread", -1);
+            _exit(2);
+        }
+        audio_started = 1;
+    } else {
+        fprintf(stderr, "media_audio_disabled=1\n");
     }
     if (pthread_create(&speaker, &thread_attr, audio_out_thread, NULL) != 0) {
         report_error("speaker_thread", -1);
@@ -1853,7 +1886,7 @@ int main(int argc, char **argv) {
         night_thread_started = 0;
     }
     pthread_join(speaker, NULL);
-    pthread_join(audio, NULL);
+    if (audio_started) pthread_join(audio, NULL);
     pthread_join(video, NULL);
 
     if (video_input) {

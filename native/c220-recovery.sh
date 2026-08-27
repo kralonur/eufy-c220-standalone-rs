@@ -33,7 +33,12 @@ WIFI_TXT="$SD_MOUNT/wifi.txt"
 MAINTENANCE_TXT="$SD_MOUNT/maintenance.txt"
 PROFILE=/home/nvram/fs_config/wpa_supplicant.conf
 RUNTIME=/var/run/wpa_supplicant/wpa_supplicant.conf
+SECURITY_CONFIG=/home/nvram/system/standalone_auth.conf
 LOG_FILE=/tmp/c220-recovery.log
+
+# Shared definition of the rescue network, used for the unprovisioned state below.
+RESCUE_LIB=${RESCUE_LIB:-/home/script/c220-rescue.sh}
+. "$RESCUE_LIB"
 
 log_message() {
     printf '%s %s\n' "$(date '+%H:%M:%S')" "$*" >>"$LOG_FILE"
@@ -176,4 +181,25 @@ if [ -f "$WIFI_TXT" ]; then
     apply_wifi_file
 else
     log_message "no wifi.txt on the card"
+fi
+
+# No security config means the firmware refuses to start any service, so the shell
+# is the only way in and this is the moment an owner has to provision the camera.
+# That is also exactly the state a factory reset leaves behind, so it is treated
+# as the unprovisioned state: without a stored profile the camera also joins the
+# rescue network, which is the out-of-the-box behaviour the vendor firmware had.
+if [ ! -r "$SECURITY_CONFIG" ]; then
+    if [ ! -s "$PROFILE" ]; then
+        if rescue_write_profile 1; then
+            log_message "unprovisioned: joining the rescue network $(rescue_ssid)"
+        else
+            log_message "unprovisioned: could not write the rescue profile"
+        fi
+    else
+        log_message "unprovisioned: keeping the stored network, no security config yet"
+    fi
+    if [ -x /usr/sbin/telnetd ]; then
+        /usr/sbin/telnetd -p 23 -l /bin/sh >/dev/null 2>&1 &
+        log_message "unprovisioned: provisioning shell started on port 23"
+    fi
 fi

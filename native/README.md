@@ -160,18 +160,24 @@ device cannot defend against - so keep the recovery card where the camera's
 credentials deserve to be, and leave it out of the camera in normal operation.
 The recovery log is written to `/tmp/c220-recovery.log` on each boot.
 
-### Button recovery
+### Button recovery and factory reset
 
-Holding the physical reset button for ten seconds puts the camera on a known
-network with the maintenance shell open, which needs neither the network nor a
-working configuration and no tools at all. This board routes the button to a
-SARADC key ladder rather than a GPIO (measured: 1020-1023 idle, 557-561 held), and
-this kernel has no input/evdev subsystem, so `script/c220-button.sh` samples the
-IIO channel directly.
+The physical reset button has two tiers, separated on purpose so a short press can
+never destroy a working camera's credentials:
+
+| hold | effect |
+| --- | --- |
+| 5 s | joins the rescue hotspot and opens the maintenance shell for this boot |
+| 10 s | factory reset: wipes credentials, certificate, key, Wi-Fi and markers, then reboots |
+
+This board routes the button to a SARADC key ladder rather than a GPIO, and this
+kernel has no input/evdev subsystem, so `script/c220-button.sh` samples the IIO
+channel directly (measured: 1020-1023 idle, 557-561 held, threshold 800).
 
 The camera cannot host an access point: the factory rootfs ships no hostapd or
-DHCP server. It therefore *joins* a hotspot instead, which is what the vendor's
-rescue mode did. The defaults are `RescueAP` / `12345678`; override them with
+DHCP server, so there is nothing to hand out addresses. It therefore *joins* a
+hotspot instead, which is what the vendor's rescue mode did. The defaults are
+`RescueAP` / `12345678`; override them with
 
 ```sh
 SSID=MyPhoneHotspot
@@ -179,13 +185,30 @@ PSK=my-hotspot-password
 ```
 
 in `/home/nvram/system/standalone_rescue.conf` (mode 0600, parsed as data and
-never sourced). The profile is written to NVRAM and the supplicant restarted, so
-the camera reconnects on its own, and the button triggers once per boot.
+never sourced).
 
-This is a physical control, so it is a physical-access path by design: whoever can
-reach the button can put the camera on their own network and open a root shell.
-That is the same trust level as the card slot, and it is the point - it is the
-only recovery route that needs no tools.
+### Unprovisioned state
+
+A camera with no `standalone_auth.conf` cannot start any service - that is the
+fail-closed rule - so `script/c220-recovery.sh` treats it as unprovisioned and
+provisions the way in: with no stored Wi-Fi profile it joins the rescue network,
+and it opens the maintenance shell on port 23. This is the state a factory reset
+leaves behind and the state a new owner receives, matching the vendor firmware's
+out-of-the-box behaviour. Provision from that shell with
+`/home/script/wificonnect.sh "<ssid>" WPA "<psk>"` and by writing
+`standalone_auth.conf` plus the certificate and key as described above.
+
+The factory reset deliberately keeps the vendor's own NVRAM identity - board
+serial, country, rate-power tables, the factory database and logs - because those
+identify the hardware rather than the deployment and cannot be regenerated. See
+`script/c220-factory-reset.sh` for the exact list; `DRY_RUN=1` prints it without
+changing anything.
+
+Both the button and the card are physical controls, so they are physical-access
+paths by design: whoever can reach them can move the camera to their own network
+and open a root shell. That is the same trust level as the card slot, and it is
+the point - they are the recovery routes that need no tools and no working
+network.
 
 Microphone capture is opt-in. Create the root-owned marker
 `/home/nvram/system/.standalone_audio_enable` before starting the service when

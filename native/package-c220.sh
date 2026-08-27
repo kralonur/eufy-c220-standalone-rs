@@ -110,9 +110,12 @@ cp "$SCRIPT_DIR/c220-startup.sh" "$STAGE/script/c220-startup.sh"
 cp "$SCRIPT_DIR/c220-wifi.sh" "$STAGE/script/c220-wifi.sh"
 cp "$SCRIPT_DIR/c220-recovery.sh" "$STAGE/script/c220-recovery.sh"
 cp "$SCRIPT_DIR/c220-button.sh" "$STAGE/script/c220-button.sh"
+cp "$SCRIPT_DIR/c220-rescue.sh" "$STAGE/script/c220-rescue.sh"
+cp "$SCRIPT_DIR/c220-factory-reset.sh" "$STAGE/script/c220-factory-reset.sh"
 chmod 755 "$STAGE/c220-firmware" "$STAGE/c220-media-engine" \
     "$STAGE/script/c220-startup.sh" "$STAGE/script/c220-wifi.sh" \
-    "$STAGE/script/c220-recovery.sh" "$STAGE/script/c220-button.sh"
+    "$STAGE/script/c220-recovery.sh" "$STAGE/script/c220-button.sh" \
+    "$STAGE/script/c220-rescue.sh" "$STAGE/script/c220-factory-reset.sh"
 
 # These are the only files from the local factory bundle that belong in /home.
 # The loader, libc, Rockchip, and C++ libraries stay in their preserved factory

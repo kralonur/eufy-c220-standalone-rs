@@ -88,6 +88,13 @@ if [ -x /home/script/c220-wifi.sh ]; then
     /home/script/c220-wifi.sh &
 fi
 
+# The physical button is a recovery path: it has to work when the network, the
+# configuration or the firmware are broken, so it is started here, outside the
+# configuration loop, and never blocks anything.
+if [ -x /home/script/c220-button.sh ]; then
+    /home/script/c220-button.sh &
+fi
+
 # Credentials, ports, and certificate paths live on writable NVRAM. Re-read the
 # file for every supervisor iteration so an administrator can repair a bad
 # configuration and reboot/restart without rebuilding the SquashFS image.

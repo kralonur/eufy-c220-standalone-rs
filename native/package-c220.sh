@@ -109,9 +109,10 @@ cp "$REPO_ROOT/target/$TARGET/release/c220-firmware" "$STAGE/c220-firmware"
 cp "$SCRIPT_DIR/c220-startup.sh" "$STAGE/script/c220-startup.sh"
 cp "$SCRIPT_DIR/c220-wifi.sh" "$STAGE/script/c220-wifi.sh"
 cp "$SCRIPT_DIR/c220-recovery.sh" "$STAGE/script/c220-recovery.sh"
+cp "$SCRIPT_DIR/c220-button.sh" "$STAGE/script/c220-button.sh"
 chmod 755 "$STAGE/c220-firmware" "$STAGE/c220-media-engine" \
     "$STAGE/script/c220-startup.sh" "$STAGE/script/c220-wifi.sh" \
-    "$STAGE/script/c220-recovery.sh"
+    "$STAGE/script/c220-recovery.sh" "$STAGE/script/c220-button.sh"
 
 # These are the only files from the local factory bundle that belong in /home.
 # The loader, libc, Rockchip, and C++ libraries stay in their preserved factory

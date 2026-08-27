@@ -144,16 +144,21 @@ while :; do
         [ -n "${STANDALONE_HTTP_PASSWORD_FILE:-}" ] && \
             export HTTP_PASSWORD_FILE="$STANDALONE_HTTP_PASSWORD_FILE"
         if [ "$insecure_bringup" = 1 ]; then
-            export RTSP_PORT="${STANDALONE_RTSP_PORT:-554}"
+            # Board bring-up: the one-boot marker is the only thing that may
+            # retire TLS and reopen plaintext RTSP, so the values are fixed here
+            # and cannot come from a configuration file.
+            export RTSP_PORT=554
             export RTSPS_PORT="${STANDALONE_RTSPS_PORT:-0}"
-            export API_TLS="${STANDALONE_API_TLS:-0}"
+            export API_TLS=0
             export STANDALONE_INSECURE_BRINGUP=1
         else
-            # Secure defaults mean a missing setting cannot silently reopen
-            # plaintext RTSP or disable the control-plane TLS requirement.
-            export RTSP_PORT="${STANDALONE_RTSP_PORT:-0}"
+            # Secure mode: plaintext RTSP is retired and the control plane must
+            # be TLS, so neither is configurable. Leaving these two as settings
+            # only created a way to make the firmware refuse to start; a stale
+            # STANDALONE_RTSP_PORT or STANDALONE_API_TLS is now ignored.
+            export RTSP_PORT=0
             export RTSPS_PORT="${STANDALONE_RTSPS_PORT:-322}"
-            export API_TLS="${STANDALONE_API_TLS:-1}"
+            export API_TLS=1
         fi
         [ -n "${STANDALONE_RTSP_CERT_FILE:-}" ] && \
             export RTSP_CERT_FILE="$STANDALONE_RTSP_CERT_FILE"

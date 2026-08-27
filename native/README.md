@@ -108,21 +108,26 @@ STANDALONE_RTSP_USERNAME=frigate
 STANDALONE_RTSP_PASSWORD_FILE=/home/nvram/system/standalone_rtsp_password
 STANDALONE_HTTP_USERNAME=admin
 STANDALONE_HTTP_PASSWORD_FILE=/home/nvram/system/standalone_http_password
-STANDALONE_RTSP_PORT=0
 STANDALONE_RTSPS_PORT=322
 STANDALONE_RTSP_CERT_FILE=/home/nvram/system/standalone_rtsp_cert.pem
 STANDALONE_RTSP_KEY_FILE=/home/nvram/system/standalone_rtsp_key.pem
-STANDALONE_API_TLS=1
 ```
 
 Use mode `0600` for the config and both password/key files. The startup hook
 maps these values to the firmware's environment. In secure mode, missing or
 invalid configuration stops the service rather than opening a fallback:
-`RTSP_PORT=0` disables plaintext RTSP, `RTSPS_PORT` must be nonzero, TLS 1.3
-protects both RTSPS and the HTTP control API, and both listeners require Digest
-credentials. `/healthz` is the only intentionally unauthenticated endpoint.
-The certificate must contain the camera address in its IP SAN, and clients
-must verify it against the LAN CA.
+`RTSPS_PORT` must be nonzero, TLS 1.3 protects both RTSPS and the HTTP control
+API, and both listeners require Digest credentials. `/healthz` is the only
+intentionally unauthenticated endpoint. The certificate must contain the camera
+address in its IP SAN, and clients must verify it against the LAN CA.
+
+Plaintext RTSP and a plaintext control API are not configurable, because secure
+mode cannot allow them: they are fixed off, and only the one-boot bring-up marker
+below can reopen them. `STANDALONE_RTSP_PORT` and `STANDALONE_API_TLS` therefore
+no longer exist as settings and are ignored if an older configuration still sets
+them - having them as variables only provided a way to make the firmware refuse
+to start. `STANDALONE_RTSPS_PORT` remains a setting because choosing a different
+port is a legitimate preference.
 
 For offline board bring-up only, create the one-boot marker
 `/home/nvram/system/.standalone_insecure_bringup`; it permits the legacy

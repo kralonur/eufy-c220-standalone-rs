@@ -14,6 +14,7 @@ use rtsp::{RtspServer, RtspServerConfig, RtspsConfig};
 pub mod clock;
 pub mod control;
 pub mod digest;
+pub mod identity;
 pub mod media;
 pub mod media_engine;
 pub mod ptz;
@@ -129,13 +130,32 @@ async fn run_firmware() -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut tls_acceptor = None;
     if rtsps_port != 0 || api_tls {
         match (cert_file.as_deref(), key_file.as_deref()) {
-            (Some(cert_file), Some(key_file)) => match tls::build_acceptor(cert_file, key_file) {
-                Ok(acceptor) => tls_acceptor = Some(acceptor),
-                Err(error) if rtsps_port == 0 => {
-                    tracing::warn!(%error, "control API TLS unavailable; serving plaintext")
+            (Some(cert_file), Some(key_file)) => {
+                // First boot: the camera creates its own certificate rather than
+                // requiring the owner to run a certificate authority. An installed
+                // certificate is never overwritten, and a generation failure is
+                // reported by the acceptor below, which is the authority on whether
+                // the pair is usable.
+                if !insecure_bringup {
+                    match identity::ensure_self_signed(cert_file, key_file) {
+                        Ok(identity::Outcome::Generated(names)) => tracing::info!(
+                            names = %names.join(", "),
+                            "generated a self-signed certificate; clients trust it on first use"
+                        ),
+                        Ok(identity::Outcome::Existing) => {}
+                        Err(error) => {
+                            tracing::warn!(%error, "could not generate a self-signed certificate")
+                        }
+                    }
                 }
-                Err(error) => return Err(Box::new(error)),
-            },
+                match tls::build_acceptor(cert_file, key_file) {
+                    Ok(acceptor) => tls_acceptor = Some(acceptor),
+                    Err(error) if rtsps_port == 0 => {
+                        tracing::warn!(%error, "control API TLS unavailable; serving plaintext")
+                    }
+                    Err(error) => return Err(Box::new(error)),
+                }
+            }
             _ if rtsps_port != 0 => {
                 return Err(Box::new(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -145,6 +165,7 @@ async fn run_firmware() -> Result<(), Box<dyn Error + Send + Sync>> {
             _ => tracing::warn!("control API TLS not configured; serving plaintext"),
         }
     }
+
     let rtsps = if rtsps_port == 0 {
         None
     } else {

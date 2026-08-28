@@ -19,6 +19,9 @@ hmac = { version = "0.12.1", default-features = false }
 # `settimeofday` for the SNTP clock sync; libc is already in the tree via tokio.
 libc = "0.2.189"
 md-5 = { version = "0.10.6", default-features = false }
+# Self-signed certificate generation for first boot. Pure Rust and reuses the
+# ring provider already selected for rustls, so no second crypto stack is added.
+rcgen = { version = "0.14.10", default-features = false, features = ["pem", "ring"] }
 rtp = "0.17.2"
 rtsp-runtime = "0.6.0"
 rtsp-types = "0.1.3"

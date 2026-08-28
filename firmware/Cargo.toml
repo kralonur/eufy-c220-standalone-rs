@@ -9,6 +9,7 @@ bytes = { workspace = true }
 hmac = { workspace = true }
 libc = { workspace = true }
 md-5 = { workspace = true }
+rcgen = { workspace = true }
 rtp = { workspace = true }
 rtsp-runtime = { workspace = true, features = ["tokio"] }
 rtsp-types = { workspace = true }

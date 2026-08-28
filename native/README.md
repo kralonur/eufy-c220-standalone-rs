@@ -118,8 +118,36 @@ maps these values to the firmware's environment. In secure mode, missing or
 invalid configuration stops the service rather than opening a fallback:
 `RTSPS_PORT` must be nonzero, TLS 1.3 protects both RTSPS and the HTTP control
 API, and both listeners require Digest credentials. `/healthz` is the only
-intentionally unauthenticated endpoint. The certificate must contain the camera
-address in its IP SAN, and clients must verify it against the LAN CA.
+intentionally unauthenticated endpoint.
+
+#### The certificate is generated on first boot
+
+A new camera is not left needing a certificate authority: when neither
+`STANDALONE_RTSP_CERT_FILE` nor `STANDALONE_RTSP_KEY_FILE` exists, the firmware
+generates a self-signed pair itself (ECDSA P-256, one year-and-a-decade-long
+validity that does not depend on the board's clockless boot) and installs it with
+the key at mode 0600. Its subject alternative names are `c220.local`, loopback
+and every IPv4 address the camera holds, so the address the owner types into a
+client is in the certificate. Encryption stays mandatory; only the CA ceremony is
+removed.
+
+A certificate the owner installs is never overwritten, and an owner who wants
+proper verification writes `cert.pem` and `key.pem` onto the provisioning card,
+or places them at the configured paths. To replace a generated certificate with a
+newly generated one, delete both files and reboot.
+
+Because a self-signed certificate cannot be verified against a public CA, clients
+either pin it or trust it explicitly. It is public information, so it can be
+fetched from the camera itself:
+
+```sh
+openssl s_client -connect <camera>:322 -servername <camera> </dev/null 2>/dev/null \
+  | openssl x509 -outform PEM > c220.pem
+```
+
+Then point the client's CA file at `c220.pem` (a self-signed certificate is its
+own issuer) or at the LAN CA when the owner issued the certificate properly. The
+fingerprint to pin is `openssl x509 -in c220.pem -noout -fingerprint -sha256`.
 
 Plaintext RTSP and a plaintext control API are not configurable, because secure
 mode cannot allow them: they are fixed off, and only the one-boot bring-up marker
@@ -147,23 +175,54 @@ a trusted LAN and close/reboot the camera when finished.
 A camera with no working network has no other management path, and reaching it
 physically is slow. `script/c220-recovery.sh` therefore keeps a narrowly bounded
 card-based path that runs before the services start. The card is mounted
-read-only with `nosuid,nodev,noexec`, and only two files are recognised:
+read-only with `nosuid,nodev,noexec`, and only these files are recognised:
 
 | file | effect |
 | --- | --- |
 | `wifi.txt` | `SSID=...`, `PSK=...`, `MODE=WPA\|WEP\|NONE`. Parsed as data, never sourced. Writes the supplicant profile the Wi-Fi bootstrap reads, so the camera can be moved to a new network with no console |
+| `provision.txt` | network plus credentials: `SSID`, `PSK`, `MODE`, `RTSP_USER`, `RTSP_PASSWORD`, `HTTP_USER`, `HTTP_PASSWORD`, and optionally `RTSPS_PORT` and `NTP_HOST`. This is the whole setup for a new owner and needs no shell |
+| `cert.pem`, `key.pem` | install a certificate and key instead of letting the firmware generate a self-signed pair; both are required |
 | `maintenance.txt` | starts the root shell on port 23 for that boot only |
+
+#### Setting up a camera with a card
+
+Write `provision.txt` in the card's root, put the card in the camera and power it
+on. The camera writes the Wi-Fi profile, both password files, the configuration
+and - if the card carries one - the certificate, all before the firmware starts,
+so the camera is serving on that same boot:
+
+```sh
+SSID=MyNetwork
+PSK=my-wifi-password
+RTSP_USER=frigate
+RTSP_PASSWORD=a-long-random-password
+HTTP_USER=admin
+HTTP_PASSWORD=another-long-random-password
+NTP_HOST=192.168.1.1
+```
+
+Values are validated before anything is written (usernames are restricted to
+`A-Z a-z 0-9 . _ @ -`, passwords to 128 characters with no control characters,
+quotes or backslashes, the port to 1-65535) and a file that fails validation is
+rejected as a whole rather than half applied. Passwords are never written to the
+log. `provision.txt` deliberately replaces an existing configuration: it is the
+handover path, and the card slot is already a physical credential.
+
+**Remove the card after provisioning.** It contains the Wi-Fi password and the
+camera credentials in plain text.
 
 Nothing else on the card is read or executed: there are no `custom.sh`, factory,
 SD or NVRAM script hooks, and `maintenance.txt` is the only way to a shell that
-does not need the network. `wifi.txt` is re-applied on every boot the card is
-present, so a card left in the slot keeps overriding the stored network.
+does not need the network. `wifi.txt` and `provision.txt` are re-applied on every
+boot the card is present, so a card left in the slot keeps overriding the stored
+network and credentials.
 
 Treat the card slot as a credential. Anyone who can insert a card can open a root
-shell or point the camera at another network - the same physical access the
-device cannot defend against - so keep the recovery card where the camera's
-credentials deserve to be, and leave it out of the camera in normal operation.
-The recovery log is written to `/tmp/c220-recovery.log` on each boot.
+shell, point the camera at another network or replace its credentials - the same
+physical access the device cannot defend against - so keep the recovery card
+where the camera's credentials deserve to be, and leave it out of the camera in
+normal operation. The recovery log is written to `/tmp/c220-recovery.log` on each
+boot.
 
 ### Button recovery and factory reset
 

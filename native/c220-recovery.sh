@@ -36,8 +36,9 @@ SD_MOUNT=${SD_MOUNT:-/tmp/sd}
 # plausible name is tried instead of assuming one.
 SD_DEVICES="/dev/mmcblk1p1 /dev/mmcblk1 /dev/mmcblk0p1 /dev/mmcblk0"
 # The MMC controller can enumerate the card a little after this runs, so keep
-# looking for a while rather than skipping recovery for the whole boot.
-CARD_WAIT_SECONDS=20
+# looking for a while rather than skipping recovery for the whole boot. The wait
+# is overridable so the paths below can be exercised without a card slot.
+CARD_WAIT_SECONDS=${CARD_WAIT_SECONDS:-20}
 WIFI_TXT="$SD_MOUNT/wifi.txt"
 PROVISION_TXT="$SD_MOUNT/provision.txt"
 MAINTENANCE_TXT="$SD_MOUNT/maintenance.txt"
@@ -342,8 +343,11 @@ elif [ -f "$PROVISION_TXT" ] || [ -f "$WIFI_TXT" ] || [ -f "$MAINTENANCE_TXT" ];
     # exercised without a card slot. A boot with no card leaves this directory
     # empty, so the mount below is still the normal path.
     log_message "using the card files already present in $SD_MOUNT"
-elif ! mount_card; then
-    exit 0
+else
+    # No card. This does not end the script: an unprovisioned camera still has to
+    # leave a way in, and that happens below. Every card file is read from the
+    # mount point, so with nothing mounted the card sections do nothing.
+    mount_card || true
 fi
 
 if [ -f "$MAINTENANCE_TXT" ]; then

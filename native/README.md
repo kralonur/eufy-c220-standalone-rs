@@ -258,7 +258,10 @@ fail-closed rule - so `script/c220-recovery.sh` treats it as unprovisioned and
 provisions the way in: with no stored Wi-Fi profile it joins the rescue network,
 and it opens the maintenance shell on port 23. This is the state a factory reset
 leaves behind and the state a new owner receives, matching the vendor firmware's
-out-of-the-box behaviour. Provision from that shell with
+out-of-the-box behaviour. It happens on every boot until the camera is
+provisioned and needs no card and no button: with a card that
+`provision.txt` provisions, the configuration exists afterwards and neither the
+shell nor the rescue network is opened. Provision from that shell with
 `/home/script/wificonnect.sh "<ssid>" WPA "<psk>"` and by writing
 `standalone_auth.conf` plus the certificate and key as described above.
 

@@ -35,10 +35,15 @@ SD_MOUNT=${SD_MOUNT:-/tmp/sd}
 # whole device (mmcblk1), and the slot it lands on is not guaranteed, so every
 # plausible name is tried instead of assuming one.
 SD_DEVICES="/dev/mmcblk1p1 /dev/mmcblk1 /dev/mmcblk0p1 /dev/mmcblk0"
-# The MMC controller can enumerate the card a little after this runs, so keep
-# looking for a while rather than skipping recovery for the whole boot. The wait
-# is overridable so the paths below can be exercised without a card slot.
-CARD_WAIT_SECONDS=${CARD_WAIT_SECONDS:-20}
+# The MMC controller publishes a card during kernel probe, which is well before
+# this hook runs, and this slot has no card-detect GPIO, so a card that will be
+# found is normally already there. The grace therefore only covers a controller
+# still bringing the card up, and the mount retry covers a card that is present
+# but not ready to mount yet. Both are short on purpose: this hook runs before
+# the services, so every second waited here is a second the camera is not
+# watching. A card must be inserted before the camera is powered on.
+CARD_NODE_GRACE_SECONDS=${CARD_NODE_GRACE_SECONDS:-2}
+CARD_MOUNT_RETRY_SECONDS=${CARD_MOUNT_RETRY_SECONDS:-4}
 WIFI_TXT="$SD_MOUNT/wifi.txt"
 PROVISION_TXT="$SD_MOUNT/provision.txt"
 MAINTENANCE_TXT="$SD_MOUNT/maintenance.txt"
@@ -314,7 +319,28 @@ mkdir -p "$SD_MOUNT"
 # Read-only, noexec, nosuid: the card supplies data and nothing else.
 # /proc/mounts is used instead of `mountpoint`, which this BusyBox may not ship.
 mount_card() {
+    # Phase one: wait briefly for the controller to publish a block device.
     waited=0
+    while :; do
+        for device in $SD_DEVICES; do
+            if [ -b "$device" ]; then
+                break 2
+            fi
+        done
+        if [ "$waited" -ge "$CARD_NODE_GRACE_SECONDS" ]; then
+            # Record what the kernel actually offered, so a card problem can be
+            # diagnosed without another lockout.
+            log_message "no card: no block device after ${CARD_NODE_GRACE_SECONDS}s (looked for: $SD_DEVICES)"
+            log_message "partitions: $(grep -c mmcblk /proc/partitions 2>/dev/null) mmc entries; block devices: $(ls /dev/mmcblk* 2>/dev/null | tr '\n' ' ')"
+            return 1
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    # Phase two: mount it, retrying while the card finishes coming up.
+    waited=0
+    attempt=0
     while :; do
         for device in $SD_DEVICES; do
             [ -b "$device" ] || continue
@@ -324,15 +350,12 @@ mount_card() {
             fi
             log_message "could not mount $device"
         done
-        if [ "$waited" -ge "$CARD_WAIT_SECONDS" ]; then
-            # Record what the kernel actually offered, so a future card problem
-            # can be diagnosed without another lockout.
-            log_message "no card after ${CARD_WAIT_SECONDS}s; block devices: $(ls /dev/mmcblk* 2>/dev/null | tr '\n' ' ')"
-            log_message "partitions: $(grep mmcblk /proc/partitions 2>/dev/null | tr '\n' ' ')"
+        if [ "$attempt" -ge "$CARD_MOUNT_RETRY_SECONDS" ]; then
+            log_message "card present but no candidate device could be mounted"
             return 1
         fi
-        sleep 2
-        waited=$((waited + 2))
+        attempt=$((attempt + 1))
+        sleep 1
     done
 }
 

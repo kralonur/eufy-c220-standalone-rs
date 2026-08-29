@@ -203,6 +203,19 @@ On your phone, share a hotspot with:
 (You can change these later with `standalone_rescue.conf` on a card or over the
 shell, but a camera that has just been reset uses these defaults.)
 
+A Linux PC with NetworkManager can host the same hotspot, which is convenient if
+you are already sitting at one:
+
+```sh
+# the interface needs to support AP mode: iw list | grep -A5 'Supported interface modes'
+nmcli device wifi hotspot ifname wlan0 ssid RescueAP password 12345678 band bg
+```
+
+Do this on a machine that reaches the camera by Ethernet or not at all - the
+camera is about to leave your normal network. The camera appears as a client as
+soon as it joins (`ip neigh show dev wlan0`), and when you are finished:
+`nmcli connection delete Hotspot`.
+
 #### B2. Power on the camera and find it
 
 Power the camera on and wait about 30 seconds. Look in your phone's hotspot

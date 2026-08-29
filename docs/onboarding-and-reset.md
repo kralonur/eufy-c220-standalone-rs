@@ -64,6 +64,46 @@ Passwords may contain spaces and symbols such as `!#%` - just not quotes or `\`.
 
 Generate them rather than inventing them, for example `openssl rand -base64 24`.
 
+### Step 2: decide about the certificate
+
+The camera must serve TLS, so either way something has to make your clients trust
+the certificate it presents. Choose by what you already run:
+
+| you have | do this | client work afterwards |
+| --- | --- | --- |
+| a private CA on your network (Home Assistant, pfSense, step-ca, mkcert) | sign a certificate for the camera's address, put `cert.pem` and `key.pem` on the provisioning card | **none** - your clients already trust that CA |
+| a computer with openssl | generate the pair yourself with the command below, put it on the card | add that one certificate to your client's trusted certificates, once |
+| neither | nothing: the camera generates its own on first boot | fetch it from the camera and trust it once ([A5](#a5-trust-the-certificate)) |
+
+All three give the same TLS 1.3 encryption; they differ only in who vouches for
+the certificate. A self-signed certificate - the camera's or your own - cannot be
+verified by anyone else, so it always ends in a one-time client step. A
+certificate signed by a CA your clients already trust is the only option that
+removes that step, so it is worth doing if you already run one.
+
+Generating the pair yourself is not more secure than letting the camera do it. It
+gives you control over the names and the lifetime, and it keeps the private key on
+your machine instead of generating it on the camera. The camera never overwrites a
+pair you installed.
+
+To make a pair for a camera at `192.168.1.55`, valid for that address and for the
+name `c220.local`:
+
+```sh
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+  -keyout key.pem -out cert.pem -days 3650 \
+  -subj "/O=eufy-c220-standalone/CN=c220 camera" \
+  -addext "subjectAltName=IP:192.168.1.55,DNS:c220.local"
+```
+
+The SAN must contain the address or name your client will connect to - that is
+what the client checks. If the camera uses DHCP, either reserve its address or
+include the name you actually use. The same rule applies if you sign with your own
+CA.
+
+None of this is required for the camera to work: with no certificate files it
+makes its own on first boot and says so in the log.
+
 ### Route A: SD card (recommended)
 
 #### A1. Write one file on the card
@@ -108,14 +148,12 @@ Notes:
 - On Windows, make sure the file is really named `provision.txt` and not
   `provision.txt.txt`.
 
-#### A2. Optional: use your own certificate
+#### A2. Put the certificate on the card (see [Step 2](#step-2-decide-about-the-certificate))
 
-If you have a certificate for the camera (for example from your own LAN CA), copy
-it to the card as `cert.pem` and the matching private key as `key.pem`. Both are
-required; if only one is present the camera ignores both, logs the problem and
-generates its own instead. If you skip this step you get a self-signed
-certificate, which is fine for most home setups (see
-[trusting the certificate](#a5-trust-the-certificate)).
+If you decided to supply a certificate, copy it to the card as `cert.pem` and the
+matching private key as `key.pem`. Both are required: if only one is present the
+camera ignores both, logs the problem and generates its own instead. Skip this step
+if you are letting the camera generate its own.
 
 #### A3. Insert and power on
 

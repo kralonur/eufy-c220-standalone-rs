@@ -102,7 +102,12 @@ include the name you actually use. The same rule applies if you sign with your o
 CA.
 
 None of this is required for the camera to work: with no certificate files it
-makes its own on first boot and says so in the log.
+makes its own on first boot and says so in the log. The rest of this section is
+for when you want to supply one yourself.
+
+The full walkthrough, including signing with your own CA and the mistakes that
+make a camera refuse to start, is [Using your own certificate](#using-your-own-certificate)
+further down.
 
 ### Route A: SD card (recommended)
 
@@ -320,6 +325,135 @@ The certificate paths do not need to exist - the camera generates the
 certificate on the next boot. After the reboot the camera joins your Wi-Fi and
 starts serving; the hotspot is no longer needed. Turn it off, then follow
 [A4](#a4-check-it-is-alive) and [A5](#a5-trust-the-certificate) above.
+
+### Using your own certificate
+
+Everything here is optional. Skip it and the camera generates a self-signed pair on
+first boot that names itself for the address it actually has.
+
+#### What the camera needs
+
+| | |
+| --- | --- |
+| Files | `cert.pem` and `key.pem`, in the root of the provisioning card, or at `/home/nvram/system/standalone_rtsp_cert.pem` and `standalone_rtsp_key.pem` on the camera |
+| Both or neither | with only one present the camera refuses to replace the pair and refuses to serve, because the missing half may be the one you were about to copy in |
+| Certificate format | PEM, leaf certificate first, then any intermediates. The file is sent as the chain, so include an intermediate if your CA uses one (not the root) |
+| Key format | PEM, any of PKCS#8 (`PRIVATE KEY`), PKCS#1 (`RSA PRIVATE KEY`) or SEC1 (`EC PRIVATE KEY`) |
+| Key types | RSA, ECDSA P-256/P-384 and Ed25519 all work. Sign with SHA-256 or better: the camera speaks TLS 1.3 only |
+| Permissions | the key must be root-owned and mode `0600` or stricter, or the camera refuses to start. The card path sets this for you; over a shell you must do it yourself |
+| Names | the SAN must contain every address or name a client will dial - the client checks that, not the camera |
+| Lifetime | use years, not weeks. Replacing the certificate means re-provisioning the camera, and clients that pin it need updating |
+
+#### Signing with your own CA
+
+If you already run a CA that your clients trust, this is the option that removes the
+client-side step completely. Make the key and the request on your machine, with the
+names clients will use:
+
+```sh
+openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+  -keyout key.pem -out c220.csr \
+  -subj "/O=eufy-c220-standalone/CN=c220 camera" \
+  -addext "subjectAltName=IP:192.168.1.55,DNS:camera.home.arpa"
+```
+
+Then sign it. **The `-copy_extensions copy` is not optional**: without it OpenSSL
+signs the request but drops the SAN, and you get a certificate that names nothing -
+it loads on the camera and is then rejected by every client. This is the single most
+common way to get this wrong:
+
+```sh
+openssl x509 -req -in c220.csr -CA ca.pem -CAkey ca-key.pem -CAcreateserial \
+  -out cert.pem -days 3650 -sha256 -copy_extensions copy
+```
+
+Some CA tooling does copy the SAN from the request (that is the whole point of the
+request), some needs the extension given again at signing time. Whichever you use,
+check the result rather than assuming - the next section is exactly that check.
+
+#### Check before you boot the camera
+
+Four commands, all on your own machine, that catch every mistake the camera would
+otherwise punish you for:
+
+```sh
+# 1. the chain verifies against your CA
+openssl verify -CAfile ca.pem cert.pem
+
+# 2. the names are actually in there, and the dates are sane
+openssl x509 -in cert.pem -noout -subject -issuer -dates -ext subjectAltName
+
+# 3. the key belongs to the certificate (a mismatch stops the camera serving)
+openssl x509 -in cert.pem -noout -pubkey | openssl md5
+openssl pkey -in key.pem -pubout | openssl md5
+
+# 4. it is a key the camera can read, not an encrypted or PKCS#12 blob
+head -1 key.pem
+```
+
+Steps 3 and 4 are the ones people skip. The two hashes must be identical, and step 4
+must print one of `-----BEGIN PRIVATE KEY-----`, `-----BEGIN RSA PRIVATE KEY-----` or
+`-----BEGIN EC PRIVATE KEY-----`. If it says `ENCRYPTED PRIVATE KEY` the camera cannot
+use it: create the key with `-nodes`, or decrypt it first.
+
+#### What your clients need
+
+| you used | client configuration |
+| --- | --- |
+| a CA-signed certificate | point the client's CA file at your CA, and use a name or address that is in the SAN. Nothing per-camera |
+| a self-signed certificate of your own | add `cert.pem` to the client's trusted certificates, or accept/pin it. Same work as accepting the camera's own certificate |
+
+The camera does not care which of these you did: it sends whatever you installed.
+
+#### When it goes wrong
+
+The camera is fail-closed about certificates, so a bad pair means it serves nothing
+rather than falling back to plaintext. The firmware exits and the supervisor retries,
+which looks like a camera that is up on Wi-Fi and answers on no port at all.
+
+| what you see | cause | fix |
+| --- | --- | --- |
+| no `322`, no `8080`, log says `certificate and key were rejected` | the key does not match the certificate | supply the matching pair |
+| same, but the log says `must be root-owned and mode 0600 or stricter` | key permissions, usually after copying it by hand over a shell | `chmod 600` the key file, owned by root |
+| log says `refusing to replace a half-present pair` | only one of the two files exists | copy both, or delete both to let the camera generate its own |
+| serves fine, but clients say it is not valid for the name | the SAN lacks the name or address the client dialled | re-issue with the right SAN, or dial something that is in it |
+| serves fine, one client works and another does not | the URLs use different names (`camera.home.arpa` in one, the IP in the other) | put every name you use in the SAN |
+| client says the issuer is untrusted | a self-signed certificate, or a CA that client does not have | add your CA, or the certificate itself, to that client |
+
+You can always get back to a working camera from here: put a card in with a
+corrected pair (or with no certificate at all, to let the camera generate one), or
+hold the button 5 seconds and fix the files over the shell. Neither needs the camera
+to be serving.
+
+#### Replacing it later
+
+The camera never overwrites a certificate you installed, so replacing one is
+deliberate:
+
+1. put the new `cert.pem` and `key.pem` on a provisioning card and boot with it, or
+2. write both files to the NVRAM paths over the maintenance shell and reboot
+
+Clients that trust your CA carry on unchanged. Clients that pinned the old
+certificate need its new fingerprint. If you would rather hand the job back to the
+camera, delete both files and reboot: it generates a new pair naming itself for the
+address it has at that moment.
+
+#### What the camera generates for itself
+
+For comparison, when nothing is installed:
+
+| | |
+| --- | --- |
+| Subject | `CN=c220 camera, O=eufy-c220-standalone` |
+| Issuer | itself |
+| Key | ECDSA P-256, generated on the camera, stored mode `0600` |
+| Names | `c220.local`, loopback, and every IPv4 address it holds at that moment |
+| Validity | 1975 to 4096, so it cannot expire because this board has no clock battery |
+| Rotation | none: it is written once and left alone, so a client that pinned it keeps working |
+
+It waits up to 30 seconds for an address before writing, because the address is what
+you will type into a client. That is why it should be generated on the network the
+camera will actually live on.
 
 ### Changing things later
 

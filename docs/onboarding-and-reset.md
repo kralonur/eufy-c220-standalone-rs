@@ -367,6 +367,23 @@ While it is unprovisioned, the camera joins the rescue hotspot and opens the
 shell **on every boot**, not just once, so you can always get back in without
 pressing the button again.
 
+### This sequence was rehearsed on real hardware
+
+A factory reset followed by one boot with a provisioning card was run on a live
+camera, to check the path a new owner actually takes:
+
+- the reset removed the credentials, the certificate and key, the Wi-Fi profile
+  and the opt-in markers, and kept the radio calibration and board identity
+- one boot with the card rewrote the configuration, both passwords, the
+  certificate and key, and the Wi-Fi profile - every file byte-identical to what
+  was there before the reset
+- the camera rejoined its network and served RTSPS, the control API, video and
+  both audio tracks, and the card was mounted 3 seconds into the boot
+
+The card was then wiped of credentials again. If you rehearse this yourself, do
+the same: a card left in the slot keeps re-applying whatever it carries on every
+boot.
+
 ### Handing the camera to someone else
 
 1. Hold the button 10 seconds to factory reset it. The camera now has no

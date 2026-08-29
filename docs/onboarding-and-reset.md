@@ -148,7 +148,7 @@ Notes:
 - On Windows, make sure the file is really named `provision.txt` and not
   `provision.txt.txt`.
 
-#### A2. Put the certificate on the card (see [Step 2](#step-2-decide-about-the-certificate))
+#### A2. Put your certificate on the card
 
 If you decided to supply a certificate, copy it to the card as `cert.pem` and the
 matching private key as `key.pem`. Both are required: if only one is present the
@@ -214,7 +214,7 @@ fallback (`-tls_verify 0` in ffmpeg) - the stream is still encrypted, you just
 lose protection against something on your LAN pretending to be the camera.
 
 If you would rather not pin a certificate, put a real one on the provisioning
-card ([A2](#a2-optional-use-your-own-certificate)) - the camera will never
+card ([A2](#a2-put-your-certificate-on-the-card)) - the camera will never
 overwrite it.
 
 #### A6. Remove the card

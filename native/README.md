@@ -1,5 +1,9 @@
 # Native media companion
 
+> Setting up, resetting or recovering a camera from the outside is documented for
+the owner in [`docs/onboarding-and-reset.md`](../docs/onboarding-and-reset.md).
+> This file documents the build and the internals.
+
 `c220-media-engine.c` is the only native runtime source required by the Rust
 firmware. It owns the camera hardware path that cannot be replaced by the
 Rust service layer:

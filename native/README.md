@@ -174,6 +174,72 @@ Digest credentials and the control-plane TLS acceptor are configured; the
 startup script kills stale Telnet processes at the next boot. Use it only from
 a trusted LAN and close/reboot the camera when finished.
 
+### Chip-level recovery (CH341A, UART)
+
+Everything the running camera can do for itself needs no programmer: credentials,
+Wi-Fi, configuration and the whole `/home` image are recoverable from a card, the
+button, or the rescue network. `flashrom` on a CH341A is for the states where the
+camera cannot run at all - a damaged bootloader, kernel or rootfs - and for a flash
+write that failed part way. This project only ever writes `mtd6` (the `home`
+partition, which holds the firmware itself); the vendor partitions below it are
+never touched.
+
+The flash chip is a 16 MiB GD25Q128E. **Pin the chip name**, because autoprobe can
+select a different 16 MiB part and write the wrong thing:
+
+```sh
+CHIP='GD25Q128E/GD25B128E/GD25R128E/GD25Q127C'
+```
+
+A full-chip read or write takes about two to three minutes. The layout, computed
+from `/proc/mtd` and confirmed against a full dump:
+
+| mtd | name | size | chip offset | contents |
+| --- | --- | --- | --- | --- |
+| 0 | `env` | 0x10000 | 0x0000000 | vendor environment |
+| 1 | `idblock` | 0x20000 | 0x0010000 | vendor |
+| 2 | `uboot` | 0x20000 | 0x0030000 | vendor bootloader |
+| 3 | `boot` | 0x200000 | 0x0050000 | vendor kernel |
+| 4 | `rootfs` | 0x400000 | 0x0250000 | vendor rootfs |
+| 5 | `recovery` | 0x380000 | 0x0650000 | vendor recovery |
+| 6 | `home` | 0x4b0000 | 0x09d0000 | **the only region this project writes** |
+| 7 | `nvram` | 0x160000 | 0x0e80000 | Wi-Fi, credentials, board identity |
+| 8 | `misc` | 0x10000 | 0x0fe0000 | vendor |
+| 9 | `DID` | 0x10000 | 0x0ff0000 | vendor |
+
+**Read before you write anything.** A full dump is the undo for everything below:
+
+```sh
+flashrom -p ch341a_spi -c "$CHIP" -r full-before.bin
+```
+
+To restore only `/home`, which is the usual case, the image has to be placed at its
+offset inside a full-size image because flashrom validates against the whole chip:
+
+```sh
+cp full-before.bin work.bin
+dd if=eufy_c220_standalone_home.squashfs of=work.bin bs=4096 \
+   seek=$((0x9d0000 / 4096)) conv=notrunc
+flashrom -p ch341a_spi -c "$CHIP" -w work.bin
+```
+
+Then read it back and compare, rather than trusting the write:
+
+```sh
+flashrom -p ch341a_spi -c "$CHIP" -r verify.bin
+cmp -n 4915200 -i $((0x9d0000)) work.bin verify.bin && echo identical
+```
+
+Do not write `env`, `uboot`, `boot` or `rootfs` from anything but a dump taken from
+the same board, and never write `nvram` from another camera: it holds that camera's
+Wi-Fi profile, credentials and board identity.
+
+**UART console.** The vendor inittab spawns a shell on `ttyFIQ0` at 1500000 baud,
+8N1, which is the fastest way to see why a boot failed. This project has not
+verified it - it needs a USB-TTL adapter that was not available while the rest of
+this was tested - so treat the baud rate and the shell as expected rather than
+proven.
+
 ### Discovery by name (mDNS)
 
 The camera answers for its own name on the local network and advertises its stream,

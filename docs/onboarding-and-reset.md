@@ -637,7 +637,7 @@ as any camera with a reset button, and it is why physical access is the boundary
 | The card seems to be ignored | Was it in **before** power-on? Is it FAT32? Are the file names exactly `provision.txt` / `wifi.txt`, in the card's root, with no `.txt.txt`? Read `/tmp/c220-recovery.log` - it records what it found and why it refused |
 | The camera joined `RescueAP` instead of your network | Its Wi-Fi profile is missing or was wiped (for example after a factory reset), or the stored network cannot be reached. Provision it again |
 | You need a shell but have no card and cannot hold the button | `POST /maintenance/enable` on the control API opens port 23 for one boot. It needs the HTTP Digest password, and closes again after a reboot |
-| Nothing works at all | The recovery paths above cover everything except a corrupted flash. See the hardware notes in `native/README.md` for chip-level recovery with a CH341A programmer or the UART console |
+| Nothing works at all | The recovery paths above cover everything except a corrupted flash. Chip-level recovery with a CH341A programmer (partition map, offsets, read-before-write) is documented in `native/README.md`, under chip-level recovery |
 
 ### Logs
 

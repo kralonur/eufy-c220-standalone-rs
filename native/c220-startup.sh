@@ -41,6 +41,27 @@ private_file_permissions_ok() {
     esac
 }
 
+# A per-board label, so two cameras never answer to the same name and the name
+# survives a factory reset (which keeps the vendor identity but removes everything
+# this deployment provisioned). The vendor PCB serial is preferred because it is the
+# serial printed on the camera, so the advertised name can be matched to the device
+# in your hand; the SoC serial in /proc/cpuinfo survives a wiped NVRAM, and the Wi-Fi
+# MAC is the last resort because it always exists.
+board_label() {
+    for candidate in \
+        "$(cat /home/nvram/system/.pcbsn 2>/dev/null)" \
+        "$(sed -n 's/^Serial[[:space:]]*:[[:space:]]*//p' /proc/cpuinfo 2>/dev/null | head -n 1)" \
+        "$(cat /sys/class/net/wlan0/address 2>/dev/null | tr -d ':')"
+    do
+        label=$(printf '%s' "$candidate" | tr 'A-Z' 'a-z' | tr -cd 'a-z0-9' | cut -c1-40)
+        if [ -n "$label" ]; then
+            printf '%s' "$label"
+            return 0
+        fi
+    done
+    return 1
+}
+
 consume_insecure_marker() {
     if ! private_file_permissions_ok "$INSECURE_MARKER"; then
         log_message "insecure permissions on bring-up marker; refusing it"
@@ -93,6 +114,15 @@ fi
 # configuration loop, and never blocks anything.
 if [ -x /home/script/c220-button.sh ]; then
     /home/script/c220-button.sh &
+fi
+
+# The board's name is derived once: it identifies the hardware, so it cannot change
+# while this process runs, and reading it every iteration would only repeat work.
+if DERIVED_HOST_LABEL=$(board_label); then
+    log_message "camera name derived from the board identity"
+else
+    DERIVED_HOST_LABEL=""
+    log_message "no board identity found; the camera will use the default name"
 fi
 
 # Credentials, ports, and certificate paths live on writable NVRAM. Re-read the
@@ -171,9 +201,13 @@ while :; do
         [ -n "${STANDALONE_NTP_HOST:-}" ] && \
             export NTP_HOST="$STANDALONE_NTP_HOST"
         # The camera's own name: what it answers for over mDNS, and the name a
-        # generated certificate is issued for. Two cameras need two names.
-        [ -n "${STANDALONE_HOST_NAME:-}" ] && \
+        # generated certificate is issued for. Two cameras need two names, so an
+        # explicit setting wins and the board identity fills in otherwise.
+        if [ -n "${STANDALONE_HOST_NAME:-}" ]; then
             export HOST_NAME="$STANDALONE_HOST_NAME"
+        elif [ -n "$DERIVED_HOST_LABEL" ]; then
+            export HOST_NAME="camera-$DERIVED_HOST_LABEL"
+        fi
     elif [ -f "$INSECURE_MARKER" ]; then
         # No security file is accepted only with this explicit one-boot marker.
         if ! consume_insecure_marker; then

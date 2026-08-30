@@ -120,8 +120,11 @@ fn subject_names(host_label: &str) -> Vec<String> {
     names
 }
 
-/// Enumerate this host's interface addresses.
-fn local_addresses() -> Vec<Ipv4Addr> {
+/// Enumerate this host's non-loopback IPv4 interface addresses.
+///
+/// Shared with discovery, which has the same problem as certificate generation:
+/// the firmware starts before Wi-Fi has an address, and both need one.
+pub fn local_addresses() -> Vec<Ipv4Addr> {
     let mut addresses = Vec::new();
     // SAFETY: getifaddrs fills a list we own and must release with freeifaddrs.
     // Each entry is dereferenced only after a null check, and the address is read

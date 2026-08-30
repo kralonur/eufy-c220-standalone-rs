@@ -41,7 +41,7 @@ Decide now which route you will use:
 | Ports after setup | **322** RTSPS (video), **8080** HTTPS (control API). Plaintext 554 is off, port 23 is closed |
 | Time to come up | about **17 seconds** to start serving, about **22 seconds** until video flows |
 | Certificate | the camera makes its own self-signed one on first boot, unless you supply one. Your client has to trust it once |
-| Name | the camera answers to `<name>.local` over mDNS, `c220.local` by default, so you never have to remember its address |
+| Name | the camera answers to `<name>.local` over mDNS, `camera-<serial>.local` by default, so you never have to remember its address |
 | Where the card goes | the microSD slot. **Insert the card before powering on** - the camera has no card-detect line and cannot notice a card inserted while running |
 | What the card contains | your Wi-Fi password and camera passwords, in plain text. **Take it out when you are done** and keep it somewhere sensible |
 
@@ -110,11 +110,18 @@ The full walkthrough, including signing with your own CA and the mistakes that
 make a camera refuse to start, is [Using your own certificate](#using-your-own-certificate)
 further down.
 
-### Step 3: pick the camera's name
+### Step 3: know your camera's name
 
-Every camera answers to a name of its own over **mDNS**: the default is `c220`,
-which makes it `c220.local` on your network. Nothing has to be configured for this
-to work, and it is worth knowing about for three reasons:
+Every camera answers to a name of its own over **mDNS**, derived from the board's
+serial number, so it is `camera-<serial>.local` - the serial printed on the camera,
+which means the name you see on the network can be matched to the device in your
+hand. Nothing needs configuring, and no two cameras can collide.
+
+The name comes from the first identifier the board offers: the vendor PCB serial
+(`.pcbsn`, which a factory reset keeps), then the SoC serial, then the Wi-Fi MAC
+address. If a camera later loses its NVRAM identity, the name changes with it.
+
+It is worth knowing about for three reasons:
 
 - **You can stop remembering addresses.** `ping c220.local`, `telnet c220.local`,
   and `rtsps://frigate:password@c220.local:322/live` all work from any device on the
@@ -122,17 +129,18 @@ to work, and it is worth knowing about for three reasons:
 - **The certificate follows the name.** A camera-generated certificate is issued for
   `<name>.local` plus its current addresses, so dialling the name verifies even if
   DHCP moves the camera. The name is the part that never goes stale.
-- **Two cameras need two names.** Two cameras both answering `c220.local` would
-  collide, so the second one gets its own name.
+- **Two cameras need two names.** Derived names are unique because serial numbers
+  are, so a second camera introduces no conflict and needs no configuration.
 
-Set it in the same provisioning file, one line:
+To choose a name yourself, put one line in the provisioning file:
 
 ```sh
 HOST_NAME=front-door
 ```
 
-The camera then answers `front-door.local`. Camera-generated certificates name it
-too. If you sign your own certificates, put the same name in the SAN.
+The camera then answers `front-door.local` and stops using the derived name.
+Camera-generated certificates name whichever is in force. If you sign your own
+certificates, put the same name in the SAN.
 
 Caveats worth knowing: **Docker containers cannot resolve `.local` names by
 themselves** - the container has its own resolver and no mDNS (see
@@ -478,7 +486,7 @@ For comparison, when nothing is installed:
 | Subject | `CN=c220 camera, O=eufy-c220-standalone` |
 | Issuer | itself |
 | Key | ECDSA P-256, generated on the camera, stored mode `0600` |
-| Names | `<name>.local` (the HOST_NAME setting, `c220` by default), loopback, and every IPv4 address it holds at that moment |
+| Names | `<name>.local` (the `HOST_NAME` setting, or `camera-<serial>` derived from the board), loopback, and every IPv4 address it holds at that moment |
 | Validity | 1975 to 4096, so it cannot expire because this board has no clock battery |
 | Rotation | none: it is written once and left alone, so a client that pinned it keeps working |
 
@@ -654,7 +662,7 @@ a card cannot run scripts on the camera.
 
 | file | purpose |
 | --- | --- |
-| `provision.txt` | full setup: network, credentials, and optionally the port, time server and camera name (`HOST_NAME`) |
+| `provision.txt` | full setup: network, credentials, and optionally the port, time server and camera name (`HOST_NAME`, which overrides the derived `camera-<serial>`) |
 | `wifi.txt` | network only: `SSID=`, `PSK=`, `MODE=WPA\|WEP\|NONE`. Applied on every boot the card is present |
 | `cert.pem` + `key.pem` | install your own certificate instead of the generated one. Both required |
 | `maintenance.txt` | start a root shell on port 23 for that boot. Contents are ignored - the file's presence is the signal |

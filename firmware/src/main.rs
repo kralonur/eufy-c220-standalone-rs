@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use control::{ControlServer, ControlServerConfig, MediaEngineSlot};
 use digest::Lockout;
@@ -62,6 +63,14 @@ const HOST_NAME_ENV: &str = "HOST_NAME";
 /// Name used when nothing is configured, so a camera that has only been flashed
 /// is still reachable by name and still generates a certificate that names it.
 const DEFAULT_HOST_LABEL: &str = "c220";
+
+/// How long to wait for an address before advertising the name without one. The
+/// firmware starts before Wi-Fi has associated, and an advertisement carrying no
+/// address is close to useless: the responder's own refresh took minutes.
+const DISCOVERY_ADDRESS_WAIT: Duration = Duration::from_secs(30);
+
+/// How often the address is re-checked while waiting for one.
+const DISCOVERY_ADDRESS_POLL: Duration = Duration::from_millis(500);
 
 /// Persistent marker that opts deployed camera boots into microphone RTSP.
 const STANDALONE_AUDIO_MARKER: &str = "/home/nvram/system/.standalone_audio_enable";
@@ -207,23 +216,40 @@ async fn run_firmware() -> Result<(), Box<dyn Error + Send + Sync>> {
         tracing::warn!("HTTP Digest credentials are not configured; control API is anonymous");
     }
 
-    // The configuration is valid at this point, so the camera is going to serve:
-    // publish its name so clients can reach it without being told an address. A
-    // failure here is reported and shrugged off - discovery must never be the
-    // reason a camera refuses to work.
-    let _advertisement = match discovery::advertise(&host_label, rtsps_port.max(rtsp_port)) {
-        Ok(advertisement) => {
-            tracing::info!(
-                name = %format!("{host_label}.local"),
-                "answering mDNS queries for this name"
-            );
-            Some(advertisement)
+    // The configuration is valid at this point, so the camera is going to serve.
+    // Publish its name in the background: the address may not exist yet, and the
+    // services must not wait for one. A failure is reported and shrugged off -
+    // discovery must never be the reason a camera refuses to work.
+    let discovery_host = host_label.clone();
+    let discovery_port = rtsps_port.max(rtsp_port);
+    tokio::spawn(async move {
+        let mut waited = Duration::ZERO;
+        let mut addresses = addresses_now();
+        while addresses.is_empty() && waited < DISCOVERY_ADDRESS_WAIT {
+            tokio::time::sleep(DISCOVERY_ADDRESS_POLL).await;
+            waited += DISCOVERY_ADDRESS_POLL;
+            addresses = addresses_now();
         }
-        Err(error) => {
-            tracing::warn!(%error, "mDNS advertisement unavailable; use the address instead");
-            None
+        if addresses.is_empty() {
+            tracing::warn!("no address yet; advertising the name without one");
         }
-    };
+        match discovery::advertise(&discovery_host, discovery_port, &addresses) {
+            Ok(advertisement) => {
+                tracing::info!(
+                    name = %format!("{discovery_host}.local"),
+                    addresses = %addresses.join(", "),
+                    "answering mDNS queries for this name"
+                );
+                // Held for the lifetime of the process: dropping it withdraws the
+                // service, and this task has nothing else to do.
+                let _advertisement = advertisement;
+                std::future::pending::<()>().await
+            }
+            Err(error) => {
+                tracing::warn!(%error, "mDNS advertisement unavailable; use the address instead")
+            }
+        }
+    });
     let lockout = Arc::new(Lockout::new());
     let audio_enabled = audio_enabled();
     let mut rtsp_config = RtspServerConfig::new(bind_address);
@@ -319,6 +345,14 @@ fn audio_enabled() -> bool {
         );
     }
     Path::new(STANDALONE_AUDIO_MARKER).is_file()
+}
+
+/// The camera's current addresses as strings, for the mDNS advertisement.
+fn addresses_now() -> Vec<String> {
+    identity::local_addresses()
+        .into_iter()
+        .map(|address| address.to_string())
+        .collect()
 }
 
 fn run_media_loop(

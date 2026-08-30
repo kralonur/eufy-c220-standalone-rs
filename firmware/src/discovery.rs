@@ -36,21 +36,26 @@ pub struct Advertisement {
 
 /// Advertise `host_label`.local and the RTSP service on `port`.
 ///
+/// `addresses` are the addresses the camera holds now. They are passed in rather
+/// than left to be discovered, because this firmware starts before Wi-Fi has one:
+/// registering with no addresses leaves the camera unknown until the responder
+/// refreshes them, which took minutes in testing. Address tracking stays enabled,
+/// so later changes are still followed.
+///
 /// Errors are reported to the caller rather than raised as a failure to serve: a
 /// camera that cannot advertise is still a working camera, and discovery is not
 /// worth refusing a connection over.
-pub fn advertise(host_label: &str, port: u16) -> io::Result<Advertisement> {
+pub fn advertise(host_label: &str, port: u16, addresses: &[String]) -> io::Result<Advertisement> {
     let daemon = ServiceDaemon::new()
         .map_err(|error| io::Error::other(format!("mDNS responder could not start: {error}")))?;
 
-    // Addresses are deliberately left empty. Address tracking fills them from the
-    // interfaces and follows the camera when its network changes, which happens on
-    // every DHCP renewal and on every visit to the rescue network.
+    // Address tracking stays on so the advertised address follows the camera onto
+    // the rescue network and through a DHCP change.
     let service = ServiceInfo::new(
         SERVICE_TYPE,
         host_label,
         &format!("{host_label}.local."),
-        "",
+        addresses,
         port,
         &[(TLS_KEY, "1"), (PATH_KEY, STREAM_PATH)][..],
     )

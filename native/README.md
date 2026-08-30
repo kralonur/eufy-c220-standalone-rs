@@ -180,9 +180,16 @@ The camera answers for its own name on the local network and advertises its stre
 so a client does not have to be told an address and a generated certificate can be
 verified without an address exception: the certificate names the same host.
 
-- Name: `HOST_NAME` (default `c220`), so `c220.local`. A second camera gets a second
-  name - one name each is what makes multiple cameras work, since two responders
-  claiming one name would collide.
+- Name: `HOST_NAME`, else derived from the board identity as `camera-<serial>`: the
+  vendor PCB serial (kept by a factory reset), then the SoC serial from
+  `/proc/cpuinfo` (survives a wiped NVRAM), then the Wi-Fi MAC. Serial numbers are
+  unique, so two cameras cannot collide and neither needs configuring.
+
+  The firmware starts before Wi-Fi has an address, and registering with no address
+  left the camera unanswered for minutes while the responder refreshed: it now waits
+  in a background task for an address (up to 30 seconds, without delaying the
+  services) and registers with it. Measured: first answer 17 seconds after a reboot,
+  one second after the network came up.
 - Service: `_rtsp._tcp.local`, instance `<name>`, TXT `tls=1` and `path=/live`. The
   advertised port is the RTSPS port, because plaintext RTSP is retired.
 - Addresses are not fixed at registration: the responder tracks the interfaces, so

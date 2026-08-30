@@ -105,7 +105,8 @@ while :; do
     unset STANDALONE_HTTP_USERNAME STANDALONE_HTTP_PASSWORD_FILE
     unset STANDALONE_RTSP_PORT STANDALONE_RTSPS_PORT
     unset STANDALONE_RTSP_CERT_FILE STANDALONE_RTSP_KEY_FILE STANDALONE_API_TLS
-    unset STANDALONE_NTP_HOST STANDALONE_INSECURE_BRINGUP
+    unset STANDALONE_NTP_HOST STANDALONE_HOST_NAME STANDALONE_INSECURE_BRINGUP
+    unset HOST_NAME
     insecure_bringup=0
     if [ -r "$SECURITY_CONFIG" ]; then
         # Reject a writable/non-root config before the shell can source it.
@@ -169,6 +170,10 @@ while :; do
         # this board's clock on such a network.
         [ -n "${STANDALONE_NTP_HOST:-}" ] && \
             export NTP_HOST="$STANDALONE_NTP_HOST"
+        # The camera's own name: what it answers for over mDNS, and the name a
+        # generated certificate is issued for. Two cameras need two names.
+        [ -n "${STANDALONE_HOST_NAME:-}" ] && \
+            export HOST_NAME="$STANDALONE_HOST_NAME"
     elif [ -f "$INSECURE_MARKER" ]; then
         # No security file is accepted only with this explicit one-boot marker.
         if ! consume_insecure_marker; then

@@ -14,9 +14,11 @@
 #                    Writes the supplicant profile the Wi-Fi bootstrap uses, so
 #                    the camera can be moved to a new network with no console.
 #   provision.txt    SSID=... PSK=... MODE=... plus RTSP_USER, RTSP_PASSWORD,
-#                    HTTP_USER, HTTP_PASSWORD and optionally RTSPS_PORT and
-#                    NTP_HOST. Writes the network and the credentials, which is
-#                    the whole setup for a new owner and needs no shell at all.
+#                    HTTP_USER, HTTP_PASSWORD and optionally RTSPS_PORT,
+#                    NTP_HOST and HOST_NAME (the camera's own name, for mDNS and
+#                    for its certificate). Writes the network and the credentials,
+#                    which is the whole setup for a new owner and needs no shell
+#                    at all.
 #   cert.pem,        Optional certificate and key to install instead of letting
 #   key.pem          the firmware generate a self-signed pair.
 #   maintenance.txt  Starts the root shell on port 23 for this boot only.
@@ -220,6 +222,18 @@ host_is_valid() {
     return 0
 }
 
+# The camera's own name: a single DNS label, so it can be an mDNS host name and
+# the subject of a certificate. A trailing .local is accepted and stripped.
+host_label_is_valid() {
+    [ -n "$1" ] || return 1
+    [ "${#1}" -le 63 ] || return 1
+    case "$1" in
+        -*|*-) return 1 ;;
+        *[!a-z0-9-]*) return 1 ;;
+    esac
+    return 0
+}
+
 write_secret() {
     path=$1
     value=$2
@@ -259,6 +273,8 @@ apply_provision_file() {
     http_password=$(value_of HTTP_PASSWORD "$PROVISION_TXT")
     rtsps_port=$(value_of RTSPS_PORT "$PROVISION_TXT")
     ntp_host=$(value_of NTP_HOST "$PROVISION_TXT")
+    host_name=$(value_of HOST_NAME "$PROVISION_TXT" | tr 'A-Z' 'a-z')
+    host_name=${host_name%.local}
 
     # Both credential pairs are required: secure mode refuses to start without
     # either, so writing only half of a configuration would leave a camera that
@@ -275,6 +291,10 @@ apply_provision_file() {
     fi
     if [ -n "$ntp_host" ] && ! host_is_valid "$ntp_host"; then
         log_message "provision.txt rejected: NTP_HOST is not a valid address or host name"
+        return 1
+    fi
+    if [ -n "$host_name" ] && ! host_label_is_valid "$host_name"; then
+        log_message "provision.txt rejected: HOST_NAME must be a DNS name like c220 or front-door"
         return 1
     fi
 
@@ -298,6 +318,9 @@ apply_provision_file() {
         if [ -n "$ntp_host" ]; then
             printf 'STANDALONE_NTP_HOST=%s\n' "$ntp_host"
         fi
+        if [ -n "$host_name" ]; then
+            printf 'STANDALONE_HOST_NAME=%s\n' "$host_name"
+        fi
     } >"$SECURITY_CONFIG"); then
         log_message "provision.txt rejected: $SECURITY_CONFIG could not be written"
         return 1
@@ -305,7 +328,7 @@ apply_provision_file() {
     chmod 600 "$SECURITY_CONFIG" || return 1
 
     # Passwords are deliberately not logged, not even in part.
-    log_message "security config written: RTSP_USER=$rtsp_user HTTP_USER=$http_user RTSPS_PORT=$rtsps_port"
+    log_message "security config written: RTSP_USER=$rtsp_user HTTP_USER=$http_user RTSPS_PORT=$rtsps_port${host_name:+ HOST_NAME=$host_name}"
 
     if [ -n "$(value_of SSID "$PROVISION_TXT")" ]; then
         apply_network_file "provision.txt" "$PROVISION_TXT"

@@ -14,6 +14,7 @@ use rtsp::{RtspServer, RtspServerConfig, RtspsConfig};
 pub mod clock;
 pub mod control;
 pub mod digest;
+pub mod discovery;
 pub mod identity;
 pub mod media;
 pub mod media_engine;
@@ -55,6 +56,13 @@ const STANDALONE_AUDIO_ENV: &str = "STANDALONE_AUDIO";
 /// gateway is asked, which is the only other thing guaranteed to be on the LAN.
 const NTP_HOST_ENV: &str = "NTP_HOST";
 
+/// The camera's own name, used for mDNS and for a generated certificate.
+const HOST_NAME_ENV: &str = "HOST_NAME";
+
+/// Name used when nothing is configured, so a camera that has only been flashed
+/// is still reachable by name and still generates a certificate that names it.
+const DEFAULT_HOST_LABEL: &str = "c220";
+
 /// Persistent marker that opts deployed camera boots into microphone RTSP.
 const STANDALONE_AUDIO_MARKER: &str = "/home/nvram/system/.standalone_audio_enable";
 
@@ -90,6 +98,7 @@ async fn run_firmware() -> Result<(), Box<dyn Error + Send + Sync>> {
     tokio::spawn(clock::sync_until_set(std::env::var(NTP_HOST_ENV).ok()));
 
     let rtsp_port = security::port(RTSP_PORT_ENV, rtsp::DEFAULT_RTSP_PORT)?;
+    let host_label = security::host_label(HOST_NAME_ENV, DEFAULT_HOST_LABEL)?;
     let bind_address = std::env::var(RTSP_BIND_ADDRESS_ENV)
         .unwrap_or_else(|_| format!("0.0.0.0:{rtsp_port}"))
         .parse::<SocketAddr>()?;
@@ -137,7 +146,7 @@ async fn run_firmware() -> Result<(), Box<dyn Error + Send + Sync>> {
                 // reported by the acceptor below, which is the authority on whether
                 // the pair is usable.
                 if !insecure_bringup {
-                    match identity::ensure_self_signed(cert_file, key_file) {
+                    match identity::ensure_self_signed(cert_file, key_file, &host_label) {
                         Ok(identity::Outcome::Generated(names)) => tracing::info!(
                             names = %names.join(", "),
                             "generated a self-signed certificate; clients trust it on first use"
@@ -197,6 +206,24 @@ async fn run_firmware() -> Result<(), Box<dyn Error + Send + Sync>> {
     if insecure_bringup && http_auth.is_none() {
         tracing::warn!("HTTP Digest credentials are not configured; control API is anonymous");
     }
+
+    // The configuration is valid at this point, so the camera is going to serve:
+    // publish its name so clients can reach it without being told an address. A
+    // failure here is reported and shrugged off - discovery must never be the
+    // reason a camera refuses to work.
+    let _advertisement = match discovery::advertise(&host_label, rtsps_port.max(rtsp_port)) {
+        Ok(advertisement) => {
+            tracing::info!(
+                name = %format!("{host_label}.local"),
+                "answering mDNS queries for this name"
+            );
+            Some(advertisement)
+        }
+        Err(error) => {
+            tracing::warn!(%error, "mDNS advertisement unavailable; use the address instead");
+            None
+        }
+    };
     let lockout = Arc::new(Lockout::new());
     let audio_enabled = audio_enabled();
     let mut rtsp_config = RtspServerConfig::new(bind_address);

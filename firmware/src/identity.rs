@@ -23,9 +23,9 @@ use std::time::{Duration, Instant};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-/// Name that identifies the camera regardless of its address. Clients that
-/// resolve it by mDNS can use it instead of a pinned address.
-const HOST_NAME: &str = "c220.local";
+/// Suffix the camera's name is published under. It is the reserved mDNS domain,
+/// so a client resolves it by asking the local network rather than a server.
+const LOCAL_SUFFIX: &str = ".local";
 
 /// Subject fields of the generated certificate, so a client that shows the
 /// issuer says something meaningful instead of a library placeholder.
@@ -57,9 +57,16 @@ pub enum Outcome {
 
 /// Make sure a usable certificate and key exist at the configured paths.
 ///
+/// `host_label` is the camera's own name, used for the first subject alternative
+/// name so the certificate matches the mDNS name the camera answers for.
+///
 /// Returns [`Outcome::Existing`] without reading or writing anything when both
 /// files are already present.
-pub fn ensure_self_signed(cert_file: &Path, key_file: &Path) -> io::Result<Outcome> {
+pub fn ensure_self_signed(
+    cert_file: &Path,
+    key_file: &Path,
+    host_label: &str,
+) -> io::Result<Outcome> {
     if !cert_file.is_absolute() || !key_file.is_absolute() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -81,7 +88,7 @@ pub fn ensure_self_signed(cert_file: &Path, key_file: &Path) -> io::Result<Outco
         (false, false) => {}
     }
 
-    let names = names_when_addressed();
+    let names = names_when_addressed(host_label);
     generate_and_write(cert_file, key_file, &names)?;
     Ok(Outcome::Generated(names))
 }
@@ -90,10 +97,10 @@ pub fn ensure_self_signed(cert_file: &Path, key_file: &Path) -> io::Result<Outco
 ///
 /// The host name comes first so it is always present even when the camera has no
 /// address yet, which is the case on a first boot that has not associated.
-fn names_when_addressed() -> Vec<String> {
+fn names_when_addressed(host_label: &str) -> Vec<String> {
     let deadline = Instant::now() + ADDRESS_WAIT;
     loop {
-        let names = subject_names();
+        let names = subject_names(host_label);
         if names.len() > 2 || Instant::now() >= deadline {
             return names;
         }
@@ -101,9 +108,9 @@ fn names_when_addressed() -> Vec<String> {
     }
 }
 
-/// The host name, loopback and every current non-loopback IPv4 address.
-fn subject_names() -> Vec<String> {
-    let mut names = vec![HOST_NAME.to_string(), LOOPBACK.to_string()];
+/// The camera's name, loopback and every current non-loopback IPv4 address.
+fn subject_names(host_label: &str) -> Vec<String> {
+    let mut names = vec![format!("{host_label}{LOCAL_SUFFIX}"), LOOPBACK.to_string()];
     for address in local_addresses() {
         let text = address.to_string();
         if !names.contains(&text) {
@@ -260,7 +267,8 @@ mod tests {
         std::fs::write(&cert, "installed certificate\n").expect("certificate should be written");
         std::fs::write(&key, "installed key\n").expect("key should be written");
 
-        let outcome = ensure_self_signed(&cert, &key).expect("an existing pair must be accepted");
+        let outcome =
+            ensure_self_signed(&cert, &key, "c220").expect("an existing pair must be accepted");
 
         assert!(matches!(outcome, Outcome::Existing));
         assert_eq!(
@@ -280,7 +288,7 @@ mod tests {
         let scratch = Scratch::new("generated");
         let cert = scratch.0.join("cert.pem");
         let key = scratch.0.join("key.pem");
-        let names = vec![HOST_NAME.to_string(), "192.168.1.55".to_string()];
+        let names = vec!["front-door.local".to_string(), "192.168.1.55".to_string()];
 
         generate_and_write(&cert, &key, &names).expect("generation should succeed");
 
@@ -313,7 +321,7 @@ mod tests {
         let key = scratch.0.join("key.pem");
         std::fs::write(&cert, "installed certificate\n").expect("certificate should be written");
 
-        let error = ensure_self_signed(&cert, &key)
+        let error = ensure_self_signed(&cert, &key, "c220")
             .err()
             .expect("a half-present pair must be refused");
 

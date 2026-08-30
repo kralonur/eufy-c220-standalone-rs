@@ -17,6 +17,9 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 #[cfg(unix)]
 const INSECURE_SECRET_MODE_BITS: u32 = 0o077;
 
+/// Longest DNS label, from RFC 1035.
+const MAX_HOST_LABEL_LENGTH: usize = 63;
+
 /// Load one Digest credential pair.
 ///
 /// Both variables must be present to enable authentication. A partial pair is
@@ -117,6 +120,53 @@ fn read_secret_file(path: &str, variable: &str) -> io::Result<String> {
     })
 }
 
+/// Read the camera's own name: the mDNS host name and the first name in a
+/// generated certificate.
+///
+/// Only a DNS label is accepted. The value ends up in the subject alternative
+/// names of a certificate, where a name that cannot be resolved or verified is
+/// worse than no name at all, so anything that is not a plain label is refused
+/// rather than passed through. A trailing `.local` is accepted and ignored, so
+/// `c220` and `c220.local` mean the same camera to whoever writes the config.
+pub fn host_label(variable: &str, default: &str) -> io::Result<String> {
+    let raw = match std::env::var(variable) {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(default.to_string()),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{variable} is not valid UTF-8"),
+            ));
+        }
+    };
+    let value = raw.trim().to_ascii_lowercase();
+    if value.is_empty() {
+        return Ok(default.to_string());
+    }
+    let label = value.strip_suffix(".local").unwrap_or(&value);
+    if !is_host_label(label) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{variable} must be a DNS name such as c220 or c220.local, not {raw:?}"),
+        ));
+    }
+    Ok(label.to_string())
+}
+
+/// Whether the value is a single DNS label (RFC 1035): lowercase letters, digits
+/// and inner hyphens, no longer than 63 characters.
+fn is_host_label(label: &str) -> bool {
+    if label.is_empty() || label.len() > MAX_HOST_LABEL_LENGTH {
+        return false;
+    }
+    if label.starts_with('-') || label.ends_with('-') {
+        return false;
+    }
+    label
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
 /// Read a port override, using the supplied default when unset. Port 0 is
 /// accepted because it explicitly disables a listener.
 pub fn port(variable: &str, default: u16) -> io::Result<u16> {
@@ -200,5 +250,42 @@ mod tests {
         unsafe {
             std::env::remove_var("C220_TEST_USER");
         }
+    }
+
+    /// A bad name here would end up inside a certificate's subject alternative
+    /// names, where it cannot be verified and cannot be fixed without reissuing.
+    #[test]
+    fn host_labels_are_validated_before_they_reach_a_certificate() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let variable = "C220_TEST_HOST_NAME";
+        let cases = [
+            ("c220", Some("c220")),
+            ("c220.local", Some("c220")),
+            ("  Front-Door.Local  ", Some("front-door")),
+            ("front-door-2", Some("front-door-2")),
+            ("", Some("c220")),
+            ("-camera", None),
+            ("camera-", None),
+            ("camera_box", None),
+            ("camera.example.com", None),
+            ("camera!", None),
+            (&"a".repeat(64), None),
+        ];
+        for (input, expected) in cases {
+            // Tests serialize environment mutation; no other test can observe
+            // these temporary values while the lock is held.
+            unsafe { std::env::set_var(variable, input) };
+            let result = host_label(variable, "c220").ok();
+            assert_eq!(
+                result.as_deref(),
+                expected,
+                "input {input:?} should be {expected:?}"
+            );
+        }
+        unsafe { std::env::remove_var(variable) };
+        assert_eq!(
+            host_label(variable, "c220").expect("an unset name uses the default"),
+            "c220"
+        );
     }
 }

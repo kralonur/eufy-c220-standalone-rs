@@ -41,6 +41,7 @@ Decide now which route you will use:
 | Ports after setup | **322** RTSPS (video), **8080** HTTPS (control API). Plaintext 554 is off, port 23 is closed |
 | Time to come up | about **17 seconds** to start serving, about **22 seconds** until video flows |
 | Certificate | the camera makes its own self-signed one on first boot, unless you supply one. Your client has to trust it once |
+| Name | the camera answers to `<name>.local` over mDNS, `c220.local` by default, so you never have to remember its address |
 | Where the card goes | the microSD slot. **Insert the card before powering on** - the camera has no card-detect line and cannot notice a card inserted while running |
 | What the card contains | your Wi-Fi password and camera passwords, in plain text. **Take it out when you are done** and keep it somewhere sensible |
 
@@ -108,6 +109,36 @@ for when you want to supply one yourself.
 The full walkthrough, including signing with your own CA and the mistakes that
 make a camera refuse to start, is [Using your own certificate](#using-your-own-certificate)
 further down.
+
+### Step 3: pick the camera's name
+
+Every camera answers to a name of its own over **mDNS**: the default is `c220`,
+which makes it `c220.local` on your network. Nothing has to be configured for this
+to work, and it is worth knowing about for three reasons:
+
+- **You can stop remembering addresses.** `ping c220.local`, `telnet c220.local`,
+  and `rtsps://frigate:password@c220.local:322/live` all work from any device on the
+  same network that speaks mDNS (macOS, iOS, Linux, Windows 10+).
+- **The certificate follows the name.** A camera-generated certificate is issued for
+  `<name>.local` plus its current addresses, so dialling the name verifies even if
+  DHCP moves the camera. The name is the part that never goes stale.
+- **Two cameras need two names.** Two cameras both answering `c220.local` would
+  collide, so the second one gets its own name.
+
+Set it in the same provisioning file, one line:
+
+```sh
+HOST_NAME=front-door
+```
+
+The camera then answers `front-door.local`. Camera-generated certificates name it
+too. If you sign your own certificates, put the same name in the SAN.
+
+Caveats worth knowing: **Docker containers cannot resolve `.local` names by
+themselves** - the container has its own resolver and no mDNS (see
+[your own certificate](#using-your-own-certificate) for the one-line hosts entry that
+solves it), Android apps generally cannot either, and mDNS is local to one network
+segment: it does not cross VLANs or routers.
 
 ### Route A: SD card (recommended)
 
@@ -447,7 +478,7 @@ For comparison, when nothing is installed:
 | Subject | `CN=c220 camera, O=eufy-c220-standalone` |
 | Issuer | itself |
 | Key | ECDSA P-256, generated on the camera, stored mode `0600` |
-| Names | `c220.local`, loopback, and every IPv4 address it holds at that moment |
+| Names | `<name>.local` (the HOST_NAME setting, `c220` by default), loopback, and every IPv4 address it holds at that moment |
 | Validity | 1975 to 4096, so it cannot expire because this board has no clock battery |
 | Rotation | none: it is written once and left alone, so a client that pinned it keeps working |
 
@@ -623,7 +654,7 @@ a card cannot run scripts on the camera.
 
 | file | purpose |
 | --- | --- |
-| `provision.txt` | full setup: network + credentials (+ optional port and time server) |
+| `provision.txt` | full setup: network, credentials, and optionally the port, time server and camera name (`HOST_NAME`) |
 | `wifi.txt` | network only: `SSID=`, `PSK=`, `MODE=WPA\|WEP\|NONE`. Applied on every boot the card is present |
 | `cert.pem` + `key.pem` | install your own certificate instead of the generated one. Both required |
 | `maintenance.txt` | start a root shell on port 23 for that boot. Contents are ignored - the file's presence is the signal |
@@ -632,7 +663,8 @@ Validation, so you know what a rejection looks like: usernames 1-32 characters o
 `A-Z a-z 0-9 . _ @ -`; passwords 1-128 characters without control characters,
 quotes or backslashes; `SSID` at most 32 characters; `PSK` at most 64, and at
 least 8 for `WPA`; `RTSPS_PORT` 1-65535; `NTP_HOST` at most 64 characters of
-`A-Z a-z 0-9 . : -`. A file that fails validation is rejected as a whole and the
+`A-Z a-z 0-9 . : -`; `HOST_NAME` a single DNS label of lowercase letters, digits and
+inner hyphens, up to 63 characters, with a trailing `.local` accepted and stripped. A file that fails validation is rejected as a whole and the
 reason is written to `/tmp/c220-recovery.log`.
 
 ### Where things live on the camera

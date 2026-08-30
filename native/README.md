@@ -174,6 +174,35 @@ Digest credentials and the control-plane TLS acceptor are configured; the
 startup script kills stale Telnet processes at the next boot. Use it only from
 a trusted LAN and close/reboot the camera when finished.
 
+### Discovery by name (mDNS)
+
+The camera answers for its own name on the local network and advertises its stream,
+so a client does not have to be told an address and a generated certificate can be
+verified without an address exception: the certificate names the same host.
+
+- Name: `HOST_NAME` (default `c220`), so `c220.local`. A second camera gets a second
+  name - one name each is what makes multiple cameras work, since two responders
+  claiming one name would collide.
+- Service: `_rtsp._tcp.local`, instance `<name>`, TXT `tls=1` and `path=/live`. The
+  advertised port is the RTSPS port, because plaintext RTSP is retired.
+- Addresses are not fixed at registration: the responder tracks the interfaces, so
+  the advertised address follows a DHCP change and follows the camera onto the
+  rescue network. This matters here more than on a mains-powered server, because
+  this camera changes networks whenever rescue mode or a new lease happens.
+- Discovery is best-effort by design. If the responder cannot start, the firmware
+  logs a warning and serves anyway: a camera that cannot advertise is still a
+  camera, and refusing to serve over it would trade a working device for a tidy log.
+
+`mdns-sd` implements it (RFC 6762/6763). It runs its own thread - no async runtime
+integration - and both default features are disabled, which drops the `log` bridge
+(Cargo.lock keeps `base64` 0.23 only for the certificate `pem` writer, not for this).
+Cost: 212 KB of binary, 86 KB of the compressed image, for name resolution and
+service discovery.
+
+Clients still need mDNS themselves. Docker containers do not have it: a container
+that must resolve `.local` wants a hosts entry (one line in compose) or host
+networking, and Android apps generally cannot resolve `.local` at all.
+
 ### Card recovery
 
 A camera with no working network has no other management path, and reaching it

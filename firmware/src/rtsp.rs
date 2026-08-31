@@ -1600,23 +1600,33 @@ fn build_sdp(
             ));
         }
     }
-    sdp.push_str("a=control:trackID=0\r\na=sendonly\r\n");
+    // No direction attribute on the tracks the camera sends. RFC 4566 would accept
+    // `a=sendonly` here, but the RTSP clients in practice read `sendonly` as "this
+    // media is a backchannel I send on" and skip it: gortsplib decides with
+    // `isBackChannel()` by looking for exactly that attribute, and go2rtc's client
+    // behaves the same way. Marking forward tracks sendonly therefore made MediaMTX
+    // pull only the backchannel, and go2rtc negotiate audio with no video at all.
+    // Omitting the attribute means sendrecv, which every client treats as readable.
+    sdp.push_str("a=control:trackID=0\r\n");
     if audio_enabled {
         sdp.push_str(&format!(
             "m=audio 0 RTP/AVP {RTP_AUDIO_PAYLOAD_TYPE}\r\n\
              a=rtpmap:{RTP_AUDIO_PAYLOAD_TYPE} PCMA/{RTP_AUDIO_CLOCK_RATE}/1\r\n\
              a=ptime:20\r\n\
-             a=control:trackID=1\r\n\
-             a=sendonly\r\n"
+             a=control:trackID=1\r\n"
         ));
     }
     if talkback_enabled {
+        // The talkback track is the one media that is marked `sendonly`, which is the
+        // convention clients use to recognise a backchannel and leave it alone. This
+        // is inverted from RFC 4566's server perspective, and it is what the field
+        // expects: ONVIF cameras advertise their backchannel the same way.
         sdp.push_str(&format!(
             "m=audio 0 RTP/AVP {RTP_AUDIO_PAYLOAD_TYPE}\r\n\
              a=rtpmap:{RTP_AUDIO_PAYLOAD_TYPE} PCMA/{RTP_AUDIO_CLOCK_RATE}/1\r\n\
              a=ptime:20\r\n\
              a=control:backchannel\r\n\
-             a=recvonly\r\n"
+             a=sendonly\r\n"
         ));
     }
     Some(sdp)
@@ -2243,7 +2253,18 @@ mod tests {
         assert!(sdp.contains("a=rtpmap:8 PCMA/8000/1\r\n"));
         assert!(sdp.contains("a=control:trackID=1\r\n"));
         assert!(sdp.contains("a=control:backchannel\r\n"));
-        assert!(sdp.contains("a=recvonly\r\n"));
+        // Forward tracks must not carry a direction attribute: clients read
+        // `sendonly` as "backchannel" and would skip the video entirely.
+        assert!(!sdp.contains("a=sendonly\r\ntrackID") && sdp.contains("a=control:trackID=0\r\n"));
+        assert_eq!(
+            sdp.matches("a=sendonly\r\n").count(),
+            1,
+            "only the talkback track"
+        );
+        assert!(
+            !sdp.contains("a=recvonly"),
+            "no forward track may look like a backchannel"
+        );
     }
 
     #[tokio::test]

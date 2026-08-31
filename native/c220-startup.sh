@@ -7,9 +7,13 @@
 # /home/script/app.sh.
 
 FIRMWARE=/home/c220-firmware
+# Vendor mixer tool, preserved in the read-only image. It is how the microphone's
+# ADC mode is selected on this board.
+TINYMIX=/home/app/tinymix
 ENGINE=/home/c220-media-engine
 SOCKET=/tmp/c220-media.sock
 SECURITY_CONFIG=/home/nvram/system/standalone_auth.conf
+MQTT_CONFIG=/home/nvram/system/standalone_mqtt.conf
 INSECURE_MARKER=/home/nvram/system/.standalone_insecure_bringup
 LOG_FILE=/tmp/c220-firmware.log
 RESTART_DELAY_SECONDS=1
@@ -137,6 +141,12 @@ while :; do
     unset STANDALONE_RTSP_CERT_FILE STANDALONE_RTSP_KEY_FILE STANDALONE_API_TLS
     unset STANDALONE_NTP_HOST STANDALONE_HOST_NAME STANDALONE_INSECURE_BRINGUP
     unset HOST_NAME
+    unset MQTT_HOST MQTT_PORT MQTT_USERNAME MQTT_PASSWORD_FILE MQTT_CA_FILE
+    unset MQTT_TOPIC_PREFIX MQTT_DISCOVERY_PREFIX MQTT_DISCOVERY
+    unset STANDALONE_MQTT_HOST STANDALONE_MQTT_PORT STANDALONE_MQTT_USERNAME
+    unset STANDALONE_MQTT_PASSWORD_FILE STANDALONE_MQTT_CA_FILE
+    unset STANDALONE_MQTT_TOPIC_PREFIX STANDALONE_MQTT_DISCOVERY_PREFIX
+    unset STANDALONE_MQTT_DISCOVERY
     insecure_bringup=0
     if [ -r "$SECURITY_CONFIG" ]; then
         # Reject a writable/non-root config before the shell can source it.
@@ -152,6 +162,17 @@ while :; do
             trim_log
             sleep "$RESTART_DELAY_SECONDS"
             continue
+        fi
+
+        # Broker settings live in their own file so a deployment can keep them apart
+        # from the service credentials, and they are optional: without them the
+        # camera makes no outbound connection at all.
+        if [ -r "$MQTT_CONFIG" ]; then
+            if ! private_file_permissions_ok "$MQTT_CONFIG"; then
+                log_message "insecure permissions on $MQTT_CONFIG; ignoring MQTT settings"
+            elif ! . "$MQTT_CONFIG"; then
+                log_message "could not source $MQTT_CONFIG; ignoring MQTT settings"
+            fi
         fi
 
         # Only the prefixed names above are accepted from NVRAM. Discard any
@@ -200,6 +221,24 @@ while :; do
         # this board's clock on such a network.
         [ -n "${STANDALONE_NTP_HOST:-}" ] && \
             export NTP_HOST="$STANDALONE_NTP_HOST"
+        # MQTT: the broker is only contacted when a host is configured, so an
+        # unprovisioned camera makes no outbound connection at all.
+        [ -n "${STANDALONE_MQTT_HOST:-}" ] && \
+            export MQTT_HOST="$STANDALONE_MQTT_HOST"
+        [ -n "${STANDALONE_MQTT_PORT:-}" ] && \
+            export MQTT_PORT="$STANDALONE_MQTT_PORT"
+        [ -n "${STANDALONE_MQTT_USERNAME:-}" ] && \
+            export MQTT_USERNAME="$STANDALONE_MQTT_USERNAME"
+        [ -n "${STANDALONE_MQTT_PASSWORD_FILE:-}" ] && \
+            export MQTT_PASSWORD_FILE="$STANDALONE_MQTT_PASSWORD_FILE"
+        [ -n "${STANDALONE_MQTT_CA_FILE:-}" ] && \
+            export MQTT_CA_FILE="$STANDALONE_MQTT_CA_FILE"
+        [ -n "${STANDALONE_MQTT_TOPIC_PREFIX:-}" ] && \
+            export MQTT_TOPIC_PREFIX="$STANDALONE_MQTT_TOPIC_PREFIX"
+        [ -n "${STANDALONE_MQTT_DISCOVERY_PREFIX:-}" ] && \
+            export MQTT_DISCOVERY_PREFIX="$STANDALONE_MQTT_DISCOVERY_PREFIX"
+        [ -n "${STANDALONE_MQTT_DISCOVERY:-}" ] && \
+            export MQTT_DISCOVERY="$STANDALONE_MQTT_DISCOVERY"
         # The camera's own name: what it answers for over mDNS, and the name a
         # generated certificate is issued for. Two cameras need two names, so an
         # explicit setting wins and the board identity fills in otherwise.
@@ -226,6 +265,19 @@ while :; do
     fi
 
     log_message "starting standalone c220-firmware"
+    # The vendor firmware set the codec's ADC mode before using the microphone, and
+    # nothing else does it: without this line the capture path stays in its default
+    # mode, which is not the single-ended mode this board's microphone needs.
+    if [ -x "$TINYMIX" ]; then
+        if "$TINYMIX" set "ADC Mode" SingadcLR >>"$LOG_FILE" 2>&1; then
+            log_message "microphone ADC mode set to SingadcLR"
+        else
+            log_message "could not set the microphone ADC mode"
+        fi
+    else
+        log_message "no tinymix binary; the microphone keeps the codec default"
+    fi
+
     "$FIRMWARE" >>"$LOG_FILE" 2>&1
     status=$?
     log_message "c220-firmware exited status=$status; restarting"

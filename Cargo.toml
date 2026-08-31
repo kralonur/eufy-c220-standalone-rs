@@ -25,6 +25,9 @@ mdns-sd = { version = "0.21.3", default-features = false }
 # Self-signed certificate generation for first boot. Pure Rust and reuses the
 # ring provider already selected for rustls, so no second crypto stack is added.
 rcgen = { version = "0.14.10", default-features = false, features = ["pem", "ring"] }
+# MQTT client. The rustls mode without a provider is used so that the ring provider
+# already in the tree serves TLS here too, rather than adding AWS-LC.
+rumqttc = { version = "0.25.1", default-features = false, features = ["use-rustls-no-provider"] }
 rtp = "0.17.2"
 rtsp-runtime = "0.6.0"
 rtsp-types = "0.1.3"

@@ -19,6 +19,7 @@ pub mod discovery;
 pub mod identity;
 pub mod media;
 pub mod media_engine;
+pub mod mqtt;
 pub mod ptz;
 pub mod rtsp;
 pub mod security;
@@ -77,9 +78,21 @@ const STANDALONE_AUDIO_MARKER: &str = "/home/nvram/system/.standalone_audio_enab
 
 fn main() {
     initialize_logging();
+    install_crypto_provider();
     if let Err(error) = run() {
         tracing::error!(%error, "camera firmware stopped");
         std::process::exit(1);
+    }
+}
+
+/// Install the process-wide rustls provider. The TLS listener builds its own with
+/// ring explicitly; the MQTT client asks rustls for the default one, so it has to
+/// exist before that connection is made.
+fn install_crypto_provider() {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        // A second install from another thread simply loses the race; the provider
+        // is already there, which is all this needs.
+        let _ = rustls::crypto::ring::default_provider().install_default();
     }
 }
 
@@ -285,6 +298,18 @@ async fn run_firmware() -> Result<(), Box<dyn Error + Send + Sync>> {
     control_config.lockout = lockout;
     control_config.tls_acceptor = if api_tls { tls_acceptor } else { None };
     let control = ControlServer::start(control_config, media_slot.clone(), ptz)?;
+
+    // MQTT shares the control plane above, so a command over the broker takes exactly
+    // the same path as the same command over HTTPS. A configuration without a broker
+    // host starts no client and makes no connection.
+    match mqtt::MqttConfig::from_env() {
+        Ok(Some(mqtt_config)) => {
+            let task = mqtt::MqttTask::new(mqtt_config, control.inner());
+            tokio::spawn(task.run());
+        }
+        Ok(None) => {}
+        Err(error) => tracing::warn!(%error, "MQTT configuration rejected; MQTT disabled"),
+    }
     tracing::info!(
         address = %control.local_addr(),
         tls = control_tls_enabled,

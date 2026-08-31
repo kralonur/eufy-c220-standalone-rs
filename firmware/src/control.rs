@@ -170,6 +170,12 @@ impl ControlServer {
         Ok(Self { inner, local_addr })
     }
 
+    /// The shared control plane, so another transport can issue the same commands
+    /// the HTTP routes do rather than duplicating their logic.
+    pub(crate) fn inner(&self) -> Arc<ControlInner> {
+        Arc::clone(&self.inner)
+    }
+
     /// Address selected by the operating system, useful when binding port 0.
     pub const fn local_addr(&self) -> SocketAddr {
         self.local_addr
@@ -182,7 +188,7 @@ impl Drop for ControlServer {
     }
 }
 
-struct ControlInner {
+pub(crate) struct ControlInner {
     media: MediaEngineSlot,
     ptz: Option<Arc<PtzController>>,
     auth: Option<Arc<DigestAuth>>,
@@ -492,7 +498,7 @@ fn maintenance_enable(inner: &Arc<ControlInner>) -> Vec<u8> {
     }
 }
 
-async fn talkback_start(inner: &Arc<ControlInner>) -> Vec<u8> {
+pub(crate) async fn talkback_start(inner: &Arc<ControlInner>) -> Vec<u8> {
     inner.active.store(false, Ordering::Release);
     inner.next_timestamp_us.store(0, Ordering::Release);
     match send_command(inner, false, |handle| handle.clear_speaker()).await {
@@ -504,7 +510,7 @@ async fn talkback_start(inner: &Arc<ControlInner>) -> Vec<u8> {
     }
 }
 
-async fn talkback_stop(inner: &Arc<ControlInner>) -> Vec<u8> {
+pub(crate) async fn talkback_stop(inner: &Arc<ControlInner>) -> Vec<u8> {
     inner.active.store(false, Ordering::Release);
     match send_command(inner, false, |handle| handle.clear_speaker()).await {
         Ok(()) => json_response(200, "OK", r#"{"status":"ok","talking":false}"#),
@@ -586,7 +592,7 @@ async fn talkback_volume(inner: &Arc<ControlInner>, body: &[u8]) -> Vec<u8> {
     }
 }
 
-async fn night_mode(inner: &Arc<ControlInner>, body: &[u8]) -> Vec<u8> {
+pub(crate) async fn night_mode(inner: &Arc<ControlInner>, body: &[u8]) -> Vec<u8> {
     let mode = match parse_json_u32_field(body, "mode").and_then(|mode| {
         u8::try_from(mode).map_err(|_| "night mode must be 0, 1, or 2".to_string())
     }) {
@@ -600,7 +606,7 @@ async fn night_mode(inner: &Arc<ControlInner>, body: &[u8]) -> Vec<u8> {
     }
 }
 
-async fn ptz_position(inner: &Arc<ControlInner>) -> Vec<u8> {
+pub(crate) async fn ptz_position(inner: &Arc<ControlInner>) -> Vec<u8> {
     match send_ptz(inner, |ptz| ptz.position()).await {
         Ok((pan, tilt)) => json_response(
             200,
@@ -611,7 +617,7 @@ async fn ptz_position(inner: &Arc<ControlInner>) -> Vec<u8> {
     }
 }
 
-async fn ptz_move(inner: &Arc<ControlInner>, body: &[u8]) -> Vec<u8> {
+pub(crate) async fn ptz_move(inner: &Arc<ControlInner>, body: &[u8]) -> Vec<u8> {
     let direction = match parse_json_string_field(body, "direction")
         .ok()
         .and_then(|value| PtzDirection::parse(&value))
@@ -649,14 +655,14 @@ async fn ptz_move(inner: &Arc<ControlInner>, body: &[u8]) -> Vec<u8> {
     }
 }
 
-async fn ptz_stop(inner: &Arc<ControlInner>) -> Vec<u8> {
+pub(crate) async fn ptz_stop(inner: &Arc<ControlInner>) -> Vec<u8> {
     match send_ptz(inner, |ptz| ptz.stop()).await {
         Ok(()) => json_response(200, "OK", r#"{"status":"ok"}"#),
         Err(error) => ptz_error_response(error),
     }
 }
 
-async fn ptz_center(inner: &Arc<ControlInner>) -> Vec<u8> {
+pub(crate) async fn ptz_center(inner: &Arc<ControlInner>) -> Vec<u8> {
     match send_ptz(inner, |ptz| {
         ptz.center(5)?;
         ptz.position()
@@ -772,7 +778,7 @@ fn command_error_response(error: CommandFailure) -> Vec<u8> {
     }
 }
 
-fn health_response(inner: &ControlInner) -> Vec<u8> {
+pub(crate) fn health_response(inner: &ControlInner) -> Vec<u8> {
     let ready = inner.media.current().ok().flatten().is_some();
     let (status, code, reason) = if ready {
         ("ok", 200, "OK")
@@ -786,7 +792,7 @@ fn health_response(inner: &ControlInner) -> Vec<u8> {
     )
 }
 
-fn talkback_status_response(inner: &ControlInner) -> Vec<u8> {
+pub(crate) fn talkback_status_response(inner: &ControlInner) -> Vec<u8> {
     let ready = inner.media.current().ok().flatten().is_some();
     let talking = inner.active.load(Ordering::Acquire);
     let volume = inner.volume.load(Ordering::Acquire);

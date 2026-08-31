@@ -71,6 +71,15 @@ fn env_string(variable: &str) -> io::Result<Option<String>> {
     }
 }
 
+/// Read a secret from the file named by `variable`, applying the same ownership and
+/// mode checks the service credentials get. Returns `None` when unset.
+pub fn secret_file(variable: &str) -> io::Result<Option<String>> {
+    match env_string(variable)? {
+        Some(path) => read_secret_file(&path, variable).map(Some),
+        None => Ok(None),
+    }
+}
+
 fn read_secret_file(path: &str, variable: &str) -> io::Result<String> {
     let path = Path::new(path);
     if !path.is_absolute() {

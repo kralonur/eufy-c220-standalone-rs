@@ -240,6 +240,42 @@ verified it - it needs a USB-TTL adapter that was not available while the rest o
 this was tested - so treat the baud rate and the shell as expected rather than
 proven.
 
+### Receiving RTSPS: SDP direction attributes and certificate verification
+
+Two things about consuming this camera's RTSPS are worth knowing, both discovered the
+hard way while wiring it into a containerised NVR.
+
+**Direction attributes are a trap.** The SDP marks forward tracks only with
+`a=control`, and marks the talkback track `a=sendonly`. That looks backwards next to
+RFC 4566, where `sendonly` describes what the *server* sends, and the instinct is to
+mark the video and microphone tracks `sendonly` too. Do not: the Go RTSP clients in
+wide use read `sendonly` as "this media is a backchannel the client sends on" -
+gortsplib decides with a one-line `isBackChannel()` that looks for exactly that
+attribute, and MediaMTX skips backchannels when it pulls a stream. A camera that
+marks its forward tracks `sendonly` therefore looks, to those clients, like a camera
+that offers nothing but a backchannel. ffmpeg is unbothered, which is what makes the
+failure look like a client bug rather than an SDP one.
+
+**Certificate verification is the client's problem, and the obvious clients do not do
+it.** ffmpeg cannot verify an `rtsps://` peer at all: `tls_verify` defaults to 0 and
+the option is a TLS-protocol option that the RTSP demuxer rejects (`Option tls_verify
+not found`), as does `-ca_file`. go2rtc's native client connected to this camera with
+the certificate deliberately removed from its trust store. MediaMTX does verify, and
+can pin the camera's own certificate without any CA:
+
+```yaml
+paths:
+  eufy_c220:
+    source: rtsps://frigate:PASSWORD@192.168.50.55:322/live
+    sourceFingerprint: "5d7143b9b86d7dcf17842f13c19705ef6872659e62c988dc0bc463aa703bcde1"
+    sourceOnDemand: no
+```
+
+The fingerprint goes in without colons, or the comparison fails with both values
+printed, and it is the anchor: a wrong fingerprint stops the connection rather than
+producing a warning. Publish it only on the host loopback, and let the NVR read that
+plain local stream, because a second listener on the LAN is a second way in.
+
 ### Discovery by name (mDNS)
 
 The camera answers for its own name on the local network and advertises its stream,

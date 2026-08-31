@@ -276,6 +276,38 @@ printed, and it is the anchor: a wrong fingerprint stops the connection rather t
 producing a warning. Publish it only on the host loopback, and let the NVR read that
 plain local stream, because a second listener on the LAN is a second way in.
 
+#### When the camera's certificate changes
+
+A pin is tied to one certificate, so it stops working when the certificate is
+replaced. That happens when:
+
+- a 10-second factory reset wipes the certificate and key, so the next boot generates
+  a new pair with a new key;
+- the two certificate files are deleted (which is the documented way to ask the camera
+  for a new one) and it reboots;
+- a certificate is installed from a card or over the maintenance shell.
+
+The failure is explicit rather than silent, and it prints the value to paste:
+
+```
+ERR [path eufy_c220] [RTSP source] source fingerprint does not match:
+    expected 5d71...bcde1, got 3a04...77c2
+```
+
+`got` is the new fingerprint, in the colon-free form the option wants - so the fix is
+to replace the pinned value with it and restart the relay. To fetch the current
+fingerprint straight from the camera instead of reading it out of an error:
+
+```sh
+openssl s_client -connect <camera>:322 -servername <camera> </dev/null 2>/dev/null \
+  | openssl x509 -noout -fingerprint -sha256 | cut -d= -f2 | tr -d ':'
+```
+
+Anything else that pinned the same certificate - a monitoring script, a phone app,
+another NVR - needs the same update. Clients that trust a CA instead are unaffected by
+this, which is the one advantage a CA keeps: the anchor outlives every certificate
+that is issued from it.
+
 ### Discovery by name (mDNS)
 
 The camera answers for its own name on the local network and advertises its stream,

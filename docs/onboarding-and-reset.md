@@ -472,10 +472,22 @@ deliberate:
 1. put the new `cert.pem` and `key.pem` on a provisioning card and boot with it, or
 2. write both files to the NVRAM paths over the maintenance shell and reboot
 
-Clients that trust your CA carry on unchanged. Clients that pinned the old
-certificate need its new fingerprint. If you would rather hand the job back to the
-camera, delete both files and reboot: it generates a new pair naming itself for the
-address it has at that moment.
+Clients that trust your CA carry on unchanged. Clients that **pinned** the old
+certificate - anything configured with its fingerprint rather than with a CA - need
+the new one:
+
+```sh
+# the fingerprint of whatever the camera is serving now
+openssl s_client -connect <camera>:322 -servername <camera> </dev/null 2>/dev/null \
+  | openssl x509 -noout -fingerprint -sha256 | cut -d= -f2 | tr -d ':'
+```
+
+If you would rather hand the job back to the camera, delete both files and reboot: it
+generates a new pair naming itself for the address it has at that moment. Anything
+pinning the old certificate stops working at that point, by design: a pin that
+survived a new certificate would not be a pin. The two cases that regenerate a
+certificate on their own are a 10-second factory reset, which wipes the pair, and
+deleting the files, which is the documented way to ask for a new one.
 
 #### What the camera generates for itself
 

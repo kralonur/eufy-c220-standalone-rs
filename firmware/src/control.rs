@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, mpsc};
 use tokio_rustls::TlsAcceptor;
 
 /// A boxed plaintext or TLS control connection.
@@ -44,6 +44,23 @@ const AAC_FRAME_DURATION_US: u64 = 64_000;
 
 /// PCM talkback is supplied as mono 16 kHz signed PCM16.
 const PCM_SAMPLE_RATE: u64 = 16_000;
+
+/// One piece of audio waiting for the camera speaker.
+///
+/// Audio is queued rather than written inline: the handler must answer the client as
+/// soon as the audio is accepted, otherwise the engine's playback pacing becomes the
+/// client's pacing, and one slow write stretches the following chunk into silence.
+/// The reference bridge queued it the same way.
+enum SpeakerFrame {
+    Pcm { data: Vec<u8>, timestamp_us: u64 },
+    Aac { data: Vec<u8>, timestamp_us: u64 },
+}
+
+/// Frames that may wait before the writer task drains them. A frame is a client-side
+/// chunk, typically 20-200 ms of audio, so this is a couple of seconds of slack:
+/// enough to absorb jitter, small enough that a client which stops sending cannot
+/// accumulate audio in the camera's scarce memory.
+const AUDIO_QUEUE_FRAMES: usize = 32;
 
 /// Native AO volume starts at its validated full-scale default.
 const DEFAULT_VOLUME: u32 = 100;
@@ -151,6 +168,8 @@ impl ControlServer {
         })?;
         let maintenance_available = config.tls_acceptor.is_some() && config.auth.is_some();
         let tls_acceptor = config.tls_acceptor;
+        // The writer task owns the speaker's pacing; the handlers only enqueue.
+        let (audio_tx, mut audio_rx) = mpsc::channel::<SpeakerFrame>(AUDIO_QUEUE_FRAMES);
         let inner = Arc::new(ControlInner {
             media,
             ptz,
@@ -161,6 +180,7 @@ impl ControlServer {
             active: AtomicBool::new(false),
             next_timestamp_us: AtomicU64::new(0),
             volume: AtomicU32::new(DEFAULT_VOLUME),
+            audio: audio_tx,
             night_mode: AtomicU8::new(0),
             command_lock: Mutex::new(()),
             ptz_lock: Mutex::new(()),
@@ -168,6 +188,29 @@ impl ControlServer {
         });
         let accept_inner = Arc::clone(&inner);
         runtime.spawn(async move { accept_loop(listener, accept_inner, tls_acceptor).await });
+
+        let writer_inner = Arc::clone(&inner);
+        runtime.spawn(async move {
+            while let Some(frame) = audio_rx.recv().await {
+                let result = match frame {
+                    SpeakerFrame::Pcm { data, timestamp_us } => {
+                        send_command(&writer_inner, true, move |handle| {
+                            handle.send_speaker_pcm(&data, timestamp_us)
+                        })
+                        .await
+                    }
+                    SpeakerFrame::Aac { data, timestamp_us } => {
+                        send_command(&writer_inner, true, move |handle| {
+                            handle.send_speaker_aac(&data, timestamp_us)
+                        })
+                        .await
+                    }
+                };
+                if let Err(error) = result {
+                    tracing::warn!(?error, "camera speaker write failed");
+                }
+            }
+        });
 
         Ok(Self { inner, local_addr })
     }
@@ -201,6 +244,9 @@ pub(crate) struct ControlInner {
     active: AtomicBool,
     next_timestamp_us: AtomicU64,
     volume: AtomicU32,
+    /// Audio waiting for the speaker writer task, bounded so that a client sending
+    /// faster than real time is refused instead of growing the camera's memory use.
+    audio: mpsc::Sender<SpeakerFrame>,
     /// Last commanded night mode: 0 automatic, 1 night, 2 day. The engine owns the
     /// real state; this is what the camera was last told to do, which is what a
     /// status reader can act on.
@@ -446,6 +492,7 @@ async fn dispatch(inner: &Arc<ControlInner>, request: HttpRequest) -> Vec<u8> {
         ("POST", "/maintenance/enable") => maintenance_enable(inner),
         ("GET", "/ptz/position") | ("GET", "/ptz/status") => ptz_position(inner).await,
         ("POST", "/ptz/move") => ptz_move(inner, &request.body).await,
+        ("POST", "/ptz/rotate") => ptz_rotate(inner, &request.body).await,
         ("POST", "/ptz/stop") => ptz_stop(inner).await,
         ("POST", "/ptz/center") => ptz_center(inner).await,
         _ => error_response(404, "control endpoint not found"),
@@ -543,17 +590,12 @@ async fn talkback_pcm(inner: &Arc<ControlInner>, body: Vec<u8>) -> Vec<u8> {
         .max(1);
     let timestamp_us = reserve_timestamp(inner, duration_us);
     let byte_count = body.len();
-    match send_command(inner, true, move |handle| {
-        handle.send_speaker_pcm(&body, timestamp_us)
-    })
-    .await
-    {
-        Ok(()) => json_response(
-            200,
-            "OK",
-            &format!(r#"{{"status":"ok","bytes_sent":{byte_count}}}"#),
-        ),
-        Err(error) => command_error_response(error),
+    match inner.audio.try_send(SpeakerFrame::Pcm {
+        data: body,
+        timestamp_us,
+    }) {
+        Ok(()) => queued_response(byte_count),
+        Err(error) => queue_error_response(error),
     }
 }
 
@@ -563,17 +605,12 @@ async fn talkback_audio(inner: &Arc<ControlInner>, body: Vec<u8>) -> Vec<u8> {
     }
     let timestamp_us = reserve_timestamp(inner, AAC_FRAME_DURATION_US);
     let byte_count = body.len();
-    match send_command(inner, true, move |handle| {
-        handle.send_speaker_aac(&body, timestamp_us)
-    })
-    .await
-    {
-        Ok(()) => json_response(
-            200,
-            "OK",
-            &format!(r#"{{"status":"ok","bytes_sent":{byte_count}}}"#),
-        ),
-        Err(error) => command_error_response(error),
+    match inner.audio.try_send(SpeakerFrame::Aac {
+        data: body,
+        timestamp_us,
+    }) {
+        Ok(()) => queued_response(byte_count),
+        Err(error) => queue_error_response(error),
     }
 }
 
@@ -660,6 +697,41 @@ pub(crate) async fn ptz_move(inner: &Arc<ControlInner>, body: &[u8]) -> Vec<u8> 
             &format!(
                 r#"{{"status":"ok","direction":"{direction}","degrees":{degrees},"speed":{speed}}}"#
             ),
+        ),
+        Err(error) => ptz_error_response(error),
+    }
+}
+
+/// Rotate until told to stop.
+///
+/// A held button wants this, not steps: every step carries its own acceleration and
+/// settling, so stepping a held direction starts and stops the motor several times a
+/// second and reads as a stutter rather than a pan.
+pub(crate) async fn ptz_rotate(inner: &Arc<ControlInner>, body: &[u8]) -> Vec<u8> {
+    let direction = match parse_json_string_field(body, "direction")
+        .ok()
+        .and_then(|value| PtzDirection::parse(&value))
+    {
+        Some(direction) => direction,
+        None => return error_response(400, "PTZ direction must be left, right, up, or down"),
+    };
+    let speed = match parse_optional_json_u32_field(body, "speed", 5) {
+        Ok(speed) if speed <= 10 => speed as u8,
+        Ok(_) => return error_response(400, "PTZ speed must be between 0 and 10"),
+        Err(error) => return error_response(400, &error),
+    };
+    let operation = move |ptz: &PtzController| {
+        if direction == PtzDirection::Stop {
+            ptz.stop()
+        } else {
+            ptz.start_move(direction, speed)
+        }
+    };
+    match send_ptz(inner, operation).await {
+        Ok(()) => json_response(
+            200,
+            "OK",
+            &format!(r#"{{"status":"ok","direction":"{direction}","speed":{speed}}}"#),
         ),
         Err(error) => ptz_error_response(error),
     }
@@ -981,6 +1053,29 @@ fn parse_json_u32_field(body: &[u8], field: &str) -> Result<u32, String> {
     value[..digit_end]
         .parse::<u32>()
         .map_err(|_| format!("JSON field {field} is out of range"))
+}
+
+/// The client's audio is accepted and will be written at the speaker's own pace.
+fn queued_response(byte_count: usize) -> Vec<u8> {
+    json_response(
+        200,
+        "OK",
+        &format!(r#"{{"status":"ok","bytes_sent":{byte_count},"queued":true}}"#),
+    )
+}
+
+/// A full queue means the client is ahead of real time. Saying so lets it pace itself;
+/// silently blocking would turn its audio into stutter instead.
+fn queue_error_response(error: mpsc::error::TrySendError<SpeakerFrame>) -> Vec<u8> {
+    match error {
+        mpsc::error::TrySendError::Full(_) => error_response(
+            503,
+            "speaker queue is full; send audio at or below real time",
+        ),
+        mpsc::error::TrySendError::Closed(_) => {
+            error_response(503, "speaker writer is not running")
+        }
+    }
 }
 
 fn json_response(status: u16, reason: &str, body: &str) -> Vec<u8> {

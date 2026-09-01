@@ -20,8 +20,8 @@ use tokio::time::{interval, sleep};
 use tracing::{info, warn};
 
 use crate::control::{
-    ControlInner, night_mode, ptz_center, ptz_move, ptz_stop, status_response, talkback_start,
-    talkback_status_response, talkback_stop,
+    ControlInner, night_mode, ptz_center, ptz_move, ptz_rotate, ptz_stop, status_response,
+    talkback_start, talkback_status_response, talkback_stop,
 };
 use crate::security;
 
@@ -48,8 +48,6 @@ const DEFAULT_DISCOVERY_PREFIX: &str = "homeassistant";
 /// moves in steps rather than continuously, so a hold is a stepping loop; this
 /// bounds how far it can run away if the release message is lost.
 const HOLD_TIMEOUT: Duration = Duration::from_secs(10);
-/// Degrees per hold step. Small enough to look continuous at the stepping interval.
-const HOLD_STEP_DEGREES: i32 = 4;
 /// Interval between hold steps.
 const HOLD_STEP_INTERVAL: Duration = Duration::from_millis(200);
 /// PTZ speed used for every MQTT command, on the 0-10 scale.
@@ -206,6 +204,10 @@ impl MqttTask {
             format!("{prefix}/ptz/set"),
             format!("{prefix}/ptz/hold"),
             format!("{prefix}/ptz/center"),
+            // The dashboard's PTZ card drives these two; without them a held button
+            // and a recentre command go nowhere at all.
+            format!("{prefix}/ptz/move"),
+            format!("{prefix}/ptz/calibrate"),
             format!("{prefix}/night_mode/set"),
             format!("{prefix}/talkback/set"),
         ] {
@@ -271,6 +273,20 @@ impl MqttTask {
                 }
                 other => warn!(%other, "ptz/hold takes left, right, up, down or stop"),
             },
+            "ptz/move" => match value {
+                "stop" | "off" | "" => {
+                    self.holding.store(false, Ordering::Release);
+                    self.report("ptz/move", ptz_stop(&self.control).await);
+                }
+                direction @ ("left" | "right" | "up" | "down") => {
+                    self.start_hold(direction.to_string()).await;
+                }
+                other => warn!(%other, "ptz/move takes left, right, up, down or stop"),
+            },
+            "ptz/calibrate" => {
+                self.holding.store(false, Ordering::Release);
+                self.report("ptz/calibrate", ptz_center(&self.control).await);
+            }
             "ptz/center" => {
                 self.holding.store(false, Ordering::Release);
                 self.report("ptz/center", ptz_center(&self.control).await);
@@ -303,32 +319,18 @@ impl MqttTask {
         }
     }
 
-    /// Hold a direction by stepping, because the engine moves in steps rather than
-    /// continuously. Stops on `ptz/hold stop`, on any other movement command, or
-    /// after [`HOLD_TIMEOUT`].
+    /// Rotate while the button is held: one continuous motor command, ended by
+    /// `ptz/hold stop`, any other movement command, or [`HOLD_TIMEOUT`] as a safety
+    /// net in case the release message never arrives.
     async fn start_hold(&self, direction: String) {
-        if self.holding.swap(true, Ordering::AcqRel) {
-            // A hold is already stepping; the new direction replaces it.
-            self.holding.store(false, Ordering::Release);
-            sleep(HOLD_STEP_INTERVAL).await;
-            self.holding.store(true, Ordering::Release);
-        }
+        self.holding.store(true, Ordering::Release);
+        let body = format!(r#"{{"direction":"{direction}","speed":{COMMAND_SPEED}}}"#);
+        self.report("ptz/hold", ptz_rotate(&self.control, body.as_bytes()).await);
         let control = Arc::clone(&self.control);
         let holding = Arc::clone(&self.holding);
         tokio::spawn(async move {
             let deadline = Instant::now() + HOLD_TIMEOUT;
             while holding.load(Ordering::Acquire) && Instant::now() < deadline {
-                let body = format!(
-                    r#"{{"direction":"{direction}","degrees":{HOLD_STEP_DEGREES},"speed":{COMMAND_SPEED}}}"#
-                );
-                if ptz_move(&control, body.as_bytes())
-                    .await
-                    .starts_with(b"HTTP/1.1 200")
-                {
-                    // keep stepping
-                } else {
-                    break;
-                }
                 sleep(HOLD_STEP_INTERVAL).await;
             }
             holding.store(false, Ordering::Release);

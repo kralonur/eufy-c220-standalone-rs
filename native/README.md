@@ -308,6 +308,49 @@ another NVR - needs the same update. Clients that trust a CA instead are unaffec
 this, which is the one advantage a CA keeps: the anchor outlives every certificate
 that is issued from it.
 
+### Flashing the home partition on this board
+
+Two things that cost an hour and are worth knowing before touching mtd6:
+
+- `flashcp` on the camera is a stub: it answers "This doesn't seem to be a valid MTD
+  flash device!" and writes nothing (`flash rc=1`). There are no mtd-utils on the
+  board, and the SD card is not mounted. The working path is the vendor's by-name
+  block node: `/dev/block/by-name/home` -> `/dev/mtdblock6`.
+- Writes to that mounted block device must be **erase-block aligned**. `dd bs=4096`
+  reports "312+0 records out", returns success, and silently drops the final partial
+  erase block - leaving the last 32 KiB of a new image unwritten, which is enough to
+  make the squashfs unmountable. Use `bs=65536` (the mtd erase size from
+  `/proc/mtd`) over an image padded to a 64 KiB multiple:
+
+  ```sh
+  dd if=/tmp/blocks.img of=/dev/block/by-name/home bs=65536 conv=notrunc
+  dd if=/dev/mtd6 bs=65536 count=20 | md5sum     # reads flash, not the block cache
+  ```
+
+  Verify through the *character* device: it bypasses the block cache, so a matching
+  md5 there is evidence about the flash itself.
+
+### Talkback: queue implemented, writer must not block the runtime
+
+The queued speaker path is implemented (`SpeakerFrame`, a bounded channel, a writer
+task, `try_send` with a 503 when full) and deployed. One flaw remains, found by
+measurement rather than reasoning: a single chunk took **20 s** (the client timeout)
+while the rest took ~60 ms.
+
+The cause is that the writer task performs the engine write inside the Tokio runtime.
+The engine socket write is blocking I/O, and the runtime is single-threaded on this
+one-core board, so a slow write stalls the accept loop and every other connection.
+The fix is to get the write off the runtime:
+
+- Use `std::sync::mpsc::sync_channel` (bounded, `try_send`) and a plain
+  `std::thread` writer, or `spawn_blocking` with `blocking_recv()`.
+- In the writer, call a *synchronous* command path (take `command_lock`, then call the
+  engine handle method) rather than awaiting `send_command`. The engine write is
+  blocking I/O either way, so an OS thread is the honest place for it.
+- Keep the handler's `try_send` and the 503-on-full response exactly as they are:
+  that part is correct and is what makes the client's pacing independent of the
+  engine's.
+
 ### Known gap: talkback audio is written inline
 
 Push-to-talk audio stutters, and this is a regression against the reference bridge

@@ -308,6 +308,36 @@ another NVR - needs the same update. Clients that trust a CA instead are unaffec
 this, which is the one advantage a CA keeps: the anchor outlives every certificate
 that is issued from it.
 
+### Known gap: talkback audio is written inline
+
+Push-to-talk audio stutters, and this is a regression against the reference bridge
+rather than a network problem. The reference queued audio and wrote it from a
+dedicated thread (`speaker.rs`: a bounded channel, `TrySendError::Full` reported as
+"speaker queue is full"); this firmware writes each frame to the engine synchronously
+from the HTTP handler, so the engine's playback pacing becomes the client's pacing and
+one slow write stretches the next chunk into silence.
+
+The fix, ready to implement:
+
+1. Add a bounded `tokio::sync::mpsc` channel to the control state (~`AUDIO_QUEUE_FRAMES
+   = 32` frames, roughly two seconds of slack) carrying
+   `enum SpeakerFrame { Pcm { data: Vec<u8>, timestamp_us: u64 }, Aac { .. } }`.
+2. Spawn a writer task in `ControlServer::start` that drains it with
+   `send_command(&inner, true, ..)` calling `send_speaker_pcm`/`send_speaker_aac`. The
+   `true` audio flag already keeps the audio path off the control mutex.
+3. Make `talkback_pcm` and `talkback_audio` `try_send` and answer immediately:
+   `200 {"status":"ok","bytes_sent":N,"queued":true}`, or `503 "speaker queue is full;
+   send audio at or below real time"`. The timestamp is still reserved at enqueue time
+   so pacing stays continuous.
+4. Leave start/stop/volume synchronous: only the payload is queued, so a stalled write
+   can never block a stop.
+
+Measured before the fix, from this machine over the LAN: one 100 ms chunk costs about
+53 ms end to end including a fresh TLS connection, and 20 sequential chunks run at a
+61 ms median with a 129 ms maximum, against a 100 ms real-time budget. Those numbers
+include per-request connection and Digest setup, so they are an upper bound - but the
+serialisation they show is the mechanism behind the stutter.
+
 ### Discovery by name (mDNS)
 
 The camera answers for its own name on the local network and advertises its stream,

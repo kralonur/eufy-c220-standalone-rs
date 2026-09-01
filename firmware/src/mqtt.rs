@@ -20,8 +20,8 @@ use tokio::time::{interval, sleep};
 use tracing::{info, warn};
 
 use crate::control::{
-    ControlInner, health_response, night_mode, ptz_center, ptz_move, ptz_position, ptz_stop,
-    talkback_start, talkback_status_response, talkback_stop,
+    ControlInner, night_mode, ptz_center, ptz_move, ptz_stop, status_response, talkback_start,
+    talkback_status_response, talkback_stop,
 };
 use crate::security;
 
@@ -351,37 +351,59 @@ impl MqttTask {
     }
 
     /// Publish availability, human status, state topics and telemetry.
+    ///
+    /// Telemetry is the same document `/status` serves, so the card and the Home
+    /// Assistant integration cannot be told different things about one camera.
     async fn publish_state(&self, client: &AsyncClient) -> Result<(), rumqttc::ClientError> {
         let prefix = &self.config.topic_prefix;
-        let streaming = response_body(&health_response(&self.control)).contains("true");
-        let status = if streaming { "streaming" } else { "starting" };
+        let telemetry = response_body(&status_response(&self.control).await).to_string();
+        let streaming = telemetry.contains(r#""status":"streaming""#);
         client
-            .publish(format!("{prefix}/status"), QoS::AtLeastOnce, true, status)
+            .publish(
+                format!("{prefix}/status"),
+                QoS::AtLeastOnce,
+                true,
+                if streaming { "streaming" } else { "starting" },
+            )
             .await?;
 
-        // The shared handlers answer like the HTTP API does, status line and
-        // headers included, so the body is what belongs in the payload.
-        let telemetry = response_body(&ptz_position(&self.control).await).to_string();
         let talkback = response_body(&talkback_status_response(&self.control)).to_string();
-        let talking = talkback.contains(r#""talking":true"#);
         client
             .publish(
                 format!("{prefix}/talkback/state"),
                 QoS::AtLeastOnce,
                 true,
-                if talking { "ON" } else { "OFF" },
+                if talkback.contains(r#""talking":true"#) {
+                    "ON"
+                } else {
+                    "OFF"
+                },
             )
             .await?;
 
-        // Telemetry is assembled here rather than with a JSON library: three fields
-        // from two existing responses is not worth a dependency.
-        let payload = format!(r#"{{"status":"{status}","ptz":{telemetry},"talkback":{talkback}}}"#);
+        // Reported from the same document, so the state topic cannot disagree with
+        // the telemetry about what the camera was last told.
+        let mode = telemetry
+            .split(r#""mode":""#)
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .unwrap_or("auto")
+            .to_string();
+        client
+            .publish(
+                format!("{prefix}/night_mode/state"),
+                QoS::AtLeastOnce,
+                true,
+                mode,
+            )
+            .await?;
+
         client
             .publish(
                 format!("{prefix}/status/json"),
                 QoS::AtLeastOnce,
                 true,
-                payload,
+                telemetry,
             )
             .await?;
         Ok(())

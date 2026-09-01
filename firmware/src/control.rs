@@ -8,10 +8,11 @@
 use crate::digest::{DigestAuth, Lockout, Outcome};
 use crate::media_engine::MediaEngineHandle;
 use crate::ptz::{PAN_MAX_DEGREES, PtzController, PtzDirection};
+use crate::security;
 use std::io;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -160,6 +161,7 @@ impl ControlServer {
             active: AtomicBool::new(false),
             next_timestamp_us: AtomicU64::new(0),
             volume: AtomicU32::new(DEFAULT_VOLUME),
+            night_mode: AtomicU8::new(0),
             command_lock: Mutex::new(()),
             ptz_lock: Mutex::new(()),
             shutdown: Notify::new(),
@@ -199,6 +201,10 @@ pub(crate) struct ControlInner {
     active: AtomicBool,
     next_timestamp_us: AtomicU64,
     volume: AtomicU32,
+    /// Last commanded night mode: 0 automatic, 1 night, 2 day. The engine owns the
+    /// real state; this is what the camera was last told to do, which is what a
+    /// status reader can act on.
+    night_mode: AtomicU8,
     command_lock: Mutex<()>,
     ptz_lock: Mutex<()>,
     shutdown: Notify,
@@ -428,6 +434,7 @@ fn unauthorized_response(auth: &DigestAuth, stale: bool) -> Vec<u8> {
 async fn dispatch(inner: &Arc<ControlInner>, request: HttpRequest) -> Vec<u8> {
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/healthz") => health_response(inner),
+        ("GET", "/status") => status_response(inner).await,
         ("GET", "/talkback/status") => talkback_status_response(inner),
         ("POST", "/talkback/start") => talkback_start(inner).await,
         ("POST", "/talkback/stop") => talkback_stop(inner).await,
@@ -601,7 +608,10 @@ pub(crate) async fn night_mode(inner: &Arc<ControlInner>, body: &[u8]) -> Vec<u8
         Err(error) => return error_response(400, &error),
     };
     match send_command(inner, false, move |handle| handle.set_night_mode(mode)).await {
-        Ok(()) => json_response(200, "OK", &format!(r#"{{"status":"ok","mode":{mode}}}"#)),
+        Ok(()) => {
+            inner.night_mode.store(mode, Ordering::Release);
+            json_response(200, "OK", &format!(r#"{{"status":"ok","mode":{mode}}}"#))
+        }
         Err(error) => command_error_response(error),
     }
 }
@@ -776,6 +786,122 @@ fn command_error_response(error: CommandFailure) -> Vec<u8> {
         CommandFailure::Rejected(message) => error_response(400, &message),
         CommandFailure::Unavailable(message) => error_response(503, &message),
     }
+}
+
+/// Telemetry for the Home Assistant integration, which polls this instead of asking
+/// several endpoints. Field names follow the payload the integration already parses,
+/// so the page that was written against the older firmware keeps working: it reads
+/// `stream.active`, `speaker`, `night_vision`, `ptz.pan`/`ptz.tilt`, `memory` and
+/// `temperature_c` from here.
+pub(crate) async fn status_response(inner: &Arc<ControlInner>) -> Vec<u8> {
+    let ready = inner.media.current().ok().flatten().is_some();
+    let position = body_of(&ptz_position(inner).await);
+    let talkback = body_of(&talkback_status_response(inner));
+    let volume = inner.volume.load(Ordering::Acquire);
+    let mode = inner.night_mode.load(Ordering::Acquire);
+    let mode_name = ["auto", "night", "day"]
+        .get(mode as usize)
+        .unwrap_or(&"auto");
+    let (total_kb, free_kb, available_kb, cached_kb) = memory_kb();
+    let uptime = uptime_seconds();
+    let temperature = temperature_celsius();
+
+    // The stream fields the integration shows, assembled from the encoder's fixed
+    // geometry and the engine's readiness rather than from a stats counter this
+    // firmware does not have.
+    let mut payload = format!(
+        r#"{{"status":"{}","ready":{},"stream":{{"active":{},"resolution":"2304x1296","codec":"H265","uptime_sec":{uptime}}},"endpoints":{{"rtsp":"rtsps://{host}:322/live","api":"https://{host}:8080"}},"ptz":{{"pan":{},"tilt":{}}},"speaker":{{"active":{},"ready":true,"volume":{volume}}},"night_vision":{{"active":{},"mode":"{mode_name}"}},"memory":{{"total_kb":{total_kb},"free_kb":{free_kb},"available_kb":{available_kb},"cached_kb":{cached_kb}}},"api_tls":{{"enabled":true}}"#,
+        if ready { "streaming" } else { "starting" },
+        ready,
+        ready,
+        pan_of(&position),
+        tilt_of(&position),
+        talkback.contains(r#""talking":true"#),
+        mode == 1,
+        host = security::host_label("HOST_NAME", "c220")
+            .map(|label| format!("{label}.local"))
+            .unwrap_or_else(|_| "c220.local".to_string()),
+    );
+    if let Some(temperature) = temperature {
+        payload.push_str(&format!(r#","temperature_c":{temperature}"#));
+    }
+    payload.push('}');
+    json_response(200, "OK", &payload)
+}
+
+/// The JSON body of a response produced by one of the shared handlers.
+fn body_of(response: &[u8]) -> String {
+    let text = String::from_utf8_lossy(response).to_string();
+    match text.find("\r\n\r\n") {
+        Some(index) => text[index + 4..].trim().to_string(),
+        None => text.trim().to_string(),
+    }
+}
+
+/// Pull one integer field out of a small JSON body without a JSON library: the
+/// bodies read here are built by this file and have a fixed shape.
+fn integer_field(body: &str, field: &str) -> i64 {
+    let needle = format!("\"{field}\":");
+    body.find(&needle)
+        .and_then(|start| {
+            let rest = &body[start + needle.len()..];
+            let end = rest.find([',', '}']).unwrap_or(rest.len());
+            rest[..end].trim().parse::<i64>().ok()
+        })
+        .unwrap_or(0)
+}
+
+fn pan_of(body: &str) -> i64 {
+    integer_field(body, "pan")
+}
+
+fn tilt_of(body: &str) -> i64 {
+    integer_field(body, "tilt")
+}
+
+/// Memory in kilobytes, in the units `/proc/meminfo` reports them.
+fn memory_kb() -> (u64, u64, u64, u64) {
+    let mut total = 0;
+    let mut free = 0;
+    let mut available = 0;
+    let mut cached = 0;
+    if let Ok(contents) = std::fs::read_to_string("/proc/meminfo") {
+        for line in contents.lines() {
+            let Some((name, value)) = line.split_once(':') else {
+                continue;
+            };
+            let Ok(kb) = value.trim().trim_end_matches(" kB").trim().parse::<u64>() else {
+                continue;
+            };
+            match name {
+                "MemTotal" => total = kb,
+                "MemFree" => free = kb,
+                "MemAvailable" => available = kb,
+                "Cached" => cached = kb,
+                _ => {}
+            }
+        }
+    }
+    (total, free, available, cached)
+}
+
+fn uptime_seconds() -> u64 {
+    std::fs::read_to_string("/proc/uptime")
+        .ok()
+        .and_then(|text| {
+            text.split_whitespace()
+                .next()
+                .and_then(|value| value.parse::<f64>().ok())
+        })
+        .map(|seconds| seconds as u64)
+        .unwrap_or(0)
+}
+
+/// SoC temperature, when the board exposes one.
+fn temperature_celsius() -> Option<f32> {
+    let text = std::fs::read_to_string("/sys/class/thermal/thermal_zone0/temp").ok()?;
+    let milli = text.trim().parse::<f32>().ok()?;
+    Some((milli / 1000.0 * 10.0).round() / 10.0)
 }
 
 pub(crate) fn health_response(inner: &ControlInner) -> Vec<u8> {

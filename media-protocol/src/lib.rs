@@ -32,9 +32,11 @@ pub const MAX_PAYLOAD_LEN: usize = 4 * 1024 * 1024;
 
 /// Record kinds in the camera-local media ABI.
 ///
-/// The numeric values are RE-derived from the native companion. Unknown values
-/// are retained so the framing layer can stay forward-compatible while a higher
-/// layer decides whether to handle them.
+/// Unknown values are retained so the framing layer can stay
+/// forward-compatible while a higher layer decides whether to handle them.
+/// ABI value 5 was a detection sub-stream that was never finished and is
+/// deliberately no longer recognized, so such a record decodes as
+/// [`RecordKind::Unknown`] and is ignored instead of joining the main stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecordKind {
     Video,
@@ -42,7 +44,6 @@ pub enum RecordKind {
     SpeakerPcm,
     SpeakerClear,
     SpeakerVolume,
-    VideoSub,
     NightMode,
     Unknown(u8),
 }
@@ -53,7 +54,6 @@ impl RecordKind {
     pub const SPEAKER_PCM: Self = Self::SpeakerPcm;
     pub const SPEAKER_CLEAR: Self = Self::SpeakerClear;
     pub const SPEAKER_VOLUME: Self = Self::SpeakerVolume;
-    pub const VIDEO_SUB: Self = Self::VideoSub;
     pub const NIGHT_MODE: Self = Self::NightMode;
 
     /// Return the ABI value written into the record header.
@@ -64,7 +64,6 @@ impl RecordKind {
             Self::SpeakerPcm => 2,
             Self::SpeakerClear => 3,
             Self::SpeakerVolume => 4,
-            Self::VideoSub => 5,
             Self::NightMode => 6,
             Self::Unknown(value) => value,
         }
@@ -78,7 +77,6 @@ impl RecordKind {
             2 => Self::SpeakerPcm,
             3 => Self::SpeakerClear,
             4 => Self::SpeakerVolume,
-            5 => Self::VideoSub,
             6 => Self::NightMode,
             value => Self::Unknown(value),
         }
@@ -86,7 +84,7 @@ impl RecordKind {
 
     /// Whether this record carries an encoded video access unit.
     pub const fn is_video(self) -> bool {
-        matches!(self, Self::Video | Self::VideoSub)
+        matches!(self, Self::Video)
     }
 }
 
@@ -324,7 +322,6 @@ mod tests {
             (RecordKind::SPEAKER_PCM, 2),
             (RecordKind::SPEAKER_CLEAR, 3),
             (RecordKind::SPEAKER_VOLUME, 4),
-            (RecordKind::VIDEO_SUB, 5),
             (RecordKind::NIGHT_MODE, 6),
             (RecordKind::Unknown(200), 200),
         ] {
@@ -332,7 +329,15 @@ mod tests {
             assert_eq!(RecordKind::from_u8(value), kind);
         }
         assert!(RecordKind::VIDEO.is_video());
-        assert!(RecordKind::VIDEO_SUB.is_video());
         assert!(!RecordKind::AUDIO_CAPTURE.is_video());
+    }
+
+    #[test]
+    fn treats_the_retired_sub_stream_kind_as_unknown() {
+        // ABI value 5 belonged to the unfinished sub-stream. Decoding it as an
+        // unknown kind keeps an older engine from injecting a second video
+        // resolution into the single RTSP video track.
+        assert_eq!(RecordKind::from_u8(5), RecordKind::Unknown(5));
+        assert!(!RecordKind::Unknown(5).is_video());
     }
 }

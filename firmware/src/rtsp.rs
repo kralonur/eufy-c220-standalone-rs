@@ -484,7 +484,7 @@ impl RtspServer {
 
     /// Publish a video record directly from the camera-local media ABI.
     pub fn push_video_record(&self, record: &MediaRecord) -> io::Result<()> {
-        if record.kind != RecordKind::VIDEO && record.kind != RecordKind::VIDEO_SUB {
+        if record.kind != RecordKind::VIDEO {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "media record is not a video record",

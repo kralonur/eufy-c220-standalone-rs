@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["firmware"]
+members = ["firmware", "media-protocol"]
 
 # The camera-side daemon is size-constrained and delegates media hot paths to C.
 # Fat LTO removes unused Rust monomorphizations; aborting panics is appropriate

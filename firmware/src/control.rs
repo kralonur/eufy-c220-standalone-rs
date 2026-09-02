@@ -1118,7 +1118,7 @@ fn escape_json(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::media::{MediaRecord, RecordKind};
+    use crate::media::{RecordKind, read_record};
     use std::os::unix::net::UnixStream;
     use tokio::net::TcpStream;
 
@@ -1226,14 +1226,14 @@ mod tests {
 
         let response = post(server.local_addr(), "/talkback/start", &[]).await;
         assert!(response.starts_with("HTTP/1.1 200 OK"));
-        let start_record = MediaRecord::read_from(&mut companion)
+        let start_record = read_record(&mut companion)
             .expect("start command should read")
             .expect("start command should be present");
         assert_eq!(start_record.kind, RecordKind::SPEAKER_CLEAR);
 
         let response = post(server.local_addr(), "/talkback/pcm", &[1, 2]).await;
         assert!(response.starts_with("HTTP/1.1 200 OK"));
-        let pcm_record = MediaRecord::read_from(&mut companion)
+        let pcm_record = read_record(&mut companion)
             .expect("PCM command should read")
             .expect("PCM command should be present");
         assert_eq!(pcm_record.kind, RecordKind::SPEAKER_PCM);

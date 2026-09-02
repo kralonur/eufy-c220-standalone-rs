@@ -6,6 +6,8 @@ edition = "2024"
 [dependencies]
 base64 = { workspace = true }
 bytes = { workspace = true }
+# Shared camera-local media framing, also used by the no_std media engine.
+c220-media-protocol = { path = "../media-protocol" }
 hmac = { workspace = true }
 libc = { workspace = true }
 md-5 = { workspace = true }

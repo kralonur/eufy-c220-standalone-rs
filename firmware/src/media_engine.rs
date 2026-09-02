@@ -6,7 +6,7 @@
 //! `native/c220-media-engine.c`; the companion is part of our camera firmware,
 //! not a vendor/P2P client.
 
-use crate::media::{MediaRecord, RecordKind};
+use crate::media::{MediaRecord, RecordKind, read_record, write_record};
 use std::io;
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
@@ -221,7 +221,7 @@ impl MediaEngine {
 
     /// Read the next record emitted by the companion.
     pub fn read_record(&mut self) -> io::Result<Option<MediaRecord>> {
-        MediaRecord::read_from(&mut self.socket)
+        read_record(&mut self.socket)
     }
 
     /// Return the command writer used by control and talkback services.
@@ -275,7 +275,7 @@ impl MediaEngineHandle {
             .socket
             .lock()
             .map_err(|_| io::Error::other("media command socket lock poisoned"))?;
-        record.write_to(&mut *socket)
+        write_record(record, &mut *socket)
     }
 
     /// Request the camera speaker to discard queued playback.
@@ -530,21 +530,21 @@ mod tests {
         sink.send_pcm(&[0; 320]).expect("second PCM should write");
 
         assert_eq!(
-            MediaRecord::read_from(&mut companion)
+            read_record(&mut companion)
                 .expect("clear command should read")
                 .expect("clear command should be present")
                 .kind,
             RecordKind::SPEAKER_CLEAR
         );
         assert_eq!(
-            MediaRecord::read_from(&mut companion)
+            read_record(&mut companion)
                 .expect("first PCM command should read")
                 .expect("first PCM command should be present")
                 .timestamp_us,
             0
         );
         assert_eq!(
-            MediaRecord::read_from(&mut companion)
+            read_record(&mut companion)
                 .expect("second PCM command should read")
                 .expect("second PCM command should be present")
                 .timestamp_us,
@@ -575,7 +575,7 @@ mod tests {
         handle.clear_speaker().expect("clear command should write");
 
         assert_eq!(
-            MediaRecord::read_from(&mut companion)
+            read_record(&mut companion)
                 .expect("PCM command should read")
                 .expect("PCM command should be present"),
             MediaRecord {
@@ -587,7 +587,7 @@ mod tests {
             }
         );
         assert_eq!(
-            MediaRecord::read_from(&mut companion)
+            read_record(&mut companion)
                 .expect("AAC command should read")
                 .expect("AAC command should be present"),
             MediaRecord {
@@ -599,21 +599,21 @@ mod tests {
             }
         );
         assert_eq!(
-            MediaRecord::read_from(&mut companion)
+            read_record(&mut companion)
                 .expect("volume command should read")
                 .expect("volume command should be present")
                 .payload,
             42_u32.to_le_bytes().to_vec()
         );
         assert_eq!(
-            MediaRecord::read_from(&mut companion)
+            read_record(&mut companion)
                 .expect("night-mode command should read")
                 .expect("night-mode command should be present")
                 .payload,
             vec![1]
         );
         assert_eq!(
-            MediaRecord::read_from(&mut companion)
+            read_record(&mut companion)
                 .expect("clear command should read")
                 .expect("clear command should be present")
                 .kind,

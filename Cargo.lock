@@ -146,6 +146,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
+ "c220-media-protocol",
  "hmac",
  "libc",
  "md-5",
@@ -163,6 +164,10 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
 ]
+
+[[package]]
+name = "c220-media-protocol"
+version = "0.1.0"
 
 [[package]]
 name = "cc"

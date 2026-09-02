@@ -574,10 +574,6 @@ impl RtspServer {
         )
     }
 
-    pub fn video_codec(&self) -> Option<VideoCodec> {
-        self.inner.codec.read().ok().map(|state| state.codec)
-    }
-
     pub fn stats(&self) -> RtspStats {
         RtspStats {
             video_access_units_published: self

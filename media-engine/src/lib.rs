@@ -27,4 +27,5 @@ extern crate alloc;
 
 pub mod cli;
 pub mod keyframe;
+pub mod platform;
 pub mod pts;

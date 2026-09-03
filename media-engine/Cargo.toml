@@ -2,3 +2,12 @@
 name = "c220-media-engine"
 version = "0.1.0"
 edition = "2024"
+
+[dependencies]
+# Shared camera-local media framing; the engine only needs the header and the
+# record kinds, because a record's payload is interpreted in place.
+c220-media-protocol = { path = "../media-protocol" }
+# The workspace default features are fine here: libc's `std` feature only selects
+# link attributes and the crate never references `std`, so it cannot put a
+# thread-local segment in this binary (see the crate documentation).
+libc = { workspace = true }

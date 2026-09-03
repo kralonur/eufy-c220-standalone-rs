@@ -168,6 +168,10 @@ dependencies = [
 [[package]]
 name = "c220-media-engine"
 version = "0.1.0"
+dependencies = [
+ "c220-media-protocol",
+ "libc",
+]
 
 [[package]]
 name = "c220-media-protocol"

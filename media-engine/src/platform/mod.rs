@@ -17,67 +17,112 @@ pub mod alloc;
 pub mod net;
 pub mod signal;
 
-/// A failed libc call, carrying the `errno` value that caused it.
+/// A failed libc or vendor call.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Error {
-    errno: c_int,
+    cause: Cause,
+}
+
+/// What produced the failure.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Cause {
+    /// A libc call set `errno`.
+    Errno(c_int),
+    /// A vendor library returned a non-zero status of its own.
+    Vendor(i32),
 }
 
 impl Error {
     /// Capture the current `errno`.
     pub(crate) fn last() -> Self {
         Self {
-            errno: unsafe { *libc::__errno_location() },
+            cause: Cause::Errno(unsafe { *libc::__errno_location() }),
         }
     }
 
     /// Build an error for a known `errno` value.
     pub const fn from_errno(errno: c_int) -> Self {
-        Self { errno }
+        Self {
+            cause: Cause::Errno(errno),
+        }
     }
 
-    /// The `errno` value.
-    pub const fn errno(self) -> c_int {
-        self.errno
+    /// Build an error from a vendor library's status code.
+    ///
+    /// Vendor calls report failure as a negative or otherwise non-zero status
+    /// whose meaning is library-specific, so it is kept as-is instead of being
+    /// mapped onto an `errno`.
+    pub const fn from_vendor_status(status: i32) -> Self {
+        Self {
+            cause: Cause::Vendor(status),
+        }
     }
 
-    /// The libc message for this `errno`, for diagnostics.
+    /// The `errno` value, when the failure came from libc.
+    pub const fn errno(self) -> Option<c_int> {
+        match self.cause {
+            Cause::Errno(errno) => Some(errno),
+            Cause::Vendor(_) => None,
+        }
+    }
+
+    /// The vendor status code, when the failure came from a vendor library.
+    pub const fn vendor_status(self) -> Option<i32> {
+        match self.cause {
+            Cause::Errno(_) => None,
+            Cause::Vendor(status) => Some(status),
+        }
+    }
+
+    /// The message for this failure, for diagnostics.
     pub fn message(self) -> &'static str {
-        // `strerror` returns a pointer to a static buffer; it is not reentrant,
-        // which is fine because this is only read to format a log line.
-        unsafe {
-            let text = libc::strerror(self.errno);
-            if text.is_null() {
-                return "unknown error";
-            }
-            core::ffi::CStr::from_ptr(text)
-                .to_str()
-                .unwrap_or("unknown error")
+        match self.cause {
+            // `strerror` returns a pointer to a static buffer; it is not
+            // reentrant, which is fine because this is only read to format a log
+            // line.
+            Cause::Errno(errno) => unsafe {
+                let text = libc::strerror(errno);
+                if text.is_null() {
+                    return "unknown error";
+                }
+                core::ffi::CStr::from_ptr(text)
+                    .to_str()
+                    .unwrap_or("unknown error")
+            },
+            Cause::Vendor(_) => "vendor library error",
         }
     }
 
     /// Whether the call was interrupted by a signal.
     pub(crate) const fn is_interrupted(self) -> bool {
-        self.errno == libc::EINTR
+        matches!(self.cause, Cause::Errno(libc::EINTR))
     }
 
     /// Whether a non-blocking or timed-out call would have blocked.
     ///
     /// `EWOULDBLOCK` is the same value as `EAGAIN` on Linux.
     pub(crate) const fn would_block(self) -> bool {
-        self.errno == libc::EAGAIN
+        matches!(self.cause, Cause::Errno(libc::EAGAIN))
     }
 }
 
 impl fmt::Debug for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "errno {}: {}", self.errno, self.message())
+        match self.cause {
+            Cause::Errno(errno) => write!(formatter, "errno {errno}: {}", self.message()),
+            Cause::Vendor(status) => {
+                write!(formatter, "vendor status {status}: {}", self.message())
+            }
+        }
     }
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{} (errno {})", self.message(), self.errno)
+        match self.cause {
+            Cause::Errno(errno) => write!(formatter, "{} (errno {errno})", self.message()),
+            Cause::Vendor(status) => write!(formatter, "{} (status {status})", self.message()),
+        }
     }
 }
 

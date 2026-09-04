@@ -25,7 +25,8 @@
 //! [`engine`] owns the private socket and the daemon session loop, [`commands`]
 //! holds the daemon command rules, [`client`] is the record I/O around them, and
 //! [`backend`] is the device side: the mock backend here, the vendor bindings
-//! next. [`platform`] is the small POSIX layer the rest is built on, and
+//! ([`vendor`], which exists only for the camera target) next. [`platform`] is
+//! the small POSIX layer the rest is built on, and
 //! [`cli`], [`keyframe`] and [`pts`] are the ported pieces of the reference
 //! engine that need no hardware.
 
@@ -41,6 +42,8 @@ pub mod engine;
 pub mod keyframe;
 pub mod platform;
 pub mod pts;
+#[cfg(target_arch = "arm")]
+pub mod vendor;
 
 use crate::backend::Backend;
 use crate::cli::EngineConfig;

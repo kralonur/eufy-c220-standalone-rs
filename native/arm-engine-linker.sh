@@ -21,6 +21,8 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 CAMERA_ROOT=${CAMERA_ROOT:-"$REPO_ROOT/native/camera-rootfs"}
 ROOTFS_LIB="$CAMERA_ROOT/rootfs/lib"
+OEM_LIB="$CAMERA_ROOT/rootfs/oem/usr/lib"
+HOME_LIB="$CAMERA_ROOT/home/lib"
 SHIM=${C220_UCLIBC_SHIM:-}
 
 for argument in "$@"; do
@@ -58,16 +60,22 @@ fi
 # this link. The camera's own uClibc is therefore named here, which is also what
 # the reference engine does.
 #
+# The vendor libraries are named for the same reason the reference engine links
+# them: the engine calls into them, and they are not on a library path a
+# cross-link can find by accident. `--as-needed`, which rustc passes, is what
+# keeps a library out of NEEDED (and its constructors from running) until the
+# engine actually references one of its symbols.
+#
 # -e _start selects the engine's own entry stub, the dynamic loader and library
 # search path are the ones the reference engine is deployed with, and -no-pie
 # overrides the -pie rustc asks for: the stub loads the entry address absolutely,
 # like the reference engine, which is also a non-PIE executable.
 exec clang --target=arm-linux-musleabihf -fuse-ld="$LLD" \
     -nostartfiles -nodefaultlibs \
-    -L"$SHIM" -L"$ROOTFS_LIB" \
+    -L"$SHIM" -L"$ROOTFS_LIB" -L"$OEM_LIB" -L"$HOME_LIB" \
     -Wl,-e,_start \
     -Wl,--dynamic-linker=/lib/ld-uClibc.so.0 \
     -Wl,-rpath,/home/lib:/oem/usr/lib:/lib \
     "$@" \
     -no-pie \
-    -l:libc.so.0
+    -l:libc.so.0 -lrockit -lrkaiq -lsmartIr -l:libfdk-aac.so.1

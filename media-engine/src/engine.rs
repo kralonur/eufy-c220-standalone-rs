@@ -69,7 +69,7 @@ impl Engine {
                     if self.shutdown.requested() {
                         break;
                     }
-                    media_log!("media_accept_error={}", error.errno());
+                    media_log!("media_accept_error={}", error);
                     platform::sleep_us(ACCEPT_RETRY_US);
                     continue;
                 }
@@ -90,7 +90,7 @@ impl Engine {
         let stop = || self.shutdown.requested();
         let (night, manual) = backend.night_mode();
         if let Err(error) = writer.send_night_mode(night, manual) {
-            media_log!("media_greeting_error={}", error.errno());
+            media_log!("media_greeting_error={}", error);
         }
 
         loop {
@@ -102,7 +102,7 @@ impl Engine {
                     break;
                 }
                 Err(error) => {
-                    media_log!("media_client_read_error={}", error.errno());
+                    media_log!("media_client_read_error={}", error);
                     break;
                 }
             };
@@ -125,7 +125,7 @@ impl Engine {
                     Ok(Outcome::Filled) => {}
                     Ok(Outcome::Ended) => break,
                     Err(error) => {
-                        media_log!("media_client_read_error={}", error.errno());
+                        media_log!("media_client_read_error={}", error);
                         break;
                     }
                 }
@@ -139,7 +139,7 @@ impl Engine {
             ) {
                 Ok(Some(command)) => {
                     if let Err(error) = backend.command(command, &writer) {
-                        media_log!("media_command_error={}", error.errno());
+                        media_log!("media_command_error={}", error);
                     }
                 }
                 Ok(None) => {}

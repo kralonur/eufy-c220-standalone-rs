@@ -266,7 +266,7 @@ mod tests {
             UnixListener::bind(&path)
                 .expect_err("overlong path")
                 .errno(),
-            libc::ENAMETOOLONG
+            Some(libc::ENAMETOOLONG)
         );
     }
 

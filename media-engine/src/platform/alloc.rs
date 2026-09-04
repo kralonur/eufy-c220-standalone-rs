@@ -92,11 +92,7 @@ impl MmapAllocator {
             // allocation failure is fatal: say why before the panic handler
             // prints a message with no errno in it.
             let error = super::Error::last();
-            crate::platform::media_log!(
-                "media_allocation_error={} size={}",
-                error.errno(),
-                layout.size()
-            );
+            crate::platform::media_log!("media_allocation_error={} size={}", error, layout.size());
             return ptr::null_mut();
         }
 

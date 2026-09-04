@@ -101,7 +101,8 @@ media output.
 | PTS counter, HEVC keyframe detection | Done |
 | Platform layer (sockets, signals, allocator, logging) | Done |
 | Engine process: entry stub, session loop, command handling, mock backend | Done |
-| Vendor bindings (V4L2, Rockchip MPI, AIQ, FDK AAC) | Not started |
+| Vendor bindings (Rockchip MPI, AIQ, SmartIR, FDK AAC) | Done, ABI-asserted |
+| V4L2 capture bindings | Not started |
 | Video, microphone, speaker, night-mode pipelines | Not started |
 
 The daemon-facing behavior already matches the reference engine: the private

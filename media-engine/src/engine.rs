@@ -56,11 +56,18 @@ impl Engine {
 
     /// Serve the daemon until a stop is requested.
     ///
+    /// The backend is started first, so a device that fails to open is reported
+    /// before any daemon connects - and the engine still serves, because the
+    /// parts that did come up are worth talking to.
+    ///
     /// One session at a time: while a daemon is connected this blocks in the
     /// session loop, and a new connection is only accepted after it ends. A stop
     /// request shuts the listening socket down, which is what makes the blocked
     /// `accept` return.
     pub fn serve(&mut self, backend: &mut dyn Backend) {
+        if let Err(error) = backend.start() {
+            media_log!("media_backend_start_error={error}");
+        }
         while !self.shutdown.requested() {
             let client = match self.listener.accept() {
                 Ok(client) => client,

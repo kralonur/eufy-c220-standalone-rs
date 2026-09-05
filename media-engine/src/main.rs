@@ -19,6 +19,8 @@ mod camera {
     //! The camera runtime: entry stub, allocator and panic handler.
 
     use c220_media_engine::backend::MockBackend;
+    #[cfg(feature = "hardware")]
+    use c220_media_engine::backend::SpeakerBackend;
     use c220_media_engine::cli::{self, ConfigError};
     use c220_media_engine::{platform, run};
     use core::ffi::{CStr, c_char};
@@ -78,8 +80,27 @@ mod camera {
             }
         };
 
+        // A build without the `hardware` feature is the one an emulator can run:
+        // it links no vendor libraries and serves the protocol with the
+        // hardware-free backend. The deployed build has them, and
+        // `--mock-backend` is the diagnostic switch that keeps that build off the
+        // devices while still letting the daemon talk to it.
+        #[cfg(feature = "hardware")]
+        if !config.mock_backend {
+            let mut backend = SpeakerBackend::new(&config.audio_card);
+            let result = run(config, &mut backend);
+            return match result {
+                Ok(()) => 0,
+                Err(error) => {
+                    platform::log(format_args!("media_engine_error={error}"));
+                    1
+                }
+            };
+        }
+
         let mut backend = MockBackend::new();
-        match run(config, &mut backend) {
+        let result = run(config, &mut backend);
+        match result {
             Ok(()) => 0,
             Err(error) => {
                 platform::log(format_args!("media_engine_error={error}"));
@@ -129,6 +150,17 @@ mod camera {
         }
         Ok(arguments)
     }
+
+    /// The personality routine that precompiled `core` and `alloc` reference.
+    ///
+    /// Those crates ship compiled with unwinding, so code paths this binary uses,
+    /// `alloc::fmt::format` among them, carry landing pads that name this symbol.
+    /// Nothing here can reach one: the panic handler below aborts the process
+    /// instead of unwinding, and `std` is not in the link to provide the
+    /// definition it would otherwise contribute. Keeping it defined is what lets
+    /// the binary link with an aborting panic strategy.
+    #[unsafe(no_mangle)]
+    extern "C" fn rust_eh_personality() {}
 
     /// Log the panic and stop.
     ///

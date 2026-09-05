@@ -60,6 +60,12 @@ fi
 # this link. The camera's own uClibc is therefore named here, which is also what
 # the reference engine does.
 #
+# `libgcc_s` is named for the same reason a C toolchain would pass `-lgcc_s`: the
+# precompiled `core` and `alloc` this binary uses carry landing pads that
+# reference the unwinder's entry points, even though nothing in this process can
+# unwind (the panic handler aborts). The camera's own copy is used, which is the
+# one the vendor libraries already load.
+#
 # The vendor libraries are named for the same reason the reference engine links
 # them: the engine calls into them, and they are not on a library path a
 # cross-link can find by accident. `--as-needed`, which rustc passes, is what
@@ -78,4 +84,4 @@ exec clang --target=arm-linux-musleabihf -fuse-ld="$LLD" \
     -Wl,-rpath,/home/lib:/oem/usr/lib:/lib \
     "$@" \
     -no-pie \
-    -l:libc.so.0 -lrockit -lrkaiq -lsmartIr -l:libfdk-aac.so.1
+    -l:libc.so.0 -l:libgcc_s.so.1 -lrockit -lrkaiq -lsmartIr -l:libfdk-aac.so.1

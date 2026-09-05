@@ -37,6 +37,13 @@ pub struct EngineConfig {
     pub iq_directory: String,
     /// Whether the microphone capture path is opened.
     pub audio_capture_enabled: bool,
+    /// Run without touching the hardware.
+    ///
+    /// The camera's device paths are the vendors' libraries, whose constructors
+    /// fault where the hardware is absent, so this is what makes the protocol
+    /// testable under an emulator - and what the reference engine's diagnostic
+    /// switches are for too.
+    pub mock_backend: bool,
     /// Main-stream frame rate.
     pub video_fps: i32,
     /// Main-stream constant-bitrate budget in kilobits per second.
@@ -51,6 +58,7 @@ impl Default for EngineConfig {
             audio_card: DEFAULT_AUDIO_CARD.to_string(),
             iq_directory: DEFAULT_IQ_DIRECTORY.to_string(),
             audio_capture_enabled: true,
+            mock_backend: false,
             video_fps: DEFAULT_VIDEO_FPS,
             video_bitrate_kbps: DEFAULT_VIDEO_BITRATE_KBPS,
         }
@@ -104,6 +112,7 @@ pub fn parse_arguments<'a>(
             "--card" => config.audio_card = value(&mut arguments, "--card")?.to_string(),
             "--iq-dir" => config.iq_directory = value(&mut arguments, "--iq-dir")?.to_string(),
             "--no-audio" => config.audio_capture_enabled = false,
+            "--mock-backend" => config.mock_backend = true,
             "--fps" => {
                 config.video_fps = positive_number(&mut arguments, "--fps")?;
             }
@@ -158,6 +167,7 @@ mod tests {
         assert_eq!(config.audio_card, "hw:0,0");
         assert_eq!(config.iq_directory, "/home");
         assert!(config.audio_capture_enabled);
+        assert!(!config.mock_backend);
         assert_eq!(config.video_fps, 15);
         assert_eq!(config.video_bitrate_kbps, 2048);
     }

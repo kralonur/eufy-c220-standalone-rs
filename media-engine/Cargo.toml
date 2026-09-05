@@ -3,6 +3,13 @@ name = "c220-media-engine"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# Link the device paths. Off by default because the vendor libraries' own
+# constructors fault where the camera's hardware is absent, which makes a
+# hardware build impossible to start under an emulator; a build without this
+# feature still serves the whole daemon protocol.
+hardware = []
+
 [dependencies]
 # Shared camera-local media framing; the engine only needs the header and the
 # record kinds, because a record's payload is interpreted in place.

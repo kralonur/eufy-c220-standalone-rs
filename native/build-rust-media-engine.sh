@@ -17,6 +17,10 @@ CAMERA_ROOT=${CAMERA_ROOT:-"$REPO_ROOT/native/camera-rootfs"}
 TARGET=armv7-unknown-linux-musleabihf
 OUT=${1:-"${OUT:-$REPO_ROOT/dist/c220-media-engine-rust}"}
 SHIM_DIR=${SHIM_DIR:-"$REPO_ROOT/target/native/c220-media-engine/shim"}
+# The device paths are linked by default. `ENGINE_FEATURES=` builds the
+# hardware-free binary, which is the one an emulator can run: it links no vendor
+# libraries, so nothing faults before its first statement.
+FEATURES=${ENGINE_FEATURES-hardware}
 ROOTFS_LIB="$CAMERA_ROOT/rootfs/lib"
 
 for required in "$ROOTFS_LIB/libc.so.0" "$ROOTFS_LIB/libgcc_s.so.1"; do
@@ -39,7 +43,7 @@ CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_LINKER="$SCRIPT_DIR/arm-engine-linke
 C220_UCLIBC_SHIM="$SHIM_DIR" \
 CAMERA_ROOT="$CAMERA_ROOT" \
     cargo build --release --locked --target "$TARGET" -p c220-media-engine \
-        --bin c220-media-engine
+        --bin c220-media-engine ${FEATURES:+--features "$FEATURES"}
 
 cp "$REPO_ROOT/target/$TARGET/release/c220-media-engine" "$OUT"
 file "$OUT"

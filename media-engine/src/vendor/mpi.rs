@@ -371,6 +371,7 @@ unsafe extern "C" {
 
     pub fn RK_MPI_AO_SetPubAttr(device: c_int, attributes: *const AudioAttributes) -> i32;
     pub fn RK_MPI_AO_Enable(device: c_int) -> i32;
+    pub fn RK_MPI_AO_Disable(device: c_int) -> i32;
     pub fn RK_MPI_AO_SetChnParams(
         device: c_int,
         channel: c_int,
@@ -485,27 +486,31 @@ impl core::fmt::Debug for MmzBuffer {
 
 /// A vendor block wrapping a buffer the engine owns.
 ///
-/// The speaker path builds one of these around each block of decoded PCM: the
-/// devices read from the block, so the borrow keeps the samples alive until the
-/// block is released.
+/// The speaker path builds one of these around each block of samples the daemon
+/// sent: the device reads from the block, so the borrow keeps the samples alive
+/// until the block is released.
 pub struct ExternalBlock<'a> {
     block: Block,
-    buffer: &'a mut [u8],
+    buffer: &'a [u8],
 }
 
 impl<'a> ExternalBlock<'a> {
     /// Wrap `buffer` in a vendor block.
-    pub fn new(buffer: &'a mut [u8]) -> Result<Self, Error> {
+    pub fn new(buffer: &'a [u8]) -> Result<Self, Error> {
         let mut block: Block = ptr::null_mut();
+        // The vendor interface takes a writable pointer even for playback, where
+        // the device only reads; the shared borrow is what the engine actually
+        // needs and what the type promises.
+        let address = buffer.as_ptr() as *mut u8;
         let config = ExternalBlockConfig {
-            virtual_address: buffer.as_mut_ptr(),
+            virtual_address: address,
             reserved0: 0,
             physical_address: 0,
             descriptor: 0,
             reserved1: 0,
             size: buffer.len() as u64,
             free_callback: None,
-            opaque: buffer.as_mut_ptr() as *mut c_void,
+            opaque: address as *mut c_void,
         };
         check(unsafe { RK_MPI_SYS_CreateMB(&mut block, &config) })?;
         if block.is_null() {
@@ -536,6 +541,127 @@ impl core::fmt::Debug for ExternalBlock<'_> {
         formatter
             .debug_struct("ExternalBlock")
             .field("length", &self.buffer.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// An owned audio output device with its channel and resampler.
+///
+/// The reference engine sets these up one call at a time in `init_speaker` and
+/// takes them down in `close_speaker`; keeping them in a value means a failure
+/// halfway through a device that is only partly configured cannot leak it.
+pub struct AudioOutput {
+    device: c_int,
+    channel: c_int,
+    enabled: bool,
+    channel_enabled: bool,
+    resampling: bool,
+}
+
+impl AudioOutput {
+    /// Configure, enable and start an output device.
+    ///
+    /// `input_rate` is the rate the engine feeds, which the resampler converts
+    /// to the card's own rate.
+    pub fn open(
+        device: c_int,
+        channel: c_int,
+        attributes: &AudioAttributes,
+        params: &AudioOutputChannelParams,
+        input_rate: i32,
+        volume: i32,
+        track_mode: i32,
+    ) -> Result<Self, Error> {
+        let mut output = Self {
+            device,
+            channel,
+            enabled: false,
+            channel_enabled: false,
+            resampling: false,
+        };
+        check(unsafe { RK_MPI_AO_SetPubAttr(device, attributes) })?;
+        check(unsafe { RK_MPI_AO_Enable(device) })?;
+        output.enabled = true;
+        check(unsafe { RK_MPI_AO_SetChnParams(device, channel, params) })?;
+        check(unsafe { RK_MPI_AO_EnableChn(device, channel) })?;
+        output.channel_enabled = true;
+        check(unsafe { RK_MPI_AO_EnableReSmp(device, channel, input_rate) })?;
+        output.resampling = true;
+        output.set_volume(volume)?;
+        output.set_track_mode(track_mode)?;
+        Ok(output)
+    }
+
+    /// Set the output volume.
+    pub fn set_volume(&mut self, volume: i32) -> Result<(), Error> {
+        check(unsafe { RK_MPI_AO_SetVolume(self.device, volume) })
+    }
+
+    /// Route the output to a track.
+    pub fn set_track_mode(&mut self, mode: i32) -> Result<(), Error> {
+        check(unsafe { RK_MPI_AO_SetTrackMode(self.device, mode) })
+    }
+
+    /// Play one block of PCM held in a vendor block.
+    ///
+    /// `length` is the length the device expects for the channel count: the
+    /// reference engine passes the byte count for mono output and the byte count
+    /// divided by the channel count otherwise.
+    pub fn play(
+        &mut self,
+        block: Block,
+        length: u32,
+        sound_mode: i32,
+        timestamp: u64,
+        sequence: u32,
+        timeout_ms: i32,
+    ) -> Result<(), Error> {
+        let frame = AudioFrame {
+            block,
+            bit_width: AUDIO_BIT_WIDTH_16,
+            sound_mode,
+            timestamp,
+            sequence,
+            length,
+            bypass_block: 0,
+        };
+        check(unsafe { RK_MPI_AO_SendFrame(self.device, self.channel, &frame, timeout_ms) })
+    }
+
+    /// Discard whatever is queued for playback.
+    pub fn clear(&mut self) -> Result<(), Error> {
+        check(unsafe { RK_MPI_AO_ClearChnBuf(self.device, self.channel) })
+    }
+}
+
+impl Drop for AudioOutput {
+    fn drop(&mut self) {
+        // The reference engine clears the queue and disables the resampler and the
+        // channel. Disabling the device as well is the counterpart of `Enable`,
+        // which the reference leaves on - it lets the process exit with the
+        // device still owned, so an engine that restarts playback in-process
+        // would find it held.
+        if self.channel_enabled {
+            unsafe { RK_MPI_AO_ClearChnBuf(self.device, self.channel) };
+        }
+        if self.resampling {
+            unsafe { RK_MPI_AO_DisableReSmp(self.device, self.channel) };
+        }
+        if self.channel_enabled {
+            unsafe { RK_MPI_AO_DisableChn(self.device, self.channel) };
+        }
+        if self.enabled {
+            unsafe { RK_MPI_AO_Disable(self.device) };
+        }
+    }
+}
+
+impl core::fmt::Debug for AudioOutput {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("AudioOutput")
+            .field("device", &self.device)
+            .field("channel", &self.channel)
             .finish_non_exhaustive()
     }
 }

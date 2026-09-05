@@ -39,6 +39,7 @@ pub mod cli;
 pub mod client;
 pub mod commands;
 pub mod engine;
+pub mod gpio;
 pub mod keyframe;
 pub mod platform;
 pub mod pts;

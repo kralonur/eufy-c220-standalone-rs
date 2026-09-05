@@ -1,3 +1,6 @@
 /target
 /dist
 /native/camera-rootfs/
+# Emulator core dumps: the vendor constructors fault where the hardware is
+# absent, and qemu writes them into the working directory.
+*.core

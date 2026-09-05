@@ -364,6 +364,46 @@ typedef void rk_smart_ir_ctx_t;
 extern rk_smart_ir_ctx_t *rk_smart_ir_init(const rk_aiq_sys_ctx_t *aiq_ctx);
 extern void rk_smart_ir_deInit(rk_smart_ir_ctx_t *ctx);
 extern int rk_smart_ir_runOnce(rk_smart_ir_ctx_t *ctx, void *stats, int *is_night);
+/* The threshold set the library applies to the statistics it is handed: six
+ * floats and a whole-sample counter, in this order and with no padding, because
+ * libsmartIr copies the seven words straight into its own context. */
+typedef struct {
+    float day_to_night_luma;
+    float night_to_day_luma;
+    float rggain_base;
+    float bggain_base;
+    float awbgain_radius;
+    float awbgain_distance;
+    int switch_samples;
+} rk_smart_ir_cfg_t;
+_Static_assert(sizeof(rk_smart_ir_cfg_t) == 7 * sizeof(float),
+               "libsmartIr copies exactly seven words of configuration");
+extern int rk_smart_ir_config(rk_smart_ir_ctx_t *ctx, const rk_smart_ir_cfg_t *cfg);
+
+/* SmartIR tuning for this sensor. The library's built-in defaults are not the
+ * values the camera was calibrated with, and one of them is actively harmful:
+ * with a non-zero AWB radius the set of blocks it averages can be empty in a
+ * monochrome infrared frame, and it then measures the origin against the
+ * baseline gains and reports daylight while the IR LED is on. That flips the LED
+ * off, the frame goes dark, and the LED hunts on and off all night. These are the
+ * values the factory application applies in auto mode (read out of its
+ * `anker_t8w11` binary, the branch that calls rk_smart_ir_config for auto), each
+ * stored there as an integer scaled by 10000, which is the scaling the library
+ * expects. */
+#define SMART_IR_DAY_TO_NIGHT_LUMA 0.0328f /* 328/10000: darker than this is night */
+#define SMART_IR_NIGHT_TO_DAY_LUMA 0.0623f /* 623/10000: brighter than this is day */
+#define SMART_IR_RGGAIN_BASE       1.0358f /* 10358/10000: AWB red gain of an IR frame */
+#define SMART_IR_BGGAIN_BASE       1.0082f /* 10082/10000: AWB blue gain of an IR frame */
+#define SMART_IR_AWBGAIN_RADIUS    0.0f    /* 0/10000: weigh every block, never an empty set */
+#define SMART_IR_AWBGAIN_DISTANCE  0.2f    /* 2000/10000: gains this near the baseline look like IR */
+#define SMART_IR_SWITCH_SAMPLES    1       /* 10000/10000: the library confirms over two samples */
+
+/* A verdict is one statistics block wide, so the engine needs its own guard
+ * against a passing headlight or a reflective surface: a new verdict has to hold
+ * for several samples, and the sensor is left alone while the ISP re-converges
+ * after a switch. Both windows are counted at the 1 Hz poll below. */
+#define NIGHT_CONFIRM_SAMPLES 5
+#define NIGHT_SETTLE_SAMPLES  10
 
 #define IRCUT_GPIO_A 130
 #define IRCUT_GPIO_B 134
@@ -485,7 +525,14 @@ static void apply_night_mode(int is_night) {
 
     /* 3. Switch AIQ scene */
     if (aiq_ctx) {
-        rk_aiq_uapi2_sysctl_switch_scene(aiq_ctx, "normal", is_night ? "night" : "day");
+        int result = rk_aiq_uapi2_sysctl_switch_scene(aiq_ctx, "normal",
+                                                      is_night ? "night" : "day");
+        if (result != 0) {
+            /* The IQ file has to carry both sub-scenes. A failure here leaves the
+             * day exposure profile in place all night, which looks like a bad
+             * night image rather than a rejected scene name. */
+            fprintf(stderr, "media_night_scene_error=%d\n", result);
+        }
     }
 
     /* 4. Notify daemon client */
@@ -502,6 +549,7 @@ static void apply_night_mode(int is_night) {
 static void *night_monitor_thread(void *arg) {
     (void)arg;
     int confirm_count = 0;
+    int settle_samples = 0;
     while (!stopping) {
         sleep(1);
         if (stopping || !aiq_started || !aiq_ctx || !smart_ir_ctx) continue;
@@ -512,9 +560,20 @@ static void *night_monitor_thread(void *arg) {
         pthread_mutex_unlock(&night_lock);
 
         if (target >= 0) {
+            /* A commanded mode owns the hardware and the library is not consulted,
+             * so its own verdict cannot fight the command. */
             if (current != target) {
                 apply_night_mode(target);
             }
+            confirm_count = 0;
+            settle_samples = NIGHT_SETTLE_SAMPLES;
+            continue;
+        }
+
+        if (settle_samples > 0) {
+            /* The statistics still describe the previous lighting: the IR-cut has
+             * just moved and the AE is still converging on the new scene. */
+            settle_samples--;
             confirm_count = 0;
             continue;
         }
@@ -527,10 +586,10 @@ static void *night_monitor_thread(void *arg) {
 
             if (detected_night != current) {
                 confirm_count++;
-                if (confirm_count >= 2) {
+                if (confirm_count >= NIGHT_CONFIRM_SAMPLES) {
                     apply_night_mode(detected_night);
                     confirm_count = 0;
-                    sleep(3);
+                    settle_samples = NIGHT_SETTLE_SAMPLES;
                 }
             } else {
                 confirm_count = 0;
@@ -719,6 +778,18 @@ static int start_aiq(void) {
     aiq_started = 1;
     smart_ir_ctx = rk_smart_ir_init(aiq_ctx);
     if (smart_ir_ctx) {
+        rk_smart_ir_cfg_t smart_ir_cfg = {
+            .day_to_night_luma = SMART_IR_DAY_TO_NIGHT_LUMA,
+            .night_to_day_luma = SMART_IR_NIGHT_TO_DAY_LUMA,
+            .rggain_base = SMART_IR_RGGAIN_BASE,
+            .bggain_base = SMART_IR_BGGAIN_BASE,
+            .awbgain_radius = SMART_IR_AWBGAIN_RADIUS,
+            .awbgain_distance = SMART_IR_AWBGAIN_DISTANCE,
+            .switch_samples = SMART_IR_SWITCH_SAMPLES,
+        };
+        if (rk_smart_ir_config(smart_ir_ctx, &smart_ir_cfg) != 0) {
+            fprintf(stderr, "media_smart_ir_config_failed=1\n");
+        }
         fprintf(stderr, "media_smart_ir_ready=1\n");
     } else {
         fprintf(stderr, "media_smart_ir_init_failed=1\n");

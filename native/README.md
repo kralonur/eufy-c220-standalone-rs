@@ -330,6 +330,15 @@ Two things that cost an hour and are worth knowing before touching mtd6:
   Verify through the *character* device: it bypasses the block cache, so a matching
   md5 there is evidence about the flash itself.
 
+- Verify the **whole** image, not just that `dd` reported success. Observed on this
+  board: after a write of a 64 KiB-multiple image through
+  `/dev/block/by-name/home`, blocks 0..18 read back byte-identical and the *last*
+  erase block still held the previous image, `sync` notwithstanding. The squashfs
+  metadata lives at the end of the image, so rebooting there would have mounted
+  nothing. Rewriting through the block device and giving the writeback a moment
+  settled it, and the md5 of the full read then matched. Read back and compare
+  before rebooting; if the tail differs, write again and read again.
+
 ### Talkback: queue implemented, writer must not block the runtime
 
 The queued speaker path is implemented (`SpeakerFrame`, a bounded channel, a writer

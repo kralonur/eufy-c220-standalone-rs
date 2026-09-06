@@ -437,7 +437,7 @@ impl MqttTask {
                 "select",
                 "night_mode",
                 format!(
-                    r#"{{"name":"Night mode","command_topic":"{prefix}/night_mode/set","options":["auto","night","day"],{device}}}"#
+                    r#"{{"name":"Night mode","state_topic":"{prefix}/night_mode/state","command_topic":"{prefix}/night_mode/set","options":["auto","night","day"],{device}}}"#
                 ),
             ),
             (

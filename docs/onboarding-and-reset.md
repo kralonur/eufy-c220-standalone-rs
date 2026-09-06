@@ -697,12 +697,20 @@ reason is written to `/tmp/c220-recovery.log`.
 | `/home/nvram/system/standalone_rtsp_cert.pem` | certificate (yours or generated) | `644` |
 | `/home/nvram/system/standalone_rtsp_key.pem` | private key | `600` |
 | `/home/nvram/system/standalone_rescue.conf` | rescue network override: `SSID=`, `PSK=` | `600` |
+| `/home/nvram/system/standalone_mqtt.conf` | broker host, port, credentials, topic prefix, `STANDALONE_MQTT_DISCOVERY=0\|1` | `600` |
 | `/home/nvram/fs_config/wpa_supplicant.conf` | your Wi-Fi profile | - |
 
 `/home/nvram` is the only writable storage that survives a reboot - `/` and
 `/home` are read-only SquashFS images and `/tmp` is RAM - so that is where all
 configuration lives. Password and key files must be root-owned and mode `600` or
 the firmware refuses to start: that is deliberate, and the refusal is logged.
+
+Home Assistant discovery is **opt-in**: the camera publishes its entities to
+`homeassistant/<component>/<prefix>/<object>/config` only when
+`STANDALONE_MQTT_DISCOVERY=1` is set. Without that line the broker still gets
+telemetry and commands under the camera's own topic prefix, but Home Assistant
+has no entities to drive - so a dashboard control that does nothing is worth
+checking for this first.
 
 ### The control API
 

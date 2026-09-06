@@ -122,6 +122,27 @@ socket with mode `0600`, one session at a time, the night-mode greeting on
 connect, the reference payload limits per record kind, a malformed record ending
 the session without stopping the engine, and the same `media_*` log lines.
 
+## Night mode: what the port has to keep
+
+The night path was tuned on hardware after the branch this crate was started from
+(see `33122d2` on `main`), and the Rust version has to keep all of it:
+
+* The detector runs on its own defaults unless it is configured, and one default
+  is actively harmful: with a non-zero AWB radius the block set it averages comes
+  up empty in a monochrome infrared frame, so it measures the origin against the
+  baseline gains, reads daylight while the IR LED is on, and flips the LED off -
+  which drops the frame back to dark and repeats, 517 times in one 45 minute boot
+  on the camera. `vendor::aiq::FACTORY_TUNING` carries the values the factory
+  application applies in auto mode, read out of its `anker_t8w11` binary.
+* One verdict is one statistics block wide, so a change has to hold for five
+  samples at the 1 Hz poll, and the sensor is left alone for ten samples after a
+  switch so the IR-cut and the AE can converge before the next opinion.
+* A commanded mode owns the hardware: the detector is not consulted, and the
+  command arms the settle window too, so a stale verdict cannot fight it.
+* A rejected night or day sub-scene and a failing detector configuration are both
+  logged. A rejected scene name otherwise looks like a bad night image rather
+  than a rejected name.
+
 ## Sub-stream: dropped
 
 The detection sub-stream is deliberately not implemented. The reference path is

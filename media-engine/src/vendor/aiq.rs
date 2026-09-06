@@ -7,6 +7,7 @@
 use crate::platform::Error;
 use core::ffi::{c_char, c_int, c_void};
 use core::marker::PhantomData;
+use core::mem::size_of;
 use core::ptr;
 
 /// Opaque ISP tuning context.
@@ -68,7 +69,53 @@ unsafe extern "C" {
         statistics: *mut c_void,
         is_night: *mut c_int,
     ) -> i32;
+    fn rk_smart_ir_config(context: *mut SmartIrContext, config: *const SmartIrConfig) -> i32;
 }
+
+/// The threshold set the night detector applies to the statistics it is handed.
+///
+/// Six floats and a whole-sample counter, in this order and with no padding: the
+/// library copies exactly seven words into its own context, which is why the
+/// assertion below counts words rather than fields.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct SmartIrConfig {
+    /// Mean luma below this counts as night.
+    pub day_to_night_luma: f32,
+    /// Mean luma above this counts as day.
+    pub night_to_day_luma: f32,
+    /// AWB red gain of a frame lit by the infrared LED.
+    pub rggain_base: f32,
+    /// AWB blue gain of a frame lit by the infrared LED.
+    pub bggain_base: f32,
+    /// Radius around those gains that counts as "this frame is infrared".
+    pub awbgain_radius: f32,
+    /// Distance from those gains that counts as sunlight.
+    pub awbgain_distance: f32,
+    /// Samples the library confirms one verdict over.
+    pub switch_samples: i32,
+}
+
+const _: () = assert!(size_of::<SmartIrConfig>() == 7 * size_of::<f32>());
+
+/// The tuning this camera's sensor was calibrated with.
+///
+/// The library's own defaults are not these values, and one of them is actively
+/// harmful here: with a non-zero AWB radius the set of blocks it averages can come
+/// up empty in a monochrome infrared frame, so it measures the origin against the
+/// baseline gains, reads daylight while the IR LED is on, and flips the LED off -
+/// which drops the frame back to dark and repeats all night. These are the values
+/// the factory application applies in its auto branch, read out of its
+/// `anker_t8w11` binary, where each is stored as an integer scaled by 10000.
+pub const FACTORY_TUNING: SmartIrConfig = SmartIrConfig {
+    day_to_night_luma: 0.0328, // 328/10000
+    night_to_day_luma: 0.0623, // 623/10000
+    rggain_base: 1.0358,       // 10358/10000
+    bggain_base: 1.0082,       // 10082/10000
+    awbgain_radius: 0.0,       // 0/10000: weigh every block, so the set is never empty
+    awbgain_distance: 0.2,     // 2000/10000
+    switch_samples: 1,         // 10000/10000: the library then confirms over two itself
+};
 
 /// Read the sensor entity name AIQ expects for its first metadata index.
 pub fn sensor_name() -> Result<alloc::ffi::CString, Error> {
@@ -227,6 +274,14 @@ impl<'a> SmartIr<'a> {
             rk_smart_ir_runOnce(self.context, statistics.pointer(), &mut is_night)
         })?;
         Ok(is_night != 0)
+    }
+
+    /// Apply a threshold set.
+    ///
+    /// Without this the library runs on defaults that are not this sensor's; see
+    /// [`FACTORY_TUNING`].
+    pub fn configure(&mut self, config: &SmartIrConfig) -> Result<(), Error> {
+        super::check(unsafe { rk_smart_ir_config(self.context, config) })
     }
 }
 

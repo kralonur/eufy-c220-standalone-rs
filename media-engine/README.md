@@ -122,6 +122,31 @@ socket with mode `0600`, one session at a time, the night-mode greeting on
 connect, the reference payload limits per record kind, a malformed record ending
 the session without stopping the engine, and the same `media_*` log lines.
 
+## The factory application as a reference
+
+The camera's own application, `app/anker_t8w11`, is the authority on how this
+hardware is meant to be driven, and it is available locally: the preserved
+`/home` partition is in the main workspace's `dist/camera-backup-*/mtd6-home.bin`,
+a squashfs that `unsquashfs` opens without root. Its night-mode branch is where
+`FACTORY_TUNING` came from.
+
+Its vendor API surface is a useful checklist. It imports 120 `RK_MPI_`/`rk_aiq_`/
+`rk_smart_ir_`/`aacDecoder_` entry points; the engine binds 49 of them, which is
+what the reference C engine needs. Most of the rest is functionality this project
+does not want (motion detection, OSD regions, voice enhancement, AAC playback,
+JPEG stills), but three are worth remembering when the video path is written:
+
+* `RK_MPI_VENC_RequestIDR` forces a keyframe, which is how an encoder avoids
+  making a newly connected viewer wait for the next group of pictures.
+* `RK_MPI_VENC_SetChnAttr` and `ResetChn` reconfigure a running channel.
+* `RK_MPI_VENC_SetChnRefBufShareAttr` shares reference buffers between channels,
+  which only matters with more than one encoder channel.
+
+`rk_aiq_uapi2_setBrightness`, `setMirrorFlip` and the exposure-switch calls behind
+`rk_aiq_user_api2_ae_setExpSwAttr` are image controls the factory app exposes and
+this firmware does not; the night path here uses scene switching alone, which is
+the behavior verified on the camera.
+
 ## Night mode: what the port has to keep
 
 The night path was tuned on hardware after the branch this crate was started from

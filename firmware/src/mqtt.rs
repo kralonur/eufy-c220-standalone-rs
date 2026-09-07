@@ -215,7 +215,6 @@ impl MqttTask {
         }
 
         let mut ticker = interval(TELEMETRY_INTERVAL);
-        let mut announced = false;
         loop {
             tokio::select! {
                 event = eventloop.poll() => match event? {
@@ -224,9 +223,13 @@ impl MqttTask {
                         client
                             .publish(format!("{prefix}/availability"), QoS::AtLeastOnce, true, "online")
                             .await?;
-                        if self.config.discovery_enabled && !announced {
+                        // Every connection, not just the first: the messages are retained
+                        // and idempotent, so republishing costs little and means a broker
+                        // that lost its retained store - or that was only just granted
+                        // write access to the discovery prefix - repairs itself on the
+                        // camera's next reconnect instead of waiting for a reboot.
+                        if self.config.discovery_enabled {
                             self.publish_discovery(&client).await?;
-                            announced = true;
                         }
                         self.publish_state(&client).await?;
                     }

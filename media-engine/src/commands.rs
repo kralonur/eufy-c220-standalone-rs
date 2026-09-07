@@ -125,9 +125,12 @@ pub fn interpret<'a>(
             Ok(Some(Command::SpeakerVolume { volume }))
         }
         RecordKind::NightMode => {
-            match NightModeTarget::from_abi(payload.first().copied().unwrap_or(0)) {
-                // The reference engine reads only the first byte and ignores the
-                // rest of the payload.
+            // The reference engine refuses an empty record here and reads only
+            // the first byte of the ones it accepts, ignoring the rest.
+            let Some(value) = payload.first().copied() else {
+                return Err(CommandError::Empty);
+            };
+            match NightModeTarget::from_abi(value) {
                 Some(target) => Ok(Some(Command::NightMode { target })),
                 None => Ok(None),
             }
@@ -265,6 +268,12 @@ mod tests {
         );
         assert_eq!(
             interpret(RecordKind::SPEAKER_PCM, false, &[], 0),
+            Err(CommandError::Empty)
+        );
+        // An empty night-mode record ends the session, as in the reference
+        // engine, rather than being read as "auto".
+        assert_eq!(
+            interpret(RecordKind::NIGHT_MODE, false, &[], 0),
             Err(CommandError::Empty)
         );
     }

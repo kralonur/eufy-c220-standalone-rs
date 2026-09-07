@@ -10,6 +10,7 @@ use crate::platform::{self, Error, media_log};
 use alloc::ffi::CString;
 use alloc::sync::Arc;
 use alloc::vec;
+use c220_media_protocol::ProtocolError;
 
 /// Retry delay after a failed accept, matching the reference engine.
 const ACCEPT_RETRY_US: u32 = 10_000;
@@ -113,8 +114,14 @@ impl Engine {
             let header = match client::read_header(client, stop) {
                 Ok(HeaderRead::Header(header)) => header,
                 Ok(HeaderRead::Ended) => break,
-                Ok(HeaderRead::Malformed) => {
-                    media_log!("media_client_bad_magic=1");
+                Ok(HeaderRead::Malformed(error)) => {
+                    // A bad magic is worth its own line: it is what a daemon
+                    // speaking the wrong protocol looks like, while any other
+                    // header error means a mangled record.
+                    match error {
+                        ProtocolError::BadMagic => media_log!("media_client_bad_magic=1"),
+                        other => media_log!("media_client_header_error={other}"),
+                    }
                     break;
                 }
                 Err(error) => {

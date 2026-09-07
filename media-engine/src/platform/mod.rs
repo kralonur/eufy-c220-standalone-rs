@@ -135,8 +135,13 @@ impl core::error::Error for Error {}
 ///
 /// Assembling the line first matters: several threads log, and a line split
 /// across writes could interleave with another thread's and become unreadable.
-/// Longer lines are truncated rather than dropped.
+/// Longer lines are truncated rather than dropped. One byte is kept back for the
+/// newline, so a full line still ends where it should and the next one starts
+/// where it should.
 const LOG_LINE_LEN: usize = 256;
+
+/// Bytes of the line available to the message itself.
+const LOG_MESSAGE_LEN: usize = LOG_LINE_LEN - 1;
 
 /// Write one diagnostic line to stderr, best effort.
 ///
@@ -150,7 +155,7 @@ pub fn log(arguments: fmt::Arguments<'_>) {
 
     impl fmt::Write for Line {
         fn write_str(&mut self, text: &str) -> fmt::Result {
-            let room = LOG_LINE_LEN - self.len;
+            let room = LOG_MESSAGE_LEN - self.len;
             let taken = text.len().min(room);
             self.bytes[self.len..self.len + taken].copy_from_slice(&text.as_bytes()[..taken]);
             self.len += taken;

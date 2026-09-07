@@ -10,7 +10,7 @@
 use crate::platform::Error;
 use crate::platform::net::{self, UnixStream};
 use crate::platform::sync::Mutex;
-use c220_media_protocol::{FRAME_HEADER_LEN, Header, RecordKind};
+use c220_media_protocol::{FRAME_HEADER_LEN, Header, ProtocolError, RecordKind};
 use core::sync::atomic::{AtomicI32, Ordering};
 
 /// The descriptor value that means "no daemon connected".
@@ -117,8 +117,8 @@ pub enum HeaderRead {
     Header(Header),
     /// The daemon closed the socket, or a stop was requested.
     Ended,
-    /// The bytes were not a record header.
-    Malformed,
+    /// The bytes were not a record header, for the reason given.
+    Malformed(ProtocolError),
 }
 
 /// How a blocking read finished.
@@ -139,7 +139,7 @@ pub fn read_header<F: Fn() -> bool>(stream: &UnixStream, stop: F) -> Result<Head
     }
     match Header::parse(&bytes) {
         Ok(header) => Ok(HeaderRead::Header(header)),
-        Err(_) => Ok(HeaderRead::Malformed),
+        Err(error) => Ok(HeaderRead::Malformed(error)),
     }
 }
 
@@ -324,7 +324,7 @@ mod tests {
             .expect("bytes should write");
         assert_eq!(
             read_header(&server, || false).expect("read should succeed"),
-            HeaderRead::Malformed
+            HeaderRead::Malformed(ProtocolError::BadMagic)
         );
 
         // Half a header is an ended session, not a partial record.

@@ -41,16 +41,20 @@ impl<T> Mutex<T> {
             storage: Storage([0; 64]),
             value: UnsafeCell::new(value),
         };
-        if unsafe { libc::pthread_mutex_init(mutex.storage(), core::ptr::null()) } != 0 {
-            return Err(Error::last());
+        // As with the thread calls, the error code is the return value: pthreads
+        // do not report through `errno`.
+        let status = unsafe { libc::pthread_mutex_init(mutex.storage(), core::ptr::null()) };
+        if status != 0 {
+            return Err(Error::from_errno(status));
         }
         Ok(mutex)
     }
 
     /// Block until the lock is free, then hold it.
     pub fn lock(&self) -> Result<Guard<'_, T>, Error> {
-        if unsafe { libc::pthread_mutex_lock(self.storage()) } != 0 {
-            return Err(Error::last());
+        let status = unsafe { libc::pthread_mutex_lock(self.storage()) };
+        if status != 0 {
+            return Err(Error::from_errno(status));
         }
         Ok(Guard { mutex: self })
     }

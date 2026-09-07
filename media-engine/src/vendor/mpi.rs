@@ -756,9 +756,10 @@ impl AudioEncoder {
 
     /// Take the next encoded block, waiting up to `timeout_ms`.
     ///
-    /// `Ok(None)` covers both a timeout and a failed read, because the reference
-    /// engine treats every non-success status the same way: it goes round again.
-    pub fn next_block(&mut self, timeout_ms: i32) -> Result<Option<AudioBlock<'_>>, Error> {
+    /// `None` covers a timeout, a failed read and an empty block alike: the
+    /// reference engine treats every one of those the same way, by going round
+    /// again.
+    pub fn next_block(&mut self, timeout_ms: i32) -> Option<AudioBlock<'_>> {
         let mut stream = AudioStream {
             block: ptr::null_mut(),
             length: 0,
@@ -767,16 +768,16 @@ impl AudioEncoder {
             bypass_block: 0,
         };
         if unsafe { RK_MPI_AENC_GetStream(self.channel, &mut stream, timeout_ms) } != RK_SUCCESS {
-            return Ok(None);
+            return None;
         }
         if stream.block.is_null() || stream.length == 0 {
             unsafe { RK_MPI_AENC_ReleaseStream(self.channel, &mut stream) };
-            return Ok(None);
+            return None;
         }
-        Ok(Some(AudioBlock {
+        Some(AudioBlock {
             encoder: self,
             stream,
-        }))
+        })
     }
 }
 

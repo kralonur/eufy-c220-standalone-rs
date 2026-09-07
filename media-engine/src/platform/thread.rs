@@ -61,13 +61,16 @@ where
 {
     let mut attributes = ThreadAttributes([0; 128]);
     let attributes = &mut attributes as *mut ThreadAttributes as *mut libc::pthread_attr_t;
-    if unsafe { libc::pthread_attr_init(attributes) } != 0 {
-        return Err(Error::last());
+    // pthreads return their error code and leave `errno` alone, so it is the
+    // return value that goes into the error, not whatever `errno` happens to hold.
+    let status = unsafe { libc::pthread_attr_init(attributes) };
+    if status != 0 {
+        return Err(Error::from_errno(status));
     }
-    if unsafe { libc::pthread_attr_setstacksize(attributes, THREAD_STACK_SIZE) } != 0 {
-        let error = Error::last();
+    let status = unsafe { libc::pthread_attr_setstacksize(attributes, THREAD_STACK_SIZE) };
+    if status != 0 {
         unsafe { libc::pthread_attr_destroy(attributes) };
-        return Err(error);
+        return Err(Error::from_errno(status));
     }
 
     // The closure travels to the trampoline as a raw pointer and is reclaimed
@@ -84,7 +87,7 @@ where
     unsafe { libc::pthread_attr_destroy(attributes) };
     if created != 0 {
         drop(unsafe { Box::from_raw(argument as *mut Box<dyn FnOnce() + Send>) });
-        return Err(Error::last());
+        return Err(Error::from_errno(created));
     }
 
     // SAFETY: a successful `pthread_create` wrote the handle.

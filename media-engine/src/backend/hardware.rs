@@ -37,6 +37,7 @@ use crate::vendor::mpi::{
     AudioAttributes, AudioEncoder, AudioInput, AudioOutput, AudioOutputChannelParams, Channel,
     ExternalBlock, ID_AENC, ID_AI, INPUT_CHANNEL_PARAMS, MAX_AUDIO_CARD_NAME, SoundCard,
 };
+use alloc::ffi::CString;
 use alloc::string::String;
 use alloc::sync::Arc;
 use c220_media_protocol::RecordKind;
@@ -76,6 +77,25 @@ const CAPTURE_FALLBACK_STEP_US: u64 = 20_000;
 
 /// Name the capture thread carries in `/proc`.
 const MICROPHONE_THREAD: &str = "c220-microphone";
+
+/// Variable that selects Rockit's log level.
+const ROCKIT_LOG_LEVEL_VARIABLE: &str = "rt_log_level";
+
+/// Variable that selects Rockit's log file.
+const ROCKIT_LOG_PATH_VARIABLE: &str = "rt_log_path";
+
+/// Rockit log level the engine runs with: 0, no output.
+///
+/// The media pipeline logs per frame at the levels above this one, so leaving it
+/// at the library's default both costs time on the hot path and fills the
+/// filesystem with a trace nobody reads.
+const ROCKIT_LOG_LEVEL: &str = "0";
+
+/// Where Rockit's log goes, whether or not anything is written to it.
+///
+/// The path is the reference engine's and the factory engine's; naming it keeps
+/// the library from choosing a location of its own.
+const ROCKIT_LOG_PATH: &str = "/tmp/c220-media-rockit.log";
 
 /// The camera's playback device.
 struct Speaker {
@@ -370,29 +390,24 @@ fn forward_captured_audio(
     let mut fallback = Counter::new(CAPTURE_FALLBACK_STEP_US);
 
     while !shutdown.requested() {
-        match encoder.next_block(CAPTURE_TIMEOUT_MS) {
-            Ok(Some(block)) => {
-                let bytes = block.data();
-                let length = bytes.len();
-                // The encoder usually stamps blocks; when it does not, the engine
-                // counts 20 ms frames itself.
-                let timestamp = if block.timestamp() != 0 {
-                    block.timestamp()
-                } else {
-                    fallback.advance()
-                };
-                if length > 0 && length <= AUDIO_MAX_PAYLOAD {
-                    // A failed send means the daemon went away; the session thread
-                    // notices that too and detaches the sink, so this is not worth
-                    // a log line per frame, exactly as in the reference engine.
-                    let _ = sink.send(RecordKind::AUDIO_CAPTURE, 0, false, timestamp, bytes);
-                }
-            }
-            Ok(None) => {}
-            Err(error) => {
-                media_log!("media_audio_stream_error={error}");
-                crate::platform::sleep_us(CAPTURE_TIMEOUT_MS as u32 * 1_000 / 100);
-            }
+        let Some(block) = encoder.next_block(CAPTURE_TIMEOUT_MS) else {
+            continue;
+        };
+        let bytes = block.data();
+        let length = bytes.len();
+        // The encoder usually stamps blocks; when it does not, the engine counts
+        // 20 ms frames itself - the length of one G.711 block at 8 kHz, which is
+        // also how the daemon splits a record into RTSP frames.
+        let timestamp = if block.timestamp() != 0 {
+            block.timestamp()
+        } else {
+            fallback.advance()
+        };
+        if length > 0 && length <= AUDIO_MAX_PAYLOAD {
+            // A failed send means the daemon went away; the session thread notices
+            // that too and detaches the sink, so this is not worth a log line per
+            // frame, exactly as in the reference engine.
+            let _ = sink.send(RecordKind::AUDIO_CAPTURE, 0, false, timestamp, bytes);
         }
     }
 
@@ -440,8 +455,40 @@ impl HardwareBackend {
     }
 }
 
+/// Start the vendor media system.
+///
+/// This mirrors the reference engine's `main`, which sets Rockit's logging
+/// variables and then calls `RK_MPI_SYS_Init` before it opens anything: every
+/// MPI call below depends on that initialization, and the two variables are read
+/// as the system comes up.
+///
+/// A failure is not fatal here the way it is in the reference engine, which
+/// exits: the engine stays up and serves the daemon so the reason is visible,
+/// and no vendor call is made afterwards that would run on an uninitialized
+/// system.
+fn start_media_system() -> Result<(), Error> {
+    for (name, value) in [
+        (ROCKIT_LOG_LEVEL_VARIABLE, ROCKIT_LOG_LEVEL),
+        (ROCKIT_LOG_PATH_VARIABLE, ROCKIT_LOG_PATH),
+    ] {
+        let name = CString::new(name).map_err(|_| Error::from_errno(libc::EINVAL))?;
+        let value = CString::new(value).map_err(|_| Error::from_errno(libc::EINVAL))?;
+        // Overwrite: the engine's own settings win over whatever the launching
+        // environment carries, as in the reference engine.
+        if unsafe { libc::setenv(name.as_ptr(), value.as_ptr(), 1) } != 0 {
+            return Err(Error::last());
+        }
+    }
+    crate::vendor::check(unsafe { mpi::RK_MPI_SYS_Init() })
+}
+
 impl Backend for HardwareBackend {
     fn start(&mut self, sink: Arc<RecordSink>, shutdown: Arc<Shutdown>) -> Result<(), Error> {
+        if let Err(error) = start_media_system() {
+            media_log!("media_sys_init_error={error}");
+            return Err(error);
+        }
+
         let mut failure = None;
 
         match Speaker::open(&self.card) {

@@ -5,7 +5,7 @@
 //! assertion it carries is repeated below: a mismatch is silent memory
 //! corruption on the camera, so it is worth failing the build for.
 
-use super::check;
+use super::{RK_SUCCESS, check};
 use crate::platform::Error;
 use core::ffi::{c_char, c_int, c_void};
 use core::mem::size_of;
@@ -665,6 +665,220 @@ impl core::fmt::Debug for AudioOutput {
             .finish_non_exhaustive()
     }
 }
+
+/// Samples the microphone path assembles per frame (reference value).
+pub const AUDIO_FRAME_SAMPLES: u32 = 320;
+
+/// Largest microphone record worth sending.
+///
+/// The reference engine caps a captured block at 4096 bytes before it becomes a
+/// record; the daemon accepts more for other kinds, but a G.711 block of that
+/// size is already seconds of audio and anything larger is a broken device.
+pub const AUDIO_MAX_PAYLOAD: usize = 4096;
+
+/// Frames the encoder holds (reference value).
+const AUDIO_ENCODER_BUFFER_COUNT: u32 = 4;
+
+/// Depth of the encoder's output queue (reference value).
+const AUDIO_ENCODER_DEPTH: u32 = 4;
+
+/// Frames of input the capture channel keeps for the user (reference value).
+const AUDIO_INPUT_FRAME_DEPTH: i32 = 1;
+
+/// An owned audio input device with its capture channel.
+pub struct AudioInput {
+    device: c_int,
+    channel: c_int,
+    enabled: bool,
+    channel_enabled: bool,
+}
+
+impl AudioInput {
+    /// Configure, enable and start a capture device.
+    pub fn open(
+        device: c_int,
+        channel: c_int,
+        attributes: &AudioAttributes,
+        params: &AudioInputChannelParams,
+        track_mode: i32,
+    ) -> Result<Self, Error> {
+        let mut input = Self {
+            device,
+            channel,
+            enabled: false,
+            channel_enabled: false,
+        };
+        check(unsafe { RK_MPI_AI_SetPubAttr(device, attributes) })?;
+        check(unsafe { RK_MPI_AI_Enable(device) })?;
+        input.enabled = true;
+        check(unsafe { RK_MPI_AI_SetChnParam(device, channel, params) })?;
+        check(unsafe { RK_MPI_AI_SetTrackMode(device, track_mode) })?;
+        check(unsafe { RK_MPI_AI_EnableChn(device, channel) })?;
+        input.channel_enabled = true;
+        Ok(input)
+    }
+}
+
+impl Drop for AudioInput {
+    fn drop(&mut self) {
+        // The reference engine disables the channel and the device; the resampler
+        // and voice-enhancement paths the vendor supports are not enabled here.
+        if self.channel_enabled {
+            unsafe { RK_MPI_AI_DisableChn(self.device, self.channel) };
+        }
+        if self.enabled {
+            unsafe { RK_MPI_AI_Disable(self.device) };
+        }
+    }
+}
+
+impl core::fmt::Debug for AudioInput {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("AudioInput")
+            .field("device", &self.device)
+            .field("channel", &self.channel)
+            .finish_non_exhaustive()
+    }
+}
+
+/// An owned audio encoder channel.
+pub struct AudioEncoder {
+    channel: c_int,
+}
+
+impl AudioEncoder {
+    /// Create an encoder channel with the given codec attributes.
+    pub fn open(channel: c_int, attributes: &AudioEncoderAttributes) -> Result<Self, Error> {
+        check(unsafe { RK_MPI_AENC_CreateChn(channel, attributes) })?;
+        Ok(Self { channel })
+    }
+
+    /// Take the next encoded block, waiting up to `timeout_ms`.
+    ///
+    /// `Ok(None)` covers both a timeout and a failed read, because the reference
+    /// engine treats every non-success status the same way: it goes round again.
+    pub fn next_block(&mut self, timeout_ms: i32) -> Result<Option<AudioBlock<'_>>, Error> {
+        let mut stream = AudioStream {
+            block: ptr::null_mut(),
+            length: 0,
+            timestamp: 0,
+            sequence: 0,
+            bypass_block: 0,
+        };
+        if unsafe { RK_MPI_AENC_GetStream(self.channel, &mut stream, timeout_ms) } != RK_SUCCESS {
+            return Ok(None);
+        }
+        if stream.block.is_null() || stream.length == 0 {
+            unsafe { RK_MPI_AENC_ReleaseStream(self.channel, &mut stream) };
+            return Ok(None);
+        }
+        Ok(Some(AudioBlock {
+            encoder: self,
+            stream,
+        }))
+    }
+}
+
+impl Drop for AudioEncoder {
+    fn drop(&mut self) {
+        unsafe { RK_MPI_AENC_DestroyChn(self.channel) };
+    }
+}
+
+impl core::fmt::Debug for AudioEncoder {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("AudioEncoder")
+            .field("channel", &self.channel)
+            .finish_non_exhaustive()
+    }
+}
+
+/// One encoded block, returned to the encoder when it goes out of scope.
+pub struct AudioBlock<'a> {
+    encoder: &'a mut AudioEncoder,
+    stream: AudioStream,
+}
+
+impl AudioBlock<'_> {
+    /// The encoded bytes.
+    ///
+    /// The encoder wrote this block, so unlike a captured video frame there is no
+    /// device-side cache to invalidate before reading it - the reference engine
+    /// reads it directly too.
+    pub fn data(&self) -> &[u8] {
+        let pointer = unsafe { RK_MPI_MB_Handle2VirAddr(self.stream.block) } as *const u8;
+        if pointer.is_null() {
+            return &[];
+        }
+        // SAFETY: the block holds `length` bytes that stay valid until the stream
+        // is released, which cannot happen while this borrow exists.
+        unsafe { core::slice::from_raw_parts(pointer, self.stream.length as usize) }
+    }
+
+    /// The device timestamp, or 0 when the encoder did not provide one.
+    pub fn timestamp(&self) -> u64 {
+        self.stream.timestamp
+    }
+}
+
+impl Drop for AudioBlock<'_> {
+    fn drop(&mut self) {
+        unsafe { RK_MPI_AENC_ReleaseStream(self.encoder.channel, &mut self.stream) };
+    }
+}
+
+impl core::fmt::Debug for AudioBlock<'_> {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("AudioBlock")
+            .field("length", &self.stream.length)
+            .field("timestamp", &self.stream.timestamp)
+            .finish()
+    }
+}
+
+/// Connect a capture channel to an encoder channel.
+///
+/// This is what turns the microphone into encoded blocks without the engine
+/// copying audio: the device writes into the encoder.
+pub fn bind(source: Channel, destination: Channel) -> Result<(), Error> {
+    check(unsafe { RK_MPI_SYS_Bind(&source, &destination) })
+}
+
+/// The capture-channel parameters the reference engine uses: one frame of depth,
+/// no loopback.
+pub const INPUT_CHANNEL_PARAMS: AudioInputChannelParams = AudioInputChannelParams {
+    user_frame_depth: AUDIO_INPUT_FRAME_DEPTH,
+    loopback_mode: AUDIO_LOOPBACK_NONE,
+};
+
+/// The G.711 A-law encoder attributes the reference engine uses.
+///
+/// One channel at 8 kHz, coded at 8 bits per sample with a 64 kbit/s nominal
+/// rate, which is what the daemon's RTSP track carries.
+pub const ALAW_ENCODER_ATTRIBUTES: AudioEncoderAttributes = AudioEncoderAttributes {
+    codec: AUDIO_ID_PCM_ALAW,
+    buffer_count: AUDIO_ENCODER_BUFFER_COUNT,
+    codec_attributes: AudioCodecAttributes {
+        codec: AUDIO_ID_PCM_ALAW,
+        bit_width: AUDIO_BIT_WIDTH_16,
+        channels: 1,
+        sample_rate: AUDIO_SAMPLE_RATE_8000 as u32,
+        bits_per_coded_sample: ALAW_BITS_PER_SAMPLE,
+        bitrate: ALAW_BITRATE_BPS,
+        reserved: [0; 4],
+        reserved_pointer: ptr::null_mut(),
+    },
+    depth: AUDIO_ENCODER_DEPTH,
+};
+
+/// Bits per coded A-law sample (reference value).
+const ALAW_BITS_PER_SAMPLE: u32 = 8;
+
+/// Nominal A-law bitrate in bits per second (reference value).
+const ALAW_BITRATE_BPS: u32 = 64_000;
 
 /// An owned video encoder channel.
 pub struct EncoderChannel {

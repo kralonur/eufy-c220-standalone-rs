@@ -17,6 +17,8 @@ pub mod alloc;
 pub mod file;
 pub mod net;
 pub mod signal;
+pub mod sync;
+pub mod thread;
 
 /// A failed libc or vendor call.
 #[derive(Clone, Copy, PartialEq, Eq)]

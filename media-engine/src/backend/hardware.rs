@@ -1,10 +1,16 @@
-//! The speaker path: daemon talkback out of the camera's playback device.
+//! The camera's audio devices: playback for talkback, capture for the microphone.
 //!
-//! Ported from the reference engine's `init_speaker`, `send_pcm_frame`,
-//! `speaker_send_aac`, `speaker_send_pcm16` and `speaker_clear`. The daemon sends
-//! either raw PCM or AAC access units; AAC goes through the FDK decoder, and both
-//! end up as 16-bit mono blocks on the AO device, which resamples 16 kHz talkback
-//! to the card's 8 kHz.
+//! The speaker path is ported from the reference engine's `init_speaker`,
+//! `send_pcm_frame`, `speaker_send_aac`, `speaker_send_pcm16` and
+//! `speaker_clear`: the daemon sends either raw PCM or AAC access units, AAC goes
+//! through the FDK decoder, and both end up as 16-bit mono blocks on the AO
+//! device, which resamples 16 kHz talkback to the card's 8 kHz.
+//!
+//! The microphone path is ported from `open_audio_capture` and `audio_thread`:
+//! the AI device is bound to the AENC channel, so the hardware hands encoded
+//! G.711 A-law blocks to a thread that forwards them to the daemon. That thread is
+//! the engine's first record producer, which is why the connection it writes to is
+//! a shared [`RecordSink`] rather than the session's own socket.
 //!
 //! Two behaviors are worth knowing, because they look like oversights and are
 //! deliberate:
@@ -16,19 +22,24 @@
 //!   continues: the daemon is not told, exactly as the reference engine does it.
 
 use super::{Backend, NightState};
-use crate::client::RecordWriter;
+use crate::client::RecordSink;
 use crate::commands::{Command, MAX_PCM_PAYLOAD, MAX_VOLUME};
 use crate::gpio::OutputPin;
+use crate::platform::signal::Shutdown;
+use crate::platform::thread::{self, Thread};
 use crate::platform::{Error, media_log};
+use crate::pts::Counter;
 use crate::vendor::fdk::{Decoded, Decoder};
 use crate::vendor::mpi::{
-    AUDIO_BIT_WIDTH_16, AUDIO_CHN_MODE_DEFAULT, AUDIO_LOOPBACK_NONE, AUDIO_SAMPLE_RATE_8000,
-    AUDIO_SAMPLE_RATE_16000, AUDIO_SOUND_MODE_MONO, AUDIO_SOUND_MODE_STEREO,
-    AUDIO_TRACK_OUT_STEREO, MAX_AUDIO_CARD_NAME,
+    self, ALAW_ENCODER_ATTRIBUTES, AUDIO_BIT_WIDTH_16, AUDIO_CHN_MODE_DEFAULT, AUDIO_FRAME_SAMPLES,
+    AUDIO_LOOPBACK_NONE, AUDIO_MAX_PAYLOAD, AUDIO_SAMPLE_RATE_8000, AUDIO_SAMPLE_RATE_16000,
+    AUDIO_SOUND_MODE_MONO, AUDIO_SOUND_MODE_STEREO, AUDIO_TRACK_FRONT_LEFT, AUDIO_TRACK_OUT_STEREO,
+    AudioAttributes, AudioEncoder, AudioInput, AudioOutput, AudioOutputChannelParams, Channel,
+    ExternalBlock, ID_AENC, ID_AI, INPUT_CHANNEL_PARAMS, MAX_AUDIO_CARD_NAME, SoundCard,
 };
-use crate::vendor::mpi::{
-    AudioAttributes, AudioOutput, AudioOutputChannelParams, ExternalBlock, SoundCard,
-};
+use alloc::string::String;
+use alloc::sync::Arc;
+use c220_media_protocol::RecordKind;
 
 /// The amplifier enable pin, from the reference engine.
 const SPEAKER_GPIO: u32 = 102;
@@ -54,6 +65,17 @@ const SEND_TIMEOUT_MS: i32 = 1000;
 
 /// Decode attempts per access unit before giving up (reference value).
 const MAX_DECODE_ATTEMPTS: usize = 64;
+
+/// How long the capture thread waits for one encoded block, in milliseconds
+/// (reference value).
+const CAPTURE_TIMEOUT_MS: i32 = 1000;
+
+/// Timestamp step the capture path falls back to when the encoder reports none,
+/// in microseconds: 20 ms, the length of one G.711 frame at 8 kHz.
+const CAPTURE_FALLBACK_STEP_US: u64 = 20_000;
+
+/// Name the capture thread carries in `/proc`.
+const MICROPHONE_THREAD: &str = "c220-microphone";
 
 /// The camera's playback device.
 struct Speaker {
@@ -261,6 +283,124 @@ impl Speaker {
     }
 }
 
+/// The camera's microphone: the capture device, its encoder and the thread that
+/// forwards encoded blocks.
+struct Microphone {
+    thread: Thread,
+}
+
+impl Microphone {
+    /// Open the capture device, bind it to the encoder and start the reader.
+    ///
+    /// The devices are moved into the thread, so they are released by the thread
+    /// as it stops - the reference engine's `close_audio_capture` runs in the
+    /// same place.
+    fn open(card: &str, sink: Arc<RecordSink>, shutdown: Arc<Shutdown>) -> Result<Self, Error> {
+        let input = open_capture_device(card)?;
+        let encoder = AudioEncoder::open(0, &ALAW_ENCODER_ATTRIBUTES)?;
+        mpi::bind(
+            Channel {
+                module: ID_AI,
+                device: 0,
+                channel: 0,
+            },
+            Channel {
+                module: ID_AENC,
+                device: 0,
+                channel: 0,
+            },
+        )?;
+
+        media_log!(
+            "media_audio_ready=pcma/8000/mono frame_samples={} card={}",
+            AUDIO_FRAME_SAMPLES,
+            card
+        );
+        let thread = thread::spawn(MICROPHONE_THREAD, move || {
+            forward_captured_audio(input, encoder, &sink, &shutdown)
+        })?;
+        Ok(Self { thread })
+    }
+}
+
+impl Drop for Microphone {
+    fn drop(&mut self) {
+        // The thread stops because shutdown was requested, and drops both devices
+        // with it; joining is what makes the devices certainly gone before the
+        // engine returns.
+        self.thread.join();
+    }
+}
+
+/// Configure and enable the capture device.
+fn open_capture_device(card: &str) -> Result<AudioInput, Error> {
+    let mut attributes = AudioAttributes {
+        card: SoundCard {
+            channels: DEVICE_CHANNELS,
+            sample_rate: AUDIO_SAMPLE_RATE_8000 as u32,
+            bit_width: AUDIO_BIT_WIDTH_16,
+        },
+        sample_rate: AUDIO_SAMPLE_RATE_8000,
+        bit_width: AUDIO_BIT_WIDTH_16,
+        sound_mode: AUDIO_SOUND_MODE_MONO,
+        extended_flags: 0,
+        frame_count: DEVICE_FRAMES,
+        points_per_frame: AUDIO_FRAME_SAMPLES,
+        channel_count: DEVICE_CHANNELS,
+        card_name: [0; MAX_AUDIO_CARD_NAME],
+    };
+    copy_card_name(&mut attributes.card_name, card);
+
+    AudioInput::open(
+        0,
+        0,
+        &attributes,
+        &INPUT_CHANNEL_PARAMS,
+        AUDIO_TRACK_FRONT_LEFT,
+    )
+}
+
+/// Send captured blocks to the daemon until asked to stop.
+fn forward_captured_audio(
+    input: AudioInput,
+    mut encoder: AudioEncoder,
+    sink: &RecordSink,
+    shutdown: &Shutdown,
+) {
+    let mut fallback = Counter::new(CAPTURE_FALLBACK_STEP_US);
+
+    while !shutdown.requested() {
+        match encoder.next_block(CAPTURE_TIMEOUT_MS) {
+            Ok(Some(block)) => {
+                let bytes = block.data();
+                let length = bytes.len();
+                // The encoder usually stamps blocks; when it does not, the engine
+                // counts 20 ms frames itself.
+                let timestamp = if block.timestamp() != 0 {
+                    block.timestamp()
+                } else {
+                    fallback.advance()
+                };
+                if length > 0 && length <= AUDIO_MAX_PAYLOAD {
+                    // A failed send means the daemon went away; the session thread
+                    // notices that too and detaches the sink, so this is not worth
+                    // a log line per frame, exactly as in the reference engine.
+                    let _ = sink.send(RecordKind::AUDIO_CAPTURE, 0, false, timestamp, bytes);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                media_log!("media_audio_stream_error={error}");
+                crate::platform::sleep_us(CAPTURE_TIMEOUT_MS as u32 * 1_000 / 100);
+            }
+        }
+    }
+
+    // Both devices are released here, in the thread that used them.
+    drop(encoder);
+    drop(input);
+}
+
 /// Copy an ALSA card name into the fixed-size field, truncating like the
 /// reference engine's `snprintf` and leaving it NUL-terminated.
 fn copy_card_name(field: &mut [u8; MAX_AUDIO_CARD_NAME], card: &str) {
@@ -270,43 +410,67 @@ fn copy_card_name(field: &mut [u8; MAX_AUDIO_CARD_NAME], card: &str) {
     field[taken] = 0;
 }
 
-/// The camera's playback backend.
+/// The camera's backend: the playback devices, the microphone, and the night
+/// state the daemon is told about until the image path lands.
 ///
-/// It owns the speaker and keeps the night state the daemon is told about until
-/// the image path lands; `--mock-backend` selects the hardware-free backend
-/// instead, which is what the emulation tests use.
-pub struct SpeakerBackend {
-    card: alloc::string::String,
+/// `--mock-backend` selects the hardware-free backend instead, which is what the
+/// emulation tests use.
+pub struct HardwareBackend {
+    card: String,
     speaker: Option<Speaker>,
+    microphone: Option<Microphone>,
+    capture_enabled: bool,
     night: NightState,
 }
 
-impl SpeakerBackend {
+impl HardwareBackend {
     /// Create a backend for the given audio card.
-    pub fn new(card: &str) -> Self {
+    ///
+    /// `capture_enabled` is the daemon's microphone preference; when it is false
+    /// the capture device is never opened, which is what the reference engine's
+    /// `--no-audio` does.
+    pub fn new(card: &str, capture_enabled: bool) -> Self {
         Self {
-            card: alloc::string::String::from(card),
+            card: String::from(card),
             speaker: None,
+            microphone: None,
+            capture_enabled,
             night: NightState::new(),
         }
     }
 }
 
-impl Backend for SpeakerBackend {
-    fn start(&mut self) -> Result<(), Error> {
+impl Backend for HardwareBackend {
+    fn start(&mut self, sink: Arc<RecordSink>, shutdown: Arc<Shutdown>) -> Result<(), Error> {
+        let mut failure = None;
+
         match Speaker::open(&self.card) {
-            Ok(speaker) => {
-                self.speaker = Some(speaker);
-                Ok(())
-            }
+            Ok(speaker) => self.speaker = Some(speaker),
             Err(error) => {
                 media_log!("media_speaker_error={error}");
-                Err(error)
+                failure = Some(error);
             }
+        }
+
+        if self.capture_enabled {
+            match Microphone::open(&self.card, sink, shutdown) {
+                Ok(microphone) => self.microphone = Some(microphone),
+                Err(error) => {
+                    media_log!("media_microphone_error={error}");
+                    failure = Some(error);
+                }
+            }
+        } else {
+            media_log!("media_audio_disabled=1");
+        }
+
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
     }
 
-    fn command(&mut self, command: Command<'_>, writer: &RecordWriter<'_>) -> Result<(), Error> {
+    fn command(&mut self, command: Command<'_>, sink: &RecordSink) -> Result<(), Error> {
         match command {
             Command::SpeakerClear => match self.speaker.as_mut() {
                 Some(speaker) => {
@@ -337,7 +501,7 @@ impl Backend for SpeakerBackend {
                 if let Some(night) = self.night.apply(target) {
                     media_log!("media_night_mode_switch={}", u8::from(night));
                     let (night, manual) = self.night.reported();
-                    writer.send_night_mode(night, manual)?;
+                    sink.send_night_mode(night, manual)?;
                 }
                 media_log!("media_night_mode_set={}", target.name());
             }
@@ -351,8 +515,11 @@ impl Backend for SpeakerBackend {
 
     fn shutdown(&mut self) {
         // Dropping the speaker clears the queue, disables the resampler, the
-        // channel and the device, and drives the amplifier low.
+        // channel and the device, and drives the amplifier low; dropping the
+        // microphone joins its thread, which releases the capture device and its
+        // encoder.
+        self.microphone = None;
         self.speaker = None;
-        media_log!("media_speaker_stopped=1");
+        media_log!("media_audio_stopped=1");
     }
 }

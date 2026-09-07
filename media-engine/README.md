@@ -114,6 +114,7 @@ on the camera: `readelf -l` must report **no `PT_TLS` segment**.
 | Engine process: entry stub, session loop, command handling, mock backend | Done |
 | Vendor bindings (Rockchip MPI, AIQ, SmartIR, FDK AAC) | Done, ABI-asserted |
 | Speaker path: amplifier pin, AO device, PCM and AAC talkback | Done, awaiting hardware |
+| Microphone path: AI + AENC, capture thread, G.711 records | Done, awaiting hardware |
 | V4L2 capture bindings | Not started |
 | Video, microphone, night-mode pipelines | Not started |
 
@@ -121,6 +122,14 @@ The daemon-facing behavior already matches the reference engine: the private
 socket with mode `0600`, one session at a time, the night-mode greeting on
 connect, the reference payload limits per record kind, a malformed record ending
 the session without stopping the engine, and the same `media_*` log lines.
+
+Records reach the daemon through one shared sink: the session thread writes the
+greeting, night-mode changes and its own replies, and the microphone thread writes
+captured audio, all under one lock so a record never interleaves with another. A
+record produced while no daemon is connected is dropped rather than queued, which
+is what the reference engine's `client_current() >= 0` check does, and the sink is
+detached before a session's socket closes so a late writer cannot reach a
+descriptor that has been reused.
 
 ## The factory application as a reference
 

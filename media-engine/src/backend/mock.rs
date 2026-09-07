@@ -5,7 +5,7 @@
 //! a host and, with `--mock-backend`, on the camera.
 
 use super::NightState;
-use crate::client::RecordWriter;
+use crate::client::RecordSink;
 use crate::commands::{Command, MAX_VOLUME};
 use crate::platform::Error;
 use crate::platform::media_log;
@@ -31,7 +31,7 @@ impl Default for MockBackend {
 }
 
 impl super::Backend for MockBackend {
-    fn command(&mut self, command: Command<'_>, writer: &RecordWriter<'_>) -> Result<(), Error> {
+    fn command(&mut self, command: Command<'_>, sink: &RecordSink) -> Result<(), Error> {
         match command {
             Command::SpeakerClear => media_log!("media_speaker_clear=1"),
             Command::SpeakerVolume { volume } => {
@@ -41,7 +41,7 @@ impl super::Backend for MockBackend {
                 if let Some(night) = self.night.apply(target) {
                     media_log!("media_night_mode_switch={}", u8::from(night));
                     let (night, manual) = self.night.reported();
-                    writer.send_night_mode(night, manual)?;
+                    sink.send_night_mode(night, manual)?;
                 }
                 media_log!("media_night_mode_set={}", target.name());
             }

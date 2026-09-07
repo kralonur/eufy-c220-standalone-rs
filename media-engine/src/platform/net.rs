@@ -148,28 +148,7 @@ impl UnixStream {
 
     /// Write all of `buffer`.
     pub fn write_all(&self, buffer: &[u8]) -> Result<(), Error> {
-        let mut remaining = buffer;
-        while !remaining.is_empty() {
-            let written = unsafe {
-                libc::write(
-                    self.fd,
-                    remaining.as_ptr() as *const c_void,
-                    remaining.len(),
-                )
-            };
-            if written < 0 {
-                let error = Error::last();
-                if error.is_interrupted() {
-                    continue;
-                }
-                return Err(error);
-            }
-            if written == 0 {
-                return Err(Error::from_errno(libc::EPIPE));
-            }
-            remaining = &remaining[written as usize..];
-        }
-        Ok(())
+        write_all(self.fd, buffer)
     }
 
     /// Wake a thread blocked on this socket.
@@ -189,6 +168,35 @@ impl Drop for UnixStream {
     fn drop(&mut self) {
         unsafe { libc::close(self.fd) };
     }
+}
+
+/// Write all of `buffer` to a connected descriptor.
+///
+/// Separate from [`UnixStream`] because record producers hold the daemon's
+/// descriptor rather than the stream that owns it.
+pub(crate) fn write_all(descriptor: c_int, buffer: &[u8]) -> Result<(), Error> {
+    let mut remaining = buffer;
+    while !remaining.is_empty() {
+        let written = unsafe {
+            libc::write(
+                descriptor,
+                remaining.as_ptr() as *const c_void,
+                remaining.len(),
+            )
+        };
+        if written < 0 {
+            let error = Error::last();
+            if error.is_interrupted() {
+                continue;
+            }
+            return Err(error);
+        }
+        if written == 0 {
+            return Err(Error::from_errno(libc::EPIPE));
+        }
+        remaining = &remaining[written as usize..];
+    }
+    Ok(())
 }
 
 fn bind_address(fd: c_int, path: &CString) -> Result<(), Error> {

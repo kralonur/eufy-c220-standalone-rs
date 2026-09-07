@@ -2,7 +2,7 @@
 
 use crate::backend::Backend;
 use crate::cli::EngineConfig;
-use crate::client::{self, HeaderRead, Outcome, RecordWriter};
+use crate::client::{self, HeaderRead, Outcome, RecordSink};
 use crate::commands;
 use crate::platform::net::{UnixListener, UnixStream};
 use crate::platform::signal::Shutdown;
@@ -20,6 +20,7 @@ const RECEIVE_TIMEOUT_US: i32 = 1_000_000;
 /// Owns the private socket and serves the daemon on it.
 pub struct Engine {
     shutdown: Arc<Shutdown>,
+    sink: Arc<RecordSink>,
     listener: UnixListener,
     socket_path: CString,
 }
@@ -35,9 +36,11 @@ impl Engine {
             .map_err(|_| Error::from_errno(libc::EINVAL))?;
         let shutdown = Arc::new(Shutdown::new());
         shutdown.register_listener(listener.raw_fd());
+        let sink = Arc::new(RecordSink::new()?);
         media_log!("media_socket_ready={}", config.socket_path);
         Ok(Self {
             shutdown,
+            sink,
             listener,
             socket_path,
         })
@@ -57,15 +60,17 @@ impl Engine {
     /// Serve the daemon until a stop is requested.
     ///
     /// The backend is started first, so a device that fails to open is reported
-    /// before any daemon connects - and the engine still serves, because the
-    /// parts that did come up are worth talking to.
+    /// before any daemon connects - and the engine still serves, because the parts
+    /// that did come up are worth talking to. Its producer threads share the
+    /// engine's sink and shutdown state, so they reach the daemon without knowing
+    /// which session is being served.
     ///
     /// One session at a time: while a daemon is connected this blocks in the
     /// session loop, and a new connection is only accepted after it ends. A stop
     /// request shuts the listening socket down, which is what makes the blocked
     /// `accept` return.
     pub fn serve(&mut self, backend: &mut dyn Backend) {
-        if let Err(error) = backend.start() {
+        if let Err(error) = backend.start(Arc::clone(&self.sink), Arc::clone(&self.shutdown)) {
             media_log!("media_backend_start_error={error}");
         }
         while !self.shutdown.requested() {
@@ -88,15 +93,19 @@ impl Engine {
     /// Serve one connected daemon until it goes away or stops behaving.
     fn serve_client(&self, client: &UnixStream, backend: &mut dyn Backend) {
         self.shutdown.register_client(client.raw_fd());
+        // Producers write through the sink, so the session tells it which socket
+        // is current before anything is sent on it.
+        if let Err(error) = self.sink.attach(client) {
+            media_log!("media_client_attach_error={error}");
+        }
         // Best effort, like the reference engine: a read that never times out is
         // still woken when the daemon closes the socket or a stop is requested.
         let _ = client.set_receive_timeout(RECEIVE_TIMEOUT_US);
         media_log!("media_client_connected=1");
 
-        let writer = RecordWriter::new(client);
         let stop = || self.shutdown.requested();
         let (night, manual) = backend.night_mode();
-        if let Err(error) = writer.send_night_mode(night, manual) {
+        if let Err(error) = self.sink.send_night_mode(night, manual) {
             media_log!("media_greeting_error={}", error);
         }
 
@@ -145,7 +154,7 @@ impl Engine {
                 header.timestamp_us(),
             ) {
                 Ok(Some(command)) => {
-                    if let Err(error) = backend.command(command, &writer) {
+                    if let Err(error) = backend.command(command, &self.sink) {
                         media_log!("media_command_error={}", error);
                     }
                 }
@@ -157,6 +166,11 @@ impl Engine {
             }
         }
 
+        // The sink is detached before the socket closes, so a producer cannot
+        // write to a descriptor that has already been reused.
+        if let Err(error) = self.sink.detach() {
+            media_log!("media_client_detach_error={error}");
+        }
         self.shutdown.clear_client();
         media_log!("media_client_disconnected=1");
     }

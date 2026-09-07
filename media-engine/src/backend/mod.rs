@@ -2,38 +2,44 @@
 //!
 //! The trait exists so the daemon protocol can be exercised without a camera:
 //! [`MockBackend`] keeps the state the protocol exposes and logs every command,
-//! while [`SpeakerBackend`] - which only exists on the camera target - drives the
-//! playback hardware. Both appear on the wire in exactly the same way.
+//! while [`HardwareBackend`] - which only exists on the camera target - drives the
+//! audio devices and keeps the microphone's record producer running. Both appear on the wire in exactly the same way.
 
-use crate::client::RecordWriter;
+use crate::client::RecordSink;
 use crate::commands::{Command, NightModeTarget};
 use crate::platform::Error;
+use crate::platform::signal::Shutdown;
+use alloc::sync::Arc;
 
+#[cfg(all(target_arch = "arm", feature = "hardware"))]
+mod hardware;
 mod mock;
-#[cfg(all(target_arch = "arm", feature = "hardware"))]
-mod speaker;
 
-pub use mock::MockBackend;
 #[cfg(all(target_arch = "arm", feature = "hardware"))]
-pub use speaker::SpeakerBackend;
+pub use hardware::HardwareBackend;
+pub use mock::MockBackend;
 
 /// The device side of the engine.
 pub trait Backend {
-    /// Open the devices this backend owns.
+    /// Open the devices this backend owns and start its producer threads.
     ///
-    /// Called once before the engine starts accepting sessions. A failure is
-    /// reported and the engine keeps serving: the daemon should still be able to
-    /// talk to the parts that did come up, and a device that is missing is
-    /// visible in the log rather than in a socket that never answers.
-    fn start(&mut self) -> Result<(), Error> {
+    /// Called once before the engine starts accepting sessions. `sink` is how a
+    /// producer reaches the daemon and `shutdown` is how its thread learns to
+    /// stop; both are shared with the engine.
+    ///
+    /// A failure is reported and the engine keeps serving: the daemon should
+    /// still be able to talk to the parts that did come up, and a device that is
+    /// missing is visible in the log rather than in a socket that never answers.
+    fn start(&mut self, sink: Arc<RecordSink>, shutdown: Arc<Shutdown>) -> Result<(), Error> {
+        let _ = (sink, shutdown);
         Ok(())
     }
 
     /// Handle one command from the daemon.
     ///
-    /// The writer is the connection the command arrived on, so a backend can
-    /// report state changes (night mode) back to the daemon.
-    fn command(&mut self, command: Command<'_>, writer: &RecordWriter<'_>) -> Result<(), Error>;
+    /// The sink is the connection the command arrived on, so a backend can report
+    /// state changes (night mode) back to the daemon.
+    fn command(&mut self, command: Command<'_>, sink: &RecordSink) -> Result<(), Error>;
 
     /// Current night state: `(night, chosen manually)`.
     ///

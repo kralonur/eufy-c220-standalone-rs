@@ -400,6 +400,22 @@ impl MqttTask {
             )
             .await?;
 
+        // What the infrared is doing, as opposed to what it was told to do: in
+        // automatic mode the mode above stays `auto` all night, so a switch
+        // built on it would never light up.
+        let night_vision = telemetry
+            .split(r#""night_vision":{"active":"#)
+            .nth(1)
+            .is_some_and(|rest| rest.starts_with("true"));
+        client
+            .publish(
+                format!("{prefix}/night_vision/state"),
+                QoS::AtLeastOnce,
+                true,
+                if night_vision { "ON" } else { "OFF" },
+            )
+            .await?;
+
         client
             .publish(
                 format!("{prefix}/status/json"),
@@ -431,6 +447,13 @@ impl MqttTask {
                 "talkback",
                 format!(
                     r#"{{"name":"Talkback","state_topic":"{prefix}/talkback/state","command_topic":"{prefix}/talkback/set","payload_on":"ON","payload_off":"OFF",{device}}}"#
+                ),
+            ),
+            (
+                "switch",
+                "infrared",
+                format!(
+                    r#"{{"name":"Infrared","state_topic":"{prefix}/night_vision/state","command_topic":"{prefix}/night_mode/set","payload_on":"night","payload_off":"day",{device}}}"#
                 ),
             ),
             (

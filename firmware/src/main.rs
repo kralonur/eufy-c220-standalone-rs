@@ -409,6 +409,15 @@ fn run_media_loop(
                         rtsp.push_audio_record(&record)?;
                     }
                 }
+                Some(record) if record.kind == RecordKind::NightMode => {
+                    // The companion reports the IR hardware state whenever it
+                    // changes and once per connection. It is the only honest
+                    // source for it: in automatic mode the commanded mode stays
+                    // `auto` through the whole night.
+                    if let Some(night) = record.payload.first() {
+                        media_slot.set_night_vision(*night != 0);
+                    }
+                }
                 Some(_) => {}
                 None => break,
             }

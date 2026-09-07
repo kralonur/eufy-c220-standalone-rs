@@ -710,7 +710,10 @@ Home Assistant discovery is **opt-in**: the camera publishes its entities to
 `STANDALONE_MQTT_DISCOVERY=1` is set. Without that line the broker still gets
 telemetry and commands under the camera's own topic prefix, but Home Assistant
 has no entities to drive - so a dashboard control that does nothing is worth
-checking for this first.
+checking for this first. Discovery creates two night-vision entities: a *Night
+mode* select for `auto`/`night`/`day`, and an *Infrared* switch whose state is
+the LED itself - turning it on forces night, turning it off forces day, and
+`auto` is chosen from the select.
 
 ### The control API
 

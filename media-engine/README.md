@@ -112,11 +112,11 @@ on the camera: `readelf -l` must report **no `PT_TLS` segment**.
 | PTS counter, HEVC keyframe detection | Done |
 | Platform layer (sockets, signals, allocator, logging) | Done |
 | Engine process: entry stub, session loop, command handling, mock backend | Done |
-| Vendor bindings (Rockchip MPI, AIQ, SmartIR, FDK AAC) | Done, ABI-asserted |
+| Vendor bindings (Rockchip MPI, AIQ, SmartIR, FDK AAC) | Done, ABI-asserted against the factory engine |
 | Speaker path: amplifier pin, AO device, PCM and AAC talkback | Done, awaiting hardware |
 | Microphone path: AI + AENC, capture thread, G.711 records | Done, awaiting hardware |
 | V4L2 capture bindings | Not started |
-| Video, microphone, night-mode pipelines | Not started |
+| Video pipeline, night-mode monitor | Not started |
 
 The daemon-facing behavior already matches the reference engine: the private
 socket with mode `0600`, one session at a time, the night-mode greeting on
@@ -130,6 +130,53 @@ record produced while no daemon is connected is dropped rather than queued, whic
 is what the reference engine's `client_current() >= 0` check does, and the sink is
 detached before a session's socket closes so a late writer cannot reach a
 descriptor that has been reused.
+
+## Verification against the factory engine
+
+The camera's own media engine - `/home/c220-media-engine` in the preserved
+partition, the binary this project's reference C engine was modelled on - can be
+read instruction by instruction, and every device attribute the audio paths use
+was checked against it. They match exactly, which is as close to hardware
+verification as this port can get before it runs on the camera:
+
+| What | Factory engine | This engine |
+| --- | --- | --- |
+| AI attributes | channels 2, 8 kHz, 16-bit, mono, frames 4, 320 samples/frame, 2 channels, card name at offset 40 of 104 | identical |
+| AI channel parameters | frame depth 1, loopback none | identical |
+| AI track mode | 8 (`AUDIO_TRACK_FRONT_LEFT`) | identical |
+| AENC attributes | A-law `0x40000002`, 4 buffers, 16-bit, 1 channel, 8 kHz, 8 bits/sample, 64 kbit/s, depth 4 | identical |
+| AENC channels | 1 | identical |
+| AO attributes | channels 2, 8 kHz, 16-bit, mono, frames 4, 1024 samples/frame, 2 channels | identical |
+| AO resampler / track | 16 kHz, track 10 (`AUDIO_TRACK_OUT_STEREO`) | identical |
+| External block | pointer at 0, size at 24 as a 64-bit value, opaque at 36, 40 bytes | identical |
+| AAC decoder | `aacDecoder_Open(TT_MP4_ADTS, 1)`, 4096-sample output, 64 decode attempts | identical |
+| Rockit logging | `rt_log_level=0`, `rt_log_path=/tmp/c220-media-rockit.log` before `RK_MPI_SYS_Init` | identical |
+
+The same reading found two things this engine had been missing and now does: the
+`RK_MPI_SYS_Init()` call every MPI entry point depends on, and those two logging
+variables, which have to be set before the media system starts or Rockit chooses
+its own level and destination. `HDR_MODE=0` belongs to the same set and is set by
+the image path (`start_aiq`), because it selects which IQ files load - the factory
+sets it in the same place.
+
+## Library check
+
+Before writing infrastructure by hand, the state of published Rust support for
+this hardware was checked, and there is none that fits:
+
+* No crate binds Rockchip's MPI/rockit or the AIQ camera engine. The vendor
+  libraries are C only, so `vendor/` stays a hand-written FFI - now with the
+  factory's own usage as the ABI reference rather than the C engine alone.
+* `linux-raw-sys` is `no_std`-compatible but contains no V4L2 types at all
+  (no `v4l2_buffer`, no `VIDIOC_QBUF`).
+* `v4l` and `v4l2r` do exist and are maintained, but both are `std` crates that
+  generate bindings with `bindgen` at build time, which needs kernel headers and
+  libclang for a uClibc cross build and would put a `std`-shaped dependency in a
+  `no_std` binary.
+
+So the V4L2 structures for the capture path will be declared here, with the size
+and offset assertions the vendor bindings already use, exactly as the reference
+engine declares them.
 
 ## The factory application as a reference
 
@@ -176,6 +223,37 @@ The night path was tuned on hardware after the branch this crate was started fro
 * A rejected night or day sub-scene and a failing detector configuration are both
   logged. A rejected scene name otherwise looks like a bad night image rather
   than a rejected name.
+
+## Known differences from the reference engine
+
+These are deliberate, and each one is small enough that it can be reverted
+without touching anything around it:
+
+* **One session at a time.** The reference engine accepts in its own thread and
+  replaces a client that is still connected (`media_client_replaced=1`). Here the
+  session loop serves one daemon at a time and accepts the next after it ends, so
+  a daemon that connects twice without closing the first connection waits. The
+  firmware opens one connection and closes it on restart, so this only changes
+  behavior in a case the daemon does not produce.
+* **The AO device is disabled on shutdown.** The reference clears the queue,
+  disables the resampler and the channel, and leaves the device enabled; it never
+  imports `RK_MPI_AO_Disable`. This engine disables it as well, which is the
+  counterpart of the `RK_MPI_AO_Enable` that was called on the way up.
+* **The keyframe byte is read as a flag.** The reference compares it with `1` to
+  decide between PCM and AAC; the shared framing layer treats any non-zero byte as
+  true. The firmware writes `0` or `1`.
+* **A partial AAC fill resumes where it stopped.** When the decoder's internal
+  buffer cannot take a whole access unit, the reference feeds the access unit from
+  the start again, which duplicates what it already consumed; this engine keeps
+  the bytes the decoder reported as not yet copied, which is what FDK's
+  documentation asks for. With one access unit per record - what the daemon
+  sends - both behave identically.
+* **An empty night-mode record ends the session** in both engines; this engine
+  reads it the same way after a review pass found it had been treating it as
+  `auto`.
+* **Errors name the right cause.** Thread and mutex failures report the code the
+  pthread call returned rather than a stale `errno`, and a record header that is
+  malformed for a reason other than its magic says so in the log.
 
 ## Sub-stream: dropped
 

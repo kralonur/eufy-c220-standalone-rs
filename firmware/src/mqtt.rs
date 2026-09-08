@@ -442,66 +442,71 @@ impl MqttTask {
                 "binary_sensor",
                 "status",
                 format!(
-                    r#"{{"name":"Camera","state_topic":"{prefix}/availability","payload_on":"online","payload_off":"offline","device_class":"connectivity",{device}}}"#
+                    r#"{{"unique_id":"{prefix}_status","name":"Camera","state_topic":"{prefix}/availability","payload_on":"online","payload_off":"offline","device_class":"connectivity",{device}}}"#
                 ),
             ),
             (
                 "switch",
                 "talkback",
                 format!(
-                    r#"{{"name":"Talkback","state_topic":"{prefix}/talkback/state","command_topic":"{prefix}/talkback/set","payload_on":"ON","payload_off":"OFF",{device}}}"#
+                    r#"{{"unique_id":"{prefix}_talkback","name":"Talkback","state_topic":"{prefix}/talkback/state","command_topic":"{prefix}/talkback/set","payload_on":"ON","payload_off":"OFF",{device}}}"#
                 ),
             ),
             (
                 "switch",
                 "infrared",
                 format!(
-                    r#"{{"name":"Infrared","state_topic":"{prefix}/night_vision/state","command_topic":"{prefix}/night_mode/set","payload_on":"night","payload_off":"day",{device}}}"#
+                    r#"{{"unique_id":"{prefix}_infrared","name":"Infrared","state_topic":"{prefix}/night_vision/state","command_topic":"{prefix}/night_mode/set","payload_on":"night","payload_off":"day",{device}}}"#
                 ),
             ),
             (
                 "select",
                 "night_mode",
                 format!(
-                    r#"{{"name":"Night mode","state_topic":"{prefix}/night_mode/state","command_topic":"{prefix}/night_mode/set","options":["auto","night","day"],{device}}}"#
+                    r#"{{"unique_id":"{prefix}_night_mode","name":"Night mode","state_topic":"{prefix}/night_mode/state","command_topic":"{prefix}/night_mode/set","options":["auto","night","day"],{device}}}"#
                 ),
             ),
             (
                 "button",
                 "ptz_left",
                 format!(
-                    r#"{{"name":"PTZ left","command_topic":"{prefix}/ptz/set","payload_press":"left",{device}}}"#
+                    r#"{{"unique_id":"{prefix}_ptz_left","name":"PTZ left","command_topic":"{prefix}/ptz/set","payload_press":"left",{device}}}"#
                 ),
             ),
             (
                 "button",
                 "ptz_right",
                 format!(
-                    r#"{{"name":"PTZ right","command_topic":"{prefix}/ptz/set","payload_press":"right",{device}}}"#
+                    r#"{{"unique_id":"{prefix}_ptz_right","name":"PTZ right","command_topic":"{prefix}/ptz/set","payload_press":"right",{device}}}"#
                 ),
             ),
             (
                 "button",
                 "ptz_up",
                 format!(
-                    r#"{{"name":"PTZ up","command_topic":"{prefix}/ptz/set","payload_press":"up",{device}}}"#
+                    r#"{{"unique_id":"{prefix}_ptz_up","name":"PTZ up","command_topic":"{prefix}/ptz/set","payload_press":"up",{device}}}"#
                 ),
             ),
             (
                 "button",
                 "ptz_down",
                 format!(
-                    r#"{{"name":"PTZ down","command_topic":"{prefix}/ptz/set","payload_press":"down",{device}}}"#
+                    r#"{{"unique_id":"{prefix}_ptz_down","name":"PTZ down","command_topic":"{prefix}/ptz/set","payload_press":"down",{device}}}"#
                 ),
             ),
             (
                 "button",
                 "ptz_center",
                 format!(
-                    r#"{{"name":"PTZ center","command_topic":"{prefix}/ptz/center","payload_press":"center",{device}}}"#
+                    r#"{{"unique_id":"{prefix}_ptz_center","name":"PTZ center","command_topic":"{prefix}/ptz/center","payload_press":"center",{device}}}"#
                 ),
             ),
         ];
+        // `unique_id` is not optional in practice: Home Assistant registers an entity
+        // only when it has one, and a device is formed from registered entities, so
+        // without it the entities exist but no camera ever appears under the MQTT
+        // integration. The id has to stay stable across restarts, because it is what
+        // the registry keys on.
         for (component, object, payload) in entities {
             client
                 .publish(

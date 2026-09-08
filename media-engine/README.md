@@ -73,6 +73,26 @@ The camera target builds in the release profile, which aborts on panic. A
 armv7-unknown-linux-musleabihf` needs `--release` as well; the host build has no
 such requirement.
 
+## Bringing it up on the camera without flashing
+
+The engine can be validated on the real hardware without touching flash. The
+deployed `/home` is a read-only squashfs, so the working firmware cannot be
+modified from a shell, and `/tmp` is tmpfs: put the engine and the probe there,
+run them by hand, and a reboot restores everything.
+
+`examples/media_probe.rs` is the other half of that: a static musl binary that
+speaks the engine's socket, since the firmware is the engine's only real client
+and a second connection waits while the deployed firmware holds the session. It
+prints the greeting, counts what the engine produces per record kind (`drain` is
+the only way to see microphone records before the RTSP path can carry them),
+plays a tone or an ADTS file through the speaker, and drives volume and clear.
+It is built with the workspace's default target linker:
+
+```sh
+cargo build --release --target armv7-unknown-linux-musleabihf \
+    -p c220-media-engine --example media_probe
+```
+
 ## Running without a camera
 
 On a development host the same engine runs with the mock backend, which is

@@ -356,15 +356,18 @@ unsafe extern "C" {
     pub fn RK_MPI_AI_SetPubAttr(device: c_int, attributes: *const AudioAttributes) -> i32;
     pub fn RK_MPI_AI_Enable(device: c_int) -> i32;
     pub fn RK_MPI_AI_Disable(device: c_int) -> i32;
+    /// The parameter structure is written through, so it must be writable.
     pub fn RK_MPI_AI_SetChnParam(
         device: c_int,
         channel: c_int,
-        params: *const AudioInputChannelParams,
+        params: *mut AudioInputChannelParams,
     ) -> i32;
     pub fn RK_MPI_AI_EnableChn(device: c_int, channel: c_int) -> i32;
     pub fn RK_MPI_AI_DisableChn(device: c_int, channel: c_int) -> i32;
     pub fn RK_MPI_AI_SetTrackMode(device: c_int, mode: i32) -> i32;
-    pub fn RK_MPI_AENC_CreateChn(channel: c_int, attributes: *const AudioEncoderAttributes) -> i32;
+    /// The attributes are written through, so they must be writable - see
+    /// [`AudioEncoder::open`], which is where that was found.
+    pub fn RK_MPI_AENC_CreateChn(channel: c_int, attributes: *mut AudioEncoderAttributes) -> i32;
     pub fn RK_MPI_AENC_DestroyChn(channel: c_int) -> i32;
     pub fn RK_MPI_AENC_GetStream(channel: c_int, stream: *mut AudioStream, timeout_ms: i32) -> i32;
     pub fn RK_MPI_AENC_ReleaseStream(channel: c_int, stream: *mut AudioStream) -> i32;
@@ -702,6 +705,7 @@ impl AudioInput {
         params: &AudioInputChannelParams,
         track_mode: i32,
     ) -> Result<Self, Error> {
+        let mut params = *params;
         let mut input = Self {
             device,
             channel,
@@ -711,7 +715,7 @@ impl AudioInput {
         check(unsafe { RK_MPI_AI_SetPubAttr(device, attributes) })?;
         check(unsafe { RK_MPI_AI_Enable(device) })?;
         input.enabled = true;
-        check(unsafe { RK_MPI_AI_SetChnParam(device, channel, params) })?;
+        check(unsafe { RK_MPI_AI_SetChnParam(device, channel, &mut params) })?;
         check(unsafe { RK_MPI_AI_SetTrackMode(device, track_mode) })?;
         check(unsafe { RK_MPI_AI_EnableChn(device, channel) })?;
         input.channel_enabled = true;
@@ -749,8 +753,14 @@ pub struct AudioEncoder {
 
 impl AudioEncoder {
     /// Create an encoder channel with the given codec attributes.
+    ///
+    /// The attributes are copied onto the stack before the call, because the
+    /// vendor entry point is handed a pointer it may write through. The reference
+    /// engine passes a local structure for the same reason; handing it a `const`
+    /// in read-only memory is a fault rather than an error code.
     pub fn open(channel: c_int, attributes: &AudioEncoderAttributes) -> Result<Self, Error> {
-        check(unsafe { RK_MPI_AENC_CreateChn(channel, attributes) })?;
+        let mut attributes = *attributes;
+        check(unsafe { RK_MPI_AENC_CreateChn(channel, &mut attributes) })?;
         Ok(Self { channel })
     }
 

@@ -97,11 +97,30 @@ pub fn install(shutdown: &Shutdown) -> Result<(), Error> {
     install_handler(SIGTERM)?;
     install_handler(SIGINT)?;
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
+    // A process that dies of a fault on the camera leaves nothing behind - no
+    // debugger, no core that survives a reboot - so the last thing it does is say
+    // which signal it was. The handler restores the default disposition and
+    // re-raises, so the kernel still reports the fault the way it normally would.
+    for signal in FATAL_SIGNALS {
+        install_handler_with(signal, handle_fatal)?;
+    }
     Ok(())
 }
 
 /// The state the handler reaches, or null before [`install`].
 static HANDLER_STATE: AtomicPtr<Shutdown> = AtomicPtr::new(core::ptr::null_mut());
+
+/// Signals that end the process no matter what.
+const FATAL_SIGNALS: [c_int; 4] = [libc::SIGSEGV, libc::SIGBUS, libc::SIGILL, libc::SIGABRT];
+
+/// Log which signal killed the process, then die the way it would have.
+extern "C" fn handle_fatal(signal: c_int) {
+    crate::platform::media_log!("media_signal={signal}");
+    unsafe {
+        libc::signal(signal, libc::SIG_DFL);
+        libc::raise(signal);
+    }
+}
 
 extern "C" fn handle_stop(_signal: c_int) {
     let state = HANDLER_STATE.load(Ordering::SeqCst);
@@ -111,6 +130,14 @@ extern "C" fn handle_stop(_signal: c_int) {
         // touches atomics and calls `shutdown(2)`.
         unsafe { (*state).request() };
     }
+}
+
+fn install_handler_with(signal: c_int, handler: extern "C" fn(c_int)) -> Result<(), Error> {
+    let previous = unsafe { libc::signal(signal, handler as *const () as libc::sighandler_t) };
+    if previous == libc::SIG_ERR {
+        return Err(Error::last());
+    }
+    Ok(())
 }
 
 fn install_handler(signal: c_int) -> Result<(), Error> {

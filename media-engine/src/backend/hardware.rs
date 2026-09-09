@@ -330,7 +330,6 @@ impl Microphone {
                 channel: 0,
             },
         )?;
-
         media_log!(
             "media_audio_ready=pcma/8000/mono frame_samples={} card={}",
             AUDIO_FRAME_SAMPLES,
@@ -491,16 +490,11 @@ impl Backend for HardwareBackend {
 
         let mut failure = None;
 
-        match Speaker::open(&self.card) {
-            Ok(speaker) => self.speaker = Some(speaker),
-            Err(error) => {
-                media_log!("media_speaker_error={error}");
-                failure = Some(error);
-            }
-        }
-
+        // The capture path comes up first: the reference engine creates its audio
+        // thread (AI and AENC) before its speaker thread, and this board's codec
+        // initialization is order-sensitive.
         if self.capture_enabled {
-            match Microphone::open(&self.card, sink, shutdown) {
+            match Microphone::open(&self.card, Arc::clone(&sink), Arc::clone(&shutdown)) {
                 Ok(microphone) => self.microphone = Some(microphone),
                 Err(error) => {
                     media_log!("media_microphone_error={error}");
@@ -509,6 +503,14 @@ impl Backend for HardwareBackend {
             }
         } else {
             media_log!("media_audio_disabled=1");
+        }
+
+        match Speaker::open(&self.card) {
+            Ok(speaker) => self.speaker = Some(speaker),
+            Err(error) => {
+                media_log!("media_speaker_error={error}");
+                failure = Some(error);
+            }
         }
 
         match failure {

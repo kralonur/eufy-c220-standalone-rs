@@ -452,11 +452,15 @@ impl MqttTask {
                     r#"{{"unique_id":"{prefix}_talkback","name":"Talkback","state_topic":"{prefix}/talkback/state","command_topic":"{prefix}/talkback/set","payload_on":"ON","payload_off":"OFF",{device}}}"#
                 ),
             ),
+            // Home Assistant defaults `state_on`/`state_off` to the command payloads, so
+            // this switch would look for "night"/"day" on the state topic, ignore the
+            // ON/OFF the daemon publishes there, and sit at "unknown" forever. Spell out
+            // that the state payloads are ON/OFF while the commands stay night/day.
             (
                 "switch",
                 "infrared",
                 format!(
-                    r#"{{"unique_id":"{prefix}_infrared","name":"Infrared","state_topic":"{prefix}/night_vision/state","command_topic":"{prefix}/night_mode/set","payload_on":"night","payload_off":"day",{device}}}"#
+                    r#"{{"unique_id":"{prefix}_infrared","name":"Infrared","state_topic":"{prefix}/night_vision/state","command_topic":"{prefix}/night_mode/set","payload_on":"night","payload_off":"day","state_on":"ON","state_off":"OFF",{device}}}"#
                 ),
             ),
             (

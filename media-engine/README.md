@@ -244,6 +244,46 @@ The night path was tuned on hardware after the branch this crate was started fro
   logged. A rejected scene name otherwise looks like a bad night image rather
   than a rejected name.
 
+## Verified on the camera
+
+The audio half has now run on the hardware, driven by `examples/media_probe.rs`
+with the deployed supervisor stopped and everything in `/tmp` (see "Bringing it
+up on the camera without flashing"). What that established:
+
+| Path | Evidence |
+| --- | --- |
+| Media system startup | Rockit's own log shows it reading `rt_log_level` as 0, so `RK_MPI_SYS_Init` and the logging variables are doing their job and the media pipeline stays silent |
+| Microphone capture | 301 records in 6.1 seconds, every one 160 bytes: 49.2 a second, which is exactly 8 kHz G.711 mono |
+| Speaker, PCM talkback | 50 records played and accepted by the device, volume changes audible in the log, clear stops playback |
+| Greeting | the night-mode record arrives with the expected payload |
+
+Two bugs were found this way and one is still open:
+
+* **Found and fixed: the vendor writes through the structures it is given.**
+  `RK_MPI_AENC_CreateChn` was handed a pointer to a `const` in this crate's
+  read-only data, and the process died inside the call - with no log line, no
+  core and nothing in dmesg. The reference engine has always passed stack
+  structures. The attributes are now copied to a local and the two entry points
+  are declared `*mut`, which is what they are. Anything handed to a vendor call
+  from now on must be writable memory.
+* **Found and fixed: a fault used to be invisible.** Nothing survives to be read
+  afterwards - no core across a reboot, and the kernel's own message is
+  rate-limited away by the ISP driver's chatter - so the engine logs
+  `media_signal=<n>` for SIGSEGV, SIGBUS, SIGILL and SIGABRT and then re-raises
+  with the default disposition. That is what identified the bug below.
+* **Open: AAC talkback crashes while the microphone is capturing.** PCM talkback
+  is unaffected, the microphone alone is unaffected, and AAC alone is unaffected
+  (`--no-audio` ran six rounds clean). The fault is a SIGSEGV inside the AAC
+  handling, it needs the capture thread to be running, and it is timing
+  sensitive: adding log lines inside `Speaker::play_aac` makes it disappear. It
+  is this engine's bug rather than a platform limit - the deployed C engine
+  played 144 AAC access units with the microphone capturing and never restarted.
+  Ruled out already: the decoded block living on the stack rather than the heap,
+  and the engine running on the process's first thread rather than a pthread.
+  The remaining difference from the reference in that path is how
+  `aacDecoder_Fill` is fed - the reference re-feeds the same buffer with a
+  reduced size while this advances the slice - which is the next thing to try.
+
 ## Known differences from the reference engine
 
 These are deliberate, and each one is small enough that it can be reverted

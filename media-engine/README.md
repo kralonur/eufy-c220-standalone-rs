@@ -135,8 +135,9 @@ on the camera: `readelf -l` must report **no `PT_TLS` segment**.
 | Vendor bindings (Rockchip MPI, AIQ, SmartIR, FDK AAC) | Done, ABI-asserted against the factory engine |
 | Speaker path: amplifier pin, AO device, PCM and AAC talkback | Done, awaiting hardware |
 | Microphone path: AI + AENC, capture thread, G.711 records | Done, awaiting hardware |
-| V4L2 capture bindings | Not started |
-| Video pipeline, night-mode monitor | Not started |
+| V4L2 capture interface, at the camera's 32-bit ABI | Done |
+| Video path: MMZ input buffer, VENC channel, capture thread | Done, awaiting hardware |
+| Image path (AIQ), night-mode monitor | Not started |
 
 The daemon-facing behavior already matches the reference engine: the private
 socket with mode `0600`, one session at a time, the night-mode greeting on
@@ -150,6 +151,40 @@ record produced while no daemon is connected is dropped rather than queued, whic
 is what the reference engine's `client_current() >= 0` check does, and the sink is
 detached before a session's socket closes so a late writer cannot reach a
 descriptor that has been reused.
+
+## The video path
+
+One caller-supplied buffer is queued to `/dev/video12`, each frame the ISP fills
+is handed to the encoder in place, and the access unit that comes back becomes a
+video record. Three things about it are not obvious:
+
+* **The frame rate is the rate the sensor really delivers** - about 15.17 fps,
+  measured, unchanged whether 20 or 30 fps is requested. Constant-bitrate mode
+  divides the budget by the declared frame rate, so declaring 20 fps starves every
+  frame of bits: 12.5 KB per frame is 1545 kbps, not the configured 2048. The
+  capture node is asked for the configured rate anyway, and both the interval it
+  reports and the one it settles on are logged.
+* **Cache maintenance is part of the data path.** The ISP writes the frame past
+  the CPU cache and the encoder writes the packs the same way, so the input buffer
+  is written back before the encoder reads it and each pack is invalidated before
+  the engine copies it into an access unit.
+* **The encoder reports no keyframe flag**, so one is decided in software by
+  scanning the access unit for an IRAP NAL type - [`crate::keyframe`], ported
+  with the original's exact scan bounds.
+
+The V4L2 declarations live in `platform::v4l2` and are the camera's 32-bit ABI,
+not the host's: a request number encodes `sizeof(struct)` in its bits and
+`struct v4l2_buffer` contains an `unsigned long`, so an engine built with a
+64-bit host's numbers fails every ioctl with `ENOTTY` on the board. The numbers
+and layouts were read out of the same headers and the same
+`arm-linux-musleabihf` target the reference engine compiles with, and are held
+by compile-time assertions; reading those offsets back caught three mistakes in
+the first draft that no host test could have.
+
+What is still missing is the image path: the reference engine starts AIQ (the ISP
+tuning, SmartIR and the IR-cut) right before it queues the buffers. Capture and
+encoding do not depend on it, but the picture stays untuned until it lands, and
+`backend::video` marks the spot where it goes.
 
 ## Verification against the factory engine
 

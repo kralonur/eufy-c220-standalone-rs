@@ -18,9 +18,9 @@ extern crate alloc;
 mod camera {
     //! The camera runtime: entry stub, allocator and panic handler.
 
-    #[cfg(feature = "hardware")]
-    use c220_media_engine::backend::HardwareBackend;
     use c220_media_engine::backend::MockBackend;
+    #[cfg(feature = "hardware")]
+    use c220_media_engine::backend::{HardwareBackend, VideoConfig};
     use c220_media_engine::cli::{self, ConfigError};
     use c220_media_engine::{platform, run};
     use core::ffi::{CStr, c_char};
@@ -87,8 +87,13 @@ mod camera {
         // devices while still letting the daemon talk to it.
         #[cfg(feature = "hardware")]
         if !config.mock_backend {
+            let video = VideoConfig::new(
+                &config.video_device,
+                u32::try_from(config.video_fps).unwrap_or(1),
+                u32::try_from(config.video_bitrate_kbps).unwrap_or(1),
+            );
             let mut backend =
-                HardwareBackend::new(&config.audio_card, config.audio_capture_enabled);
+                HardwareBackend::new(&config.audio_card, config.audio_capture_enabled, video);
             let result = run(config, &mut backend);
             return match result {
                 Ok(()) => 0,

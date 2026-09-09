@@ -402,6 +402,12 @@ pub struct MmzBuffer {
     length: usize,
 }
 
+// SAFETY: the block is a vendor handle and the mapping behind it, and neither is
+// bound to a thread: the vendor memory allocator is shared by the whole process,
+// and moving the value is what keeps the block used by one thread at a time. The
+// video path relies on this to hand its input buffer to the capture thread.
+unsafe impl Send for MmzBuffer {}
+
 impl MmzBuffer {
     /// Allocate `length` bytes of vendor memory.
     pub fn allocate(length: usize) -> Result<Self, Error> {

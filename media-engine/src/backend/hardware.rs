@@ -21,6 +21,7 @@
 //! * A malformed or undecodable block is logged and dropped, and the session
 //!   continues: the daemon is not told, exactly as the reference engine does it.
 
+use super::video::{VideoConfig, VideoPipeline};
 use super::{Backend, NightState};
 use crate::client::RecordSink;
 use crate::commands::{Command, MAX_PCM_PAYLOAD, MAX_VOLUME};
@@ -432,8 +433,10 @@ fn copy_card_name(field: &mut [u8; MAX_AUDIO_CARD_NAME], card: &str) {
 /// emulation tests use.
 pub struct HardwareBackend {
     card: String,
+    video: VideoConfig,
     speaker: Option<Speaker>,
     microphone: Option<Microphone>,
+    video_pipeline: Option<VideoPipeline>,
     capture_enabled: bool,
     night: NightState,
 }
@@ -444,11 +447,13 @@ impl HardwareBackend {
     /// `capture_enabled` is the daemon's microphone preference; when it is false
     /// the capture device is never opened, which is what the reference engine's
     /// `--no-audio` does.
-    pub fn new(card: &str, capture_enabled: bool) -> Self {
+    pub fn new(card: &str, capture_enabled: bool, video: VideoConfig) -> Self {
         Self {
             card: String::from(card),
+            video,
             speaker: None,
             microphone: None,
+            video_pipeline: None,
             capture_enabled,
             night: NightState::new(),
         }
@@ -500,7 +505,7 @@ impl Backend for HardwareBackend {
         }
 
         if self.capture_enabled {
-            match Microphone::open(&self.card, sink, shutdown) {
+            match Microphone::open(&self.card, Arc::clone(&sink), Arc::clone(&shutdown)) {
                 Ok(microphone) => self.microphone = Some(microphone),
                 Err(error) => {
                     media_log!("media_microphone_error={error}");
@@ -509,6 +514,14 @@ impl Backend for HardwareBackend {
             }
         } else {
             media_log!("media_audio_disabled=1");
+        }
+
+        match VideoPipeline::open(&self.video, Arc::clone(&sink), Arc::clone(&shutdown)) {
+            Ok(pipeline) => self.video_pipeline = Some(pipeline),
+            Err(error) => {
+                media_log!("media_video_error={error}");
+                failure = Some(error);
+            }
         }
 
         match failure {
@@ -564,9 +577,11 @@ impl Backend for HardwareBackend {
         // Dropping the speaker clears the queue, disables the resampler, the
         // channel and the device, and drives the amplifier low; dropping the
         // microphone joins its thread, which releases the capture device and its
-        // encoder.
+        // encoder; dropping the video pipeline joins the capture thread, which
+        // stops the capture node and destroys the encoder channel.
         self.microphone = None;
         self.speaker = None;
-        media_log!("media_audio_stopped=1");
+        self.video_pipeline = None;
+        media_log!("media_devices_stopped=1");
     }
 }

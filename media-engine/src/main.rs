@@ -92,8 +92,18 @@ mod camera {
                 u32::try_from(config.video_fps).unwrap_or(1),
                 u32::try_from(config.video_bitrate_kbps).unwrap_or(1),
             );
-            let mut backend =
-                HardwareBackend::new(&config.audio_card, config.audio_capture_enabled, video);
+            let mut backend = match HardwareBackend::new(
+                &config.audio_card,
+                config.audio_capture_enabled,
+                video,
+                &config.iq_directory,
+            ) {
+                Ok(backend) => backend,
+                Err(error) => {
+                    platform::log(format_args!("media_engine_error={error}"));
+                    return 1;
+                }
+            };
             let result = run(config, &mut backend);
             return match result {
                 Ok(()) => 0,

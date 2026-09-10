@@ -21,12 +21,14 @@
 //! * A malformed or undecodable block is logged and dropped, and the session
 //!   continues: the daemon is not told, exactly as the reference engine does it.
 
+use super::image::{ImagePath, NightMonitor};
 use super::video::{VideoConfig, VideoPipeline};
 use super::{Backend, NightState};
 use crate::client::RecordSink;
 use crate::commands::{Command, MAX_PCM_PAYLOAD, MAX_VOLUME};
 use crate::gpio::OutputPin;
 use crate::platform::signal::Shutdown;
+use crate::platform::sync::Mutex;
 use crate::platform::thread::{self, Thread};
 use crate::platform::{Error, media_log};
 use crate::pts::Counter;
@@ -433,11 +435,15 @@ fn copy_card_name(field: &mut [u8; MAX_AUDIO_CARD_NAME], card: &str) {
 pub struct HardwareBackend {
     card: String,
     video: VideoConfig,
+    iq_directory: String,
     speaker: Option<Speaker>,
     microphone: Option<Microphone>,
     video_pipeline: Option<VideoPipeline>,
+    image: Option<NightMonitor>,
     capture_enabled: bool,
-    night: NightState,
+    /// The night state the daemon is told about, shared with the monitor thread
+    /// that owns the IR-cut, the IR LED and the ISP scene.
+    night: Arc<Mutex<NightState>>,
 }
 
 impl HardwareBackend {
@@ -446,16 +452,23 @@ impl HardwareBackend {
     /// `capture_enabled` is the daemon's microphone preference; when it is false
     /// the capture device is never opened, which is what the reference engine's
     /// `--no-audio` does.
-    pub fn new(card: &str, capture_enabled: bool, video: VideoConfig) -> Self {
-        Self {
+    pub fn new(
+        card: &str,
+        capture_enabled: bool,
+        video: VideoConfig,
+        iq_directory: &str,
+    ) -> Result<Self, Error> {
+        Ok(Self {
             card: String::from(card),
             video,
+            iq_directory: String::from(iq_directory),
             speaker: None,
             microphone: None,
             video_pipeline: None,
+            image: None,
             capture_enabled,
-            night: NightState::new(),
-        }
+            night: Arc::new(Mutex::new(NightState::new())?),
+        })
     }
 }
 
@@ -494,6 +507,28 @@ impl Backend for HardwareBackend {
         }
 
         let mut failure = None;
+
+        // The image path starts before the capture buffers are queued: it is what
+        // programs the ISP that fills them, and AIQ reads its tuning files as it
+        // initializes.
+        match ImagePath::open(&self.iq_directory) {
+            Ok(image) => match NightMonitor::start(
+                image,
+                Arc::clone(&sink),
+                Arc::clone(&shutdown),
+                Arc::clone(&self.night),
+            ) {
+                Ok(monitor) => self.image = Some(monitor),
+                Err(error) => {
+                    media_log!("media_night_monitor_error={error}");
+                    failure = Some(error);
+                }
+            },
+            Err(error) => {
+                media_log!("media_aiq_error={error}");
+                failure = Some(error);
+            }
+        }
 
         // The devices come up in the order the reference engine's threads are
         // created: the capture path, then the microphone, then the speaker. The
@@ -534,7 +569,10 @@ impl Backend for HardwareBackend {
         }
     }
 
-    fn command(&mut self, command: Command<'_>, sink: &RecordSink) -> Result<(), Error> {
+    fn command(&mut self, command: Command<'_>, _sink: &RecordSink) -> Result<(), Error> {
+        // The sink is part of the backend contract, but this backend reports night
+        // changes from the monitor thread, which owns the hardware and knows when
+        // one actually happened.
         match command {
             Command::SpeakerClear => match self.speaker.as_mut() {
                 Some(speaker) => {
@@ -562,10 +600,14 @@ impl Backend for HardwareBackend {
                 None => media_log!("media_speaker_unavailable=1"),
             },
             Command::NightMode { target } => {
-                if let Some(night) = self.night.apply(target) {
-                    media_log!("media_night_mode_switch={}", u8::from(night));
-                    let (night, manual) = self.night.reported();
-                    sink.send_night_mode(night, manual)?;
+                // The command records what was asked for; the monitor thread owns
+                // the hardware and applies it on its next tick, which keeps the
+                // IR-cut, the IR LED and the AIQ scene under one thread.
+                match self.night.lock() {
+                    Ok(mut state) => {
+                        state.apply(target);
+                    }
+                    Err(error) => media_log!("media_night_state_error={error}"),
                 }
                 media_log!("media_night_mode_set={}", target.name());
             }
@@ -574,7 +616,12 @@ impl Backend for HardwareBackend {
     }
 
     fn night_mode(&self) -> (bool, bool) {
-        self.night.reported()
+        match self.night.lock() {
+            Ok(state) => state.reported(),
+            // A poisoned lock means the monitor thread died; report what the
+            // daemon was last told rather than inventing a state.
+            Err(_) => (false, false),
+        }
     }
 
     fn shutdown(&mut self) {
@@ -583,6 +630,9 @@ impl Backend for HardwareBackend {
         // microphone joins its thread, which releases the capture device and its
         // encoder; dropping the video pipeline joins the capture thread, which
         // stops the capture node and destroys the encoder channel.
+        // The night monitor first: it is what releases the ISP tuning context, and
+        // the reference engine joins its night thread before the rest too.
+        self.image = None;
         self.microphone = None;
         self.speaker = None;
         self.video_pipeline = None;

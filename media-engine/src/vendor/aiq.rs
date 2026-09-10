@@ -5,6 +5,7 @@
 //! the reference engine then turns into the IR-cut and IR-LED state changes.
 
 use crate::platform::Error;
+use alloc::sync::Arc;
 use core::ffi::{c_char, c_int, c_void};
 use core::marker::PhantomData;
 use core::mem::size_of;
@@ -206,6 +207,13 @@ impl Aiq {
     }
 }
 
+// SAFETY: the context is a vendor handle used through `&self` (`switch_scene` and
+// `statistics`) or `&mut self` (`prepare` and `start`, which run before it is ever
+// shared). The engine hands it to the night monitor and keeps no other user: the
+// capture thread only created it, so at most one thread calls into it at a time.
+unsafe impl Send for Aiq {}
+unsafe impl Sync for Aiq {}
+
 impl Drop for Aiq {
     fn drop(&mut self) {
         if self.started {
@@ -245,31 +253,44 @@ impl Drop for Statistics<'_> {
 }
 
 /// The night detector AIQ ships with.
-pub struct SmartIr<'a> {
+///
+/// It holds its share of the tuning context rather than borrowing it, because the
+/// thread that reads the statistics is not the thread that started the ISP.
+pub struct SmartIr {
     context: *mut SmartIrContext,
-    owner: PhantomData<&'a Aiq>,
+    aiq: Arc<Aiq>,
 }
 
-impl<'a> SmartIr<'a> {
+// SAFETY: as for `Aiq`: the detector is used by the night monitor alone, and the
+// context it keeps alive is the one the library attached it to.
+unsafe impl Send for SmartIr {}
+
+impl SmartIr {
     /// Attach the detector to an open AIQ context.
     ///
     /// `Ok(None)` means the library had no detector for this sensor, which the
     /// reference engine treats as "no automatic night mode" rather than a
     /// failure to start.
-    pub fn open(aiq: &'a Aiq) -> Result<Option<Self>, Error> {
+    pub fn open(aiq: Arc<Aiq>) -> Result<Option<Self>, Error> {
         let context = unsafe { rk_smart_ir_init(aiq.context) };
         if context.is_null() {
             return Ok(None);
         }
-        Ok(Some(Self {
-            context,
-            owner: PhantomData,
-        }))
+        Ok(Some(Self { context, aiq }))
+    }
+
+    /// The tuning context this detector reads statistics from.
+    pub fn tuning(&self) -> &Aiq {
+        &self.aiq
     }
 
     /// Decide whether the scene in `statistics` is dark enough for night mode.
-    pub fn is_night(&mut self, statistics: &Statistics<'_>) -> Result<bool, Error> {
-        let mut is_night: c_int = 0;
+    ///
+    /// `current` is the mode the hardware is in, which the library takes as its
+    /// starting opinion - the reference engine seeds it from its own night state
+    /// for the same reason.
+    pub fn is_night(&mut self, statistics: &Statistics<'_>, current: bool) -> Result<bool, Error> {
+        let mut is_night: c_int = current as c_int;
         super::check(unsafe {
             rk_smart_ir_runOnce(self.context, statistics.pointer(), &mut is_night)
         })?;
@@ -285,13 +306,13 @@ impl<'a> SmartIr<'a> {
     }
 }
 
-impl Drop for SmartIr<'_> {
+impl Drop for SmartIr {
     fn drop(&mut self) {
         unsafe { rk_smart_ir_deInit(self.context) };
     }
 }
 
-impl core::fmt::Debug for SmartIr<'_> {
+impl core::fmt::Debug for SmartIr {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         formatter.write_str("SmartIr")
     }

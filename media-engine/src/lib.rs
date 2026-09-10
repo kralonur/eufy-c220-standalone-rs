@@ -24,11 +24,11 @@
 //!
 //! [`engine`] owns the private socket and the daemon session loop, [`commands`]
 //! holds the daemon command rules, [`client`] is the record I/O around them, and
-//! [`backend`] is the device side: the mock backend here, the vendor bindings
-//! ([`vendor`], which exists only for the camera target) next. [`platform`] is
-//! the small POSIX layer the rest is built on, and
-//! [`cli`], [`keyframe`] and [`pts`] are the ported pieces of the reference
-//! engine that need no hardware.
+//! [`backend`] is the device side: the mock backend here, and on the camera the
+//! audio devices and the video capture path, over the vendor bindings
+//! ([`vendor`], which exists only for the camera target). [`platform`] is the
+//! small POSIX and V4L2 layer the rest is built on, and [`cli`], [`keyframe`] and
+//! [`pts`] are the ported pieces of the reference engine that need no device.
 
 #![cfg_attr(not(test), no_std)]
 

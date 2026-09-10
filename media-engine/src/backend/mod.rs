@@ -14,10 +14,14 @@ use alloc::sync::Arc;
 #[cfg(all(target_arch = "arm", feature = "hardware"))]
 mod hardware;
 mod mock;
+#[cfg(all(target_arch = "arm", feature = "hardware"))]
+mod video;
 
 #[cfg(all(target_arch = "arm", feature = "hardware"))]
 pub use hardware::HardwareBackend;
 pub use mock::MockBackend;
+#[cfg(all(target_arch = "arm", feature = "hardware"))]
+pub use video::{VideoConfig, VideoPipeline};
 
 /// The device side of the engine.
 pub trait Backend {

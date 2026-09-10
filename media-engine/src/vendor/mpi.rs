@@ -345,11 +345,14 @@ unsafe extern "C" {
     fn RK_MPI_MB_ReleaseMB(block: Block) -> i32;
     pub fn RK_MPI_SYS_Bind(source: *const Channel, destination: *const Channel) -> i32;
 
-    fn RK_MPI_VENC_CreateChn(channel: c_int, attributes: *const ChannelAttributes) -> i32;
+    /// The attributes are written through, so they must be writable.
+    fn RK_MPI_VENC_CreateChn(channel: c_int, attributes: *mut ChannelAttributes) -> i32;
     fn RK_MPI_VENC_DestroyChn(channel: c_int) -> i32;
-    fn RK_MPI_VENC_StartRecvFrame(channel: c_int, params: *const ReceivePictureParams) -> i32;
+    /// The parameters are written through, so they must be writable.
+    fn RK_MPI_VENC_StartRecvFrame(channel: c_int, params: *mut ReceivePictureParams) -> i32;
     fn RK_MPI_VENC_StopRecvFrame(channel: c_int) -> i32;
-    fn RK_MPI_VENC_SendFrame(channel: c_int, frame: *const VideoFrameInfo, timeout_ms: i32) -> i32;
+    /// The frame description is written through, so it must be writable.
+    fn RK_MPI_VENC_SendFrame(channel: c_int, frame: *mut VideoFrameInfo, timeout_ms: i32) -> i32;
     fn RK_MPI_VENC_GetStream(channel: c_int, stream: *mut EncodedStream, timeout_ms: i32) -> i32;
     fn RK_MPI_VENC_ReleaseStream(channel: c_int, stream: *mut EncodedStream) -> i32;
 
@@ -404,6 +407,12 @@ pub struct MmzBuffer {
     pointer: *mut u8,
     length: usize,
 }
+
+// SAFETY: the block is a vendor handle and the mapping behind it, and neither is
+// bound to a thread: the vendor memory allocator is shared by the whole process,
+// and moving the value is what keeps the block used by one thread at a time. The
+// video path relies on this to hand its input buffer to the capture thread.
+unsafe impl Send for MmzBuffer {}
 
 impl MmzBuffer {
     /// Allocate `length` bytes of vendor memory.
@@ -900,8 +909,13 @@ pub struct EncoderChannel {
 
 impl EncoderChannel {
     /// Create a channel with the given attributes.
+    ///
+    /// Like the audio devices, the attributes are copied onto the stack first:
+    /// the vendor entry points write through the structures they are handed, and
+    /// read-only memory is a fault rather than an error code.
     pub fn create(channel: c_int, attributes: &ChannelAttributes) -> Result<Self, Error> {
-        check(unsafe { RK_MPI_VENC_CreateChn(channel, attributes) })?;
+        let mut attributes = *attributes;
+        check(unsafe { RK_MPI_VENC_CreateChn(channel, &mut attributes) })?;
         let mut value = Self {
             channel,
             created: true,
@@ -915,17 +929,20 @@ impl EncoderChannel {
 
     /// Ask the channel to encode frames until it is stopped.
     pub fn start_receiving(&mut self) -> Result<(), Error> {
-        let params = ReceivePictureParams {
+        let mut params = ReceivePictureParams {
             receive_picture_count: -1,
         };
-        check(unsafe { RK_MPI_VENC_StartRecvFrame(self.channel, &params) })?;
+        check(unsafe { RK_MPI_VENC_StartRecvFrame(self.channel, &mut params) })?;
         self.receiving = true;
         Ok(())
     }
 
     /// Encode one captured frame.
+    ///
+    /// The description is copied for the same reason the attributes are.
     pub fn send_frame(&mut self, frame: &VideoFrameInfo, timeout_ms: i32) -> Result<(), Error> {
-        check(unsafe { RK_MPI_VENC_SendFrame(self.channel, frame, timeout_ms) })
+        let mut frame = *frame;
+        check(unsafe { RK_MPI_VENC_SendFrame(self.channel, &mut frame, timeout_ms) })
     }
 
     /// Collect the encoded output for one frame.

@@ -135,8 +135,8 @@ on the camera: `readelf -l` must report **no `PT_TLS` segment**.
 | Vendor bindings (Rockchip MPI, AIQ, SmartIR, FDK AAC) | Done, ABI-asserted against the factory engine |
 | Speaker path: amplifier pin, AO device, PCM and AAC talkback | Done, awaiting hardware |
 | Microphone path: AI + AENC, capture thread, G.711 records | Done, awaiting hardware |
-| V4L2 capture interface, at the camera's 32-bit ABI | Done |
-| Video path: MMZ input buffer, VENC channel, capture thread | Done, awaiting hardware |
+| V4L2 capture interface, at the camera's 32-bit ABI | Done, verified on the camera |
+| Video path: MMZ input buffer, VENC channel, capture thread | Done, verified on the camera |
 | Image path (AIQ), night-mode monitor | Not started |
 
 The daemon-facing behavior already matches the reference engine: the private
@@ -183,7 +183,9 @@ the first draft that no host test could have.
 
 What is still missing is the image path: the reference engine starts AIQ (the ISP
 tuning, SmartIR and the IR-cut) right before it queues the buffers. Capture and
-encoding do not depend on it, but the picture stays untuned until it lands, and
+encoding do not depend on it - both were verified on the camera without it, and
+the encoded bitrate is high enough that the frames carry real detail rather than
+a flat image - but the picture stays untuned until it lands, and
 `backend::video` marks the spot where it goes.
 
 ## Verification against the factory engine
@@ -291,6 +293,8 @@ up on the camera without flashing"). What that established:
 | Microphone capture | 301 records in 6.1 seconds, every one 160 bytes: 49.2 a second, which is exactly 8 kHz G.711 mono |
 | Speaker, PCM talkback | 50 records played and accepted by the device, volume changes audible in the log, clear stops playback |
 | Greeting | the night-mode record arrives with the expected payload |
+| Video capture and encode | 183 records in 12 seconds (15.2 a second, the rate the sensor delivers), 4.46 MB over 300 frames, and exactly 6 keyframes - one per two-second GOP. The capture loop counted no empty polls, no short frames and no send or stream errors |
+| Both paths at once | video records and microphone records arriving together, with talkback commands answered and the engine still running at the end |
 
 Two bugs were found this way and one is still open:
 

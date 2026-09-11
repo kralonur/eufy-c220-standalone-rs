@@ -22,7 +22,7 @@
 //!   continues: the daemon is not told, exactly as the reference engine does it.
 
 use super::image::{ImagePath, NightMonitor};
-use super::video::{VideoConfig, VideoPipeline};
+use super::video::{VideoConfig, VideoPipeline, VideoPrepared};
 use super::{Backend, NightState};
 use crate::client::RecordSink;
 use crate::commands::{Command, MAX_PCM_PAYLOAD, MAX_VOLUME};
@@ -508,7 +508,20 @@ impl Backend for HardwareBackend {
 
         let mut failure = None;
 
-        // The image path starts before the capture buffers are queued: it is what
+        // The capture buffer is taken from the media memory heap first, because
+        // the ISP takes its own buffers as soon as AIQ starts and the heap has to
+        // still have room for a full frame - the reference engine allocates it in
+        // `main` for the same reason.
+        let prepared: Option<VideoPrepared> = match super::video::prepare(&self.video) {
+            Ok(prepared) => Some(prepared),
+            Err(error) => {
+                media_log!("media_video_prepare_error={error}");
+                failure = Some(error);
+                None
+            }
+        };
+
+        // Then the image path, before the capture buffers are queued: it is what
         // programs the ISP that fills them, and AIQ reads its tuning files as it
         // initializes.
         match ImagePath::open(&self.iq_directory) {
@@ -535,11 +548,18 @@ impl Backend for HardwareBackend {
         // board's audio codec is sensitive to the last two - the capture path has
         // to own the card before playback opens it - and the video path starts
         // first because it is what brings the sensor and the encoder up.
-        match VideoPipeline::open(&self.video, Arc::clone(&sink), Arc::clone(&shutdown)) {
-            Ok(pipeline) => self.video_pipeline = Some(pipeline),
-            Err(error) => {
-                media_log!("media_video_error={error}");
-                failure = Some(error);
+        if let Some(prepared) = prepared {
+            match VideoPipeline::open(
+                &self.video,
+                prepared,
+                Arc::clone(&sink),
+                Arc::clone(&shutdown),
+            ) {
+                Ok(pipeline) => self.video_pipeline = Some(pipeline),
+                Err(error) => {
+                    media_log!("media_video_error={error}");
+                    failure = Some(error);
+                }
             }
         }
 

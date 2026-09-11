@@ -294,6 +294,8 @@ up on the camera without flashing"). What that established:
 | Speaker, PCM talkback | 50 records played and accepted by the device, volume changes audible in the log, clear stops playback |
 | Greeting | the night-mode record arrives with the expected payload |
 | Video capture and encode | 183 records in 12 seconds (15.2 a second, the rate the sensor delivers), 4.46 MB over 300 frames, and exactly 6 keyframes - one per two-second GOP. The capture loop counted no empty polls, no short frames and no send or stream errors |
+| Image path (AIQ) | the sensor enumerates as `m00_b_os03b10 4-003c`, SmartIR comes up with the factory thresholds, and the ISP decided night by itself: five samples at the 1 Hz poll, then `media_night_mode_switch=1`, the IR LED on, the IR-cut coils released after their pulse, and a greeting reporting night as the engine's own decision rather than a command |
+| Silent while idle | the amplifier pin stayed low through all of it in both runs: opening the speaker device does not make a sound, only playing does |
 | Both paths at once | video records and microphone records arriving together, with talkback commands answered and the engine still running at the end |
 
 Two bugs were found this way and one is still open:

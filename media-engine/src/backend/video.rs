@@ -173,6 +173,71 @@ struct Pipeline {
     channel: EncoderChannel,
 }
 
+/// Everything the capture path takes from the media heap before the ISP starts.
+///
+/// The reference engine does all of this in `main` and before `start_aiq`: open
+/// the capture node, allocate the input frame, create the encoder channel and tell
+/// it to receive.
+///
+/// The order is not cosmetic. Once AIQ is running and holding its own buffers, the
+/// heap has nothing left for a full frame, so the allocation fails; creating the
+/// encoder channel at that point takes the process down with it, which is what the
+/// camera showed: silence in the log, no signal, the vendor library exiting.
+/// Preparing first is what makes the difference.
+pub struct VideoPrepared {
+    device: CaptureDevice,
+    input: MmzBuffer,
+    channel: EncoderChannel,
+}
+
+/// Open the capture node, take the input frame and create the encoder channel.
+pub fn prepare(config: &VideoConfig) -> Result<VideoPrepared, Error> {
+    let device = CaptureDevice::open(&config.device).inspect_err(|error| {
+        media_log!("media_video_open_error={error}");
+    })?;
+
+    let capability = device.capabilities().inspect_err(|error| {
+        media_log!("media_video_querycap_error={error}");
+    })?;
+    let caps = capability.effective_capabilities();
+    if caps & v4l2::CAP_VIDEO_CAPTURE_MPLANE == 0 || caps & v4l2::CAP_STREAMING == 0 {
+        media_log!("media_video_caps=0x{caps:08x}");
+        return Err(Error::from_errno(libc::EINVAL));
+    }
+
+    let format = device.format().inspect_err(|error| {
+        media_log!("media_video_g_fmt_error={error}");
+    })?;
+    // SAFETY: the capture queue's format member is the multi-planar one.
+    let pix_mp = unsafe { format.pix_mp() };
+    if pix_mp.width != WIDTH
+        || pix_mp.height != HEIGHT
+        || pix_mp.pixel_format != v4l2::PIX_FMT_NV12
+        || pix_mp.num_planes != 1
+    {
+        media_log!("media_video_format_unsupported=1");
+        return Err(Error::from_errno(libc::EINVAL));
+    }
+
+    let input = MmzBuffer::allocate(FRAME_SIZE).inspect_err(|error| {
+        media_log!("media_video_mmz_error={error}");
+    })?;
+
+    let channel = EncoderChannel::create(
+        VENC_CHANNEL,
+        &encoder_attributes(config.fps, config.bitrate_kbps),
+    )
+    .inspect_err(|error| {
+        media_log!("media_venc_error={error}");
+    })?;
+
+    Ok(VideoPrepared {
+        device,
+        input,
+        channel,
+    })
+}
+
 /// The camera's video path: the capture thread and everything it owns.
 pub struct VideoPipeline {
     thread: Thread,
@@ -187,10 +252,11 @@ impl VideoPipeline {
     /// the order the reference engine releases them in.
     pub fn open(
         config: &VideoConfig,
+        prepared: VideoPrepared,
         sink: Arc<RecordSink>,
         shutdown: Arc<Shutdown>,
     ) -> Result<Self, Error> {
-        let pipeline = open_pipeline(config)?;
+        let pipeline = open_pipeline(prepared, config.fps)?;
 
         media_log!(
             "media_video_ready=h265 {}x{} fps={} bitrate={}",
@@ -225,51 +291,17 @@ impl Drop for VideoPipeline {
     }
 }
 
-/// Open the capture node, allocate the input buffer and create the encoder.
-fn open_pipeline(config: &VideoConfig) -> Result<Pipeline, Error> {
-    let mut device = CaptureDevice::open(&config.device).inspect_err(|error| {
-        media_log!("media_video_open_error={error}");
-    })?;
-
-    let capability = device.capabilities().inspect_err(|error| {
-        media_log!("media_video_querycap_error={error}");
-    })?;
-    let caps = capability.effective_capabilities();
-    if caps & v4l2::CAP_VIDEO_CAPTURE_MPLANE == 0 || caps & v4l2::CAP_STREAMING == 0 {
-        media_log!("media_video_caps=0x{caps:08x}");
-        return Err(Error::from_errno(libc::EINVAL));
-    }
-
-    let format = device.format().inspect_err(|error| {
-        media_log!("media_video_g_fmt_error={error}");
-    })?;
-    // SAFETY: the capture queue's format member is the multi-planar one.
-    let pix_mp = unsafe { format.pix_mp() };
-    if pix_mp.width != WIDTH
-        || pix_mp.height != HEIGHT
-        || pix_mp.pixel_format != v4l2::PIX_FMT_NV12
-        || pix_mp.num_planes != 1
-    {
-        media_log!("media_video_format_unsupported=1");
-        return Err(Error::from_errno(libc::EINVAL));
-    }
-
-    // The encoder comes up before the buffers are queued, so the first frame that
-    // arrives already has somewhere to go.
-    let channel = EncoderChannel::create(
-        VENC_CHANNEL,
-        &encoder_attributes(config.fps, config.bitrate_kbps),
-    )
-    .inspect_err(|error| {
-        media_log!("media_venc_error={error}");
-    })?;
-
-    // The image path starts here in the reference engine (`start_aiq`), before the
-    // buffers are queued: it is what programs the ISP that fills them.
-
-    let mut input = MmzBuffer::allocate(FRAME_SIZE).inspect_err(|error| {
-        media_log!("media_video_mmz_error={error}");
-    })?;
+/// Queue the capture buffer, start streaming and hand the devices to the thread.
+///
+/// This runs after the ISP is up: the reference engine starts AIQ between
+/// preparing and queueing, because the buffers it queues are the ones the ISP
+/// fills.
+fn open_pipeline(prepared: VideoPrepared, fps: u32) -> Result<Pipeline, Error> {
+    let VideoPrepared {
+        mut device,
+        mut input,
+        channel,
+    } = prepared;
 
     let count = device
         .request_user_buffers(INPUT_BUFFERS)
@@ -300,10 +332,10 @@ fn open_pipeline(config: &VideoConfig) -> Result<Pipeline, Error> {
             capability
         );
     }
-    match device.set_frame_interval(config.fps) {
+    match device.set_frame_interval(fps) {
         Ok(interval) => media_log!(
             "media_capture_requested={} result={}/{}",
-            config.fps,
+            fps,
             interval.numerator,
             interval.denominator
         ),

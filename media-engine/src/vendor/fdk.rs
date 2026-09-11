@@ -78,16 +78,24 @@ impl Decoder {
         Ok(Self { handle })
     }
 
-    /// Hand one access unit to the decoder.
+    /// Hand an access unit to the decoder with the reference's valid-byte count.
     ///
-    /// Returns the number of bytes the decoder did not consume, which mirrors
-    /// the library's own `bytesValid` output and is what the reference engine
-    /// feeds back on the next call.
-    pub fn fill(&mut self, access_unit: &[u8]) -> Result<usize, Error> {
+    /// The C engine keeps the original pointer and passes the current
+    /// `bytes_valid` as both the external buffer size and the initial valid-byte
+    /// count. FDK updates the latter; the next attempt repeats the same pointer
+    /// with that reduced size. Keeping the pointer and count separate here is
+    /// intentional: advancing the Rust slice changes the behavior of the C
+    /// implementation this must match.
+    pub fn fill(&mut self, access_unit: &[u8], bytes_valid: usize) -> Result<usize, Error> {
+        if bytes_valid > access_unit.len() {
+            return Err(Error::from_errno(libc::EINVAL));
+        }
+        let Ok(size) = u32::try_from(bytes_valid) else {
+            return Err(Error::from_errno(libc::EINVAL));
+        };
         // The library takes arrays of buffers; for one access unit the
         // single-element form is what the reference engine passes too.
         let mut buffer = access_unit.as_ptr() as *mut u8;
-        let size = access_unit.len() as u32;
         let mut valid = size;
         super::check(unsafe { aacDecoder_Fill(self.handle, &mut buffer, &size, &mut valid) })?;
         Ok(valid as usize)

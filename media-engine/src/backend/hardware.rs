@@ -198,19 +198,15 @@ impl Speaker {
 
     /// Decode one AAC access unit and play whatever frames it yields.
     fn play_aac(&mut self, payload: &[u8], timestamp_us: u64) {
-        let mut remaining = payload;
+        // Keep the original access-unit pointer and carry only FDK's
+        // bytes-valid count, matching the reference C implementation.
+        let mut bytes_valid = payload.len();
         let mut pcm = [0_i16; PCM_SAMPLES];
 
         for _ in 0..MAX_DECODE_ATTEMPTS {
-            if !remaining.is_empty() {
-                match self.decoder.fill(remaining) {
-                    Ok(unconsumed) => {
-                        // The decoder reports what it did not consume; the
-                        // reference engine never advances its pointer and feeds
-                        // the buffer from the start again, which is only harmless
-                        // while nothing is ever left over.
-                        remaining = &remaining[remaining.len().saturating_sub(unconsumed)..];
-                    }
+            if bytes_valid > 0 {
+                match self.decoder.fill(payload, bytes_valid) {
+                    Ok(valid) => bytes_valid = valid,
                     Err(error) => {
                         media_log!("media_aac_fill_error={error}");
                         return;

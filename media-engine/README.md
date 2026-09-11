@@ -133,11 +133,11 @@ on the camera: `readelf -l` must report **no `PT_TLS` segment**.
 | Platform layer (sockets, signals, allocator, logging) | Done |
 | Engine process: entry stub, session loop, command handling, mock backend | Done |
 | Vendor bindings (Rockchip MPI, AIQ, SmartIR, FDK AAC) | Done, ABI-asserted against the factory engine |
-| Speaker path: amplifier pin, AO device, PCM and AAC talkback | Done, awaiting hardware |
-| Microphone path: AI + AENC, capture thread, G.711 records | Done, awaiting hardware |
+| Speaker path: amplifier pin, AO device, PCM and AAC talkback | Done, verified on the camera |
+| Microphone path: AI + AENC, capture thread, G.711 records | Done, verified on the camera |
 | V4L2 capture interface, at the camera's 32-bit ABI | Done, verified on the camera |
 | Video path: MMZ input buffer, VENC channel, capture thread | Done, verified on the camera |
-| Image path (AIQ), night-mode monitor | Not started |
+| Image path (AIQ), night-mode monitor | Done, verified on the camera |
 
 The daemon-facing behavior already matches the reference engine: the private
 socket with mode `0600`, one session at a time, the night-mode greeting on
@@ -181,12 +181,11 @@ and layouts were read out of the same headers and the same
 by compile-time assertions; reading those offsets back caught three mistakes in
 the first draft that no host test could have.
 
-What is still missing is the image path: the reference engine starts AIQ (the ISP
-tuning, SmartIR and the IR-cut) right before it queues the buffers. Capture and
-encoding do not depend on it - both were verified on the camera without it, and
-the encoded bitrate is high enough that the frames carry real detail rather than
-a flat image - but the picture stays untuned until it lands, and
-`backend::video` marks the spot where it goes.
+The image path is now landed: AIQ starts with the sensor's calibration files,
+SmartIR applies the factory thresholds, and the night monitor owns the IR-cut,
+IR LED and scene switch. Capture and encoding remain independent of its verdict,
+but the camera verification below confirms that the tuned ISP and video path run
+together.
 
 ## Verification against the factory engine
 
@@ -295,10 +294,11 @@ up on the camera without flashing"). What that established:
 | Greeting | the night-mode record arrives with the expected payload |
 | Video capture and encode | 183 records in 12 seconds (15.2 a second, the rate the sensor delivers), 4.46 MB over 300 frames, and exactly 6 keyframes - one per two-second GOP. The capture loop counted no empty polls, no short frames and no send or stream errors |
 | Image path (AIQ) | the sensor enumerates as `m00_b_os03b10 4-003c`, SmartIR comes up with the factory thresholds, and the ISP decided night by itself: five samples at the 1 Hz poll, then `media_night_mode_switch=1`, the IR LED on, the IR-cut coils released after their pulse, and a greeting reporting night as the engine's own decision rather than a command |
-| Silent while idle | the amplifier pin stayed low through all of it in both runs: opening the speaker device does not make a sound, only playing does |
+| AAC with microphone capture | six muted runs of 48 ADTS access units (288 total) completed while the microphone was capturing; volume was set to 0 before AAC and `clear` followed every run, with no AAC error or signal and the engine alive afterward |
+| Silent while idle | the amplifier pin stayed low through the image-path run: opening the speaker device does not make a sound, only playing does |
 | Both paths at once | video records and microphone records arriving together, with talkback commands answered and the engine still running at the end |
 
-Two bugs were found this way and one is still open:
+The hardware checks found three issues; all are now fixed:
 
 * **Found and fixed: the vendor writes through the structures it is given.**
   `RK_MPI_AENC_CreateChn` was handed a pointer to a `const` in this crate's
@@ -312,18 +312,13 @@ Two bugs were found this way and one is still open:
   rate-limited away by the ISP driver's chatter - so the engine logs
   `media_signal=<n>` for SIGSEGV, SIGBUS, SIGILL and SIGABRT and then re-raises
   with the default disposition. That is what identified the bug below.
-* **Open: AAC talkback crashes while the microphone is capturing.** PCM talkback
-  is unaffected, the microphone alone is unaffected, and AAC alone is unaffected
-  (`--no-audio` ran six rounds clean). The fault is a SIGSEGV inside the AAC
-  handling, it needs the capture thread to be running, and it is timing
-  sensitive: adding log lines inside `Speaker::play_aac` makes it disappear. It
-  is this engine's bug rather than a platform limit - the deployed C engine
-  played 144 AAC access units with the microphone capturing and never restarted.
-  Ruled out already: the decoded block living on the stack rather than the heap,
-  and the engine running on the process's first thread rather than a pthread.
-  The remaining difference from the reference in that path is how
-  `aacDecoder_Fill` is fed - the reference re-feeds the same buffer with a
-  reduced size while this advances the slice - which is the next thing to try.
+* **Found and fixed: AAC talkback's capture-thread crash.** The Rust decoder was
+  advancing its input slice after a partial fill, while the reference keeps the
+  original pointer and passes its reduced `bytes_valid` count as the buffer size
+  on the next fill. Rust now preserves that exact pointer/count contract. Six
+  muted runs of 48 ADTS access units completed with the microphone active; the
+  engine stayed alive and logged no AAC or fatal-signal error. The speaker volume
+  was zero before the first run and playback was cleared after each run.
 
 ## Known differences from the reference engine
 
@@ -343,12 +338,6 @@ without touching anything around it:
 * **The keyframe byte is read as a flag.** The reference compares it with `1` to
   decide between PCM and AAC; the shared framing layer treats any non-zero byte as
   true. The firmware writes `0` or `1`.
-* **A partial AAC fill resumes where it stopped.** When the decoder's internal
-  buffer cannot take a whole access unit, the reference feeds the access unit from
-  the start again, which duplicates what it already consumed; this engine keeps
-  the bytes the decoder reported as not yet copied, which is what FDK's
-  documentation asks for. With one access unit per record - what the daemon
-  sends - both behave identically.
 * **An empty night-mode record ends the session** in both engines; this engine
   reads it the same way after a review pass found it had been treating it as
   `auto`.

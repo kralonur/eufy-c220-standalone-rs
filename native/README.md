@@ -4,8 +4,8 @@
 the owner in [`docs/onboarding-and-reset.md`](../docs/onboarding-and-reset.md).
 > This file documents the build and the internals.
 
-`c220-media-engine.c` is the only native runtime source required by the Rust
-firmware. It owns the camera hardware path that cannot be replaced by the
+`media-engine/` is the native runtime companion built and deployed by this
+repository. It owns the camera hardware path that cannot be replaced by the
 Rust service layer:
 
 - Rockchip AIQ/V4L2/VENC video capture and encoding;
@@ -13,9 +13,12 @@ Rust service layer:
 - Rockchip AO speaker playback and FDK AAC decoding; and
 - the shared `C220` Unix-socket record protocol.
 
-`c220-start.S` is the minimal ARM entry point used by the camera's uClibc
-runtime. The other native files from the reference project are probes or old
-split helper daemons and are not part of the deployed runtime.
+The Rust engine is `no_std` + `alloc` on the camera so its executable has no
+`PT_TLS` segment, and it uses the camera's uClibc entry point and vendor
+libraries through hand-written FFI. `c220-media-engine.c` and its builder are
+retained as the reverse-engineered reference implementation, but are not
+staged by the package script. `c220-start.S` is used only by that legacy C
+builder; the Rust engine carries its own entry stub.
 
 ## Build inputs
 
@@ -40,12 +43,13 @@ their matching paths in the deployed camera image.
 Build the companion with:
 
 ```sh
-CAMERA_ROOT="$PWD/native/camera-rootfs" ./native/build-c220-media-engine.sh
+CAMERA_ROOT="$PWD/native/camera-rootfs" ./native/build-rust-media-engine.sh
 ```
 
-The output defaults to `dist/c220-media-engine`. Copy that binary into the
+The output defaults to `dist/c220-media-engine-rust`. Copy that binary into the
 camera image as `/home/c220-media-engine`; the Rust firmware uses that path by
-default.
+default. The package script performs this rename while staging the `/home`
+overlay.
 
 ## Camera package
 
@@ -56,9 +60,9 @@ The repository includes the Rust target linker in `.cargo/config.toml` and
 ./native/package-c220.sh
 ```
 
-The default output is `dist/c220-home`. It contains `c220-firmware`,
-`c220-media-engine`, `lib/libfdk-aac.so.1`, the sensor calibration blob, and
-`script/c220-startup.sh`. When `BASE_HOME` is supplied, the superseded
+The default output is `dist/c220-home`. It contains the Rust `c220-firmware`,
+the Rust `c220-media-engine`, `lib/libfdk-aac.so.1`, the sensor calibration
+blob, and `script/c220-startup.sh`. When `BASE_HOME` is supplied, the superseded
 `c220-daemon` and split `c220-hw-*` helpers are removed by default so they
 cannot race the unified service and the image fits the `/home` partition. To
 preserve an existing factory `/home` tree and optionally create a squashfs

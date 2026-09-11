@@ -5,8 +5,10 @@ authenticated HTTPS control API, MQTT control and telemetry, talkback, PTZ, nigh
 mode, and mDNS discovery — with **no Eufy P2P, no cloud, and no vendor app**.
 
 The factory bootloader, kernel, drivers and sensor calibration are left untouched. The
-Rust firmware owns the services and the control plane; a small C engine owns the
-Rockchip media hardware (VI/VENC/AO/AI plus the ISP tuning library).
+Rust firmware owns the services and control plane, and the Rust `media-engine`
+companion owns the Rockchip media hardware (VI/VENC/AO/AI plus the ISP tuning
+library). The legacy C engine remains in `native/` as an ABI/reference artifact,
+but is not staged for deployment.
 
 ## What it does
 
@@ -41,8 +43,8 @@ Rockchip media hardware (VI/VENC/AO/AI plus the ISP tuning library).
 ## Build and deploy
 
 ```sh
-# media engine (C, links librockit + librkaiq from the camera's own rootfs)
-CAMERA_ROOT="$PWD/native/camera-rootfs" ./native/build-c220-media-engine.sh
+# media engine (Rust no_std + alloc; links the camera's librockit + librkaiq)
+CAMERA_ROOT="$PWD/native/camera-rootfs" ./native/build-rust-media-engine.sh
 
 # firmware + /home overlay + squashfs image
 BASE_HOME=/path/to/preserved/home INSTALL_STARTUP_HOOK=1 \

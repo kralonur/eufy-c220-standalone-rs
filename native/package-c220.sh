@@ -100,12 +100,14 @@ fi
     # Use the same clang-based ABI wrapper as the Rust linker; without this,
     # cc-rs looks for an uninstalled arm-linux-musleabihf-gcc.
     CC_armv7_unknown_linux_musleabihf="${CC_armv7_unknown_linux_musleabihf:-$REPO_ROOT/native/arm-cc.sh}" \
-        cargo build --release --locked --target "$TARGET"
+        cargo build --release --locked --target "$TARGET" -p c220-firmware
 )
 cp "$REPO_ROOT/target/$TARGET/release/c220-firmware" "$STAGE/c220-firmware"
 "$STRIP" -s "$STAGE/c220-firmware"
 
-"$SCRIPT_DIR/build-c220-media-engine.sh" "$STAGE/c220-media-engine"
+# The deployed companion is the Rust media engine; the legacy C builder remains
+# available as a reference but is not part of the package anymore.
+"$SCRIPT_DIR/build-rust-media-engine.sh" "$STAGE/c220-media-engine"
 cp "$SCRIPT_DIR/c220-startup.sh" "$STAGE/script/c220-startup.sh"
 cp "$SCRIPT_DIR/c220-wifi.sh" "$STAGE/script/c220-wifi.sh"
 cp "$SCRIPT_DIR/c220-recovery.sh" "$STAGE/script/c220-recovery.sh"

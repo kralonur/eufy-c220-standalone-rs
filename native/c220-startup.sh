@@ -17,6 +17,9 @@ MQTT_CONFIG=/home/nvram/system/standalone_mqtt.conf
 INSECURE_MARKER=/home/nvram/system/.standalone_insecure_bringup
 LOG_FILE=/tmp/c220-firmware.log
 RESTART_DELAY_SECONDS=1
+# Allow the media engine to release Rockchip MPP channels before forcing a
+# recovery kill. A SIGKILL can leave a channel registered until reboot.
+MEDIA_STOP_GRACE_SECONDS=3
 umask 077
 MAX_LOG_BYTES=524288
 
@@ -76,6 +79,38 @@ consume_insecure_marker() {
     return 0
 }
 
+# Find the full command lines rather than using process names: Linux truncates
+# the comm field, and killall can otherwise select the wrong process.
+media_process_pids() {
+    for directory in /proc/[0-9]*; do
+        pid=${directory#/proc/}
+        [ "$pid" = "$$" ] && continue
+        command=$(tr '\0' ' ' <"$directory/cmdline" 2>/dev/null)
+        case "$command" in
+            /home/c220-firmware*|/home/c220-media-engine\ *|\
+            /home/c220-daemon*|/home/c220-hw-rtsp*|/home/c220-hw-producer*|\
+            /home/c220-hw-audio*|/home/c220-hw-speaker*)
+                printf '%s\n' "$pid"
+                ;;
+        esac
+    done
+}
+
+# Normal shutdown is important for the vendor media driver. The force pass is
+# only a recovery fallback for a process that ignored SIGTERM or is corrupted.
+stop_media_processes() {
+    pids=$(media_process_pids)
+    if [ -n "$pids" ]; then
+        for pid in $pids; do
+            kill -TERM "$pid" 2>/dev/null || true
+        done
+        sleep "$MEDIA_STOP_GRACE_SECONDS"
+        for pid in $(media_process_pids); do
+            kill -KILL "$pid" 2>/dev/null || true
+        done
+    fi
+}
+
 if [ ! -x "$FIRMWARE" ]; then
     log_message "standalone firmware missing: $FIRMWARE"
     exit 1
@@ -93,15 +128,11 @@ if ! grep -qs ' /home/nvram ' /proc/mounts; then
     log_message "WARNING: /home/nvram is not mounted; credentials and Wi-Fi profile are unavailable"
 fi
 
-# The Rust owner normally reaps this child. The kill also handles a previous
-# SIGKILL or a power-loss recovery where the native companion was orphaned.
-# `telnetd` is deliberately NOT in this list: nothing survives a reboot, so
-# killing it here only ever destroyed a maintenance shell that the card recovery
-# had just started for this boot.
-for process in c220-firmware c220-media-engine c220-daemon \
-    c220-hw-rtsp c220-hw-producer c220-hw-audio c220-hw-speaker; do
-    killall -9 "$process" 2>/dev/null || true
-done
+# The Rust owner normally reaps this child. The cleanup also handles a power-loss
+# recovery where the native companion was orphaned. `telnetd` is deliberately NOT
+# in this list: nothing survives a reboot, so killing it here only ever destroyed
+# a maintenance shell that the card recovery had just started for this boot.
+stop_media_processes
 rm -f "$SOCKET"
 ulimit -c 0 2>/dev/null || true
 
@@ -281,10 +312,7 @@ while :; do
     "$FIRMWARE" >>"$LOG_FILE" 2>&1
     status=$?
     log_message "c220-firmware exited status=$status; restarting"
-    for process in c220-firmware c220-media-engine c220-daemon \
-        c220-hw-rtsp c220-hw-producer c220-hw-audio c220-hw-speaker; do
-        killall -9 "$process" 2>/dev/null || true
-    done
+    stop_media_processes
     rm -f "$SOCKET"
     trim_log
     sleep "$RESTART_DELAY_SECONDS"

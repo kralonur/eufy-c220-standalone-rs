@@ -295,6 +295,7 @@ up on the camera without flashing"). What that established:
 | Video capture and encode | 183 records in 12 seconds (15.2 a second, the rate the sensor delivers), 4.46 MB over 300 frames, and exactly 6 keyframes - one per two-second GOP. The capture loop counted no empty polls, no short frames and no send or stream errors |
 | Image path (AIQ) | the sensor enumerates as `m00_b_os03b10 4-003c`, SmartIR comes up with the factory thresholds, and the ISP decided night by itself: five samples at the 1 Hz poll, then `media_night_mode_switch=1`, the IR LED on, the IR-cut coils released after their pulse, and a greeting reporting night as the engine's own decision rather than a command |
 | AAC with microphone capture | six muted runs of 48 ADTS access units (288 total) completed while the microphone was capturing; volume was set to 0 before AAC and `clear` followed every run, with no AAC error or signal and the engine alive afterward |
+| Graceful microphone teardown | after the capture path is stopped, `RK_MPI_SYS_UnBind` runs before `RK_MPI_AENC_DestroyChn`; a full silent engine run reached `media_devices_stopped=1` and `media_engine_stopped=1` with no fatal signal |
 | Silent while idle | the amplifier pin stayed low through the image-path run: opening the speaker device does not make a sound, only playing does |
 | Both paths at once | video records and microphone records arriving together, with talkback commands answered and the engine still running at the end |
 
@@ -319,6 +320,10 @@ The hardware checks found three issues; all are now fixed:
   muted runs of 48 ADTS access units completed with the microphone active; the
   engine stayed alive and logged no AAC or fatal-signal error. The speaker volume
   was zero before the first run and playback was cleared after each run.
+* **Found and fixed: microphone teardown's bound-AENC crash.** Rust was destroying
+  the AENC endpoint while the AI-to-AENC system edge was still registered. The
+  encoder now owns that edge and unbinds it before `RK_MPI_AENC_DestroyChn`, so
+  the microphone can stop cleanly without leaving an MPP channel behind.
 
 ## Known differences from the reference engine
 

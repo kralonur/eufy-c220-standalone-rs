@@ -316,8 +316,7 @@ impl Microphone {
     /// same place.
     fn open(card: &str, sink: Arc<RecordSink>, shutdown: Arc<Shutdown>) -> Result<Self, Error> {
         let input = open_capture_device(card)?;
-        let encoder = AudioEncoder::open(0, &ALAW_ENCODER_ATTRIBUTES)?;
-        mpi::bind(
+        let encoder = AudioEncoder::open(0, &ALAW_ENCODER_ATTRIBUTES)?.bind(
             Channel {
                 module: ID_AI,
                 device: 0,
@@ -409,7 +408,9 @@ fn forward_captured_audio(
         }
     }
 
-    // Both devices are released here, in the thread that used them.
+    // The encoder owns the edge and removes it before its AENC endpoint is
+    // destroyed. Both devices are then released here, in the thread that used
+    // them.
     drop(encoder);
     drop(input);
 }

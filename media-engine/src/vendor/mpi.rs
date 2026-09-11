@@ -344,6 +344,7 @@ unsafe extern "C" {
     fn RK_MPI_SYS_CreateMB(block: *mut Block, config: *const ExternalBlockConfig) -> i32;
     fn RK_MPI_MB_ReleaseMB(block: Block) -> i32;
     pub fn RK_MPI_SYS_Bind(source: *const Channel, destination: *const Channel) -> i32;
+    pub fn RK_MPI_SYS_UnBind(source: *const Channel, destination: *const Channel) -> i32;
 
     /// The attributes are written through, so they must be writable.
     fn RK_MPI_VENC_CreateChn(channel: c_int, attributes: *mut ChannelAttributes) -> i32;
@@ -758,6 +759,7 @@ impl core::fmt::Debug for AudioInput {
 /// An owned audio encoder channel.
 pub struct AudioEncoder {
     channel: c_int,
+    binding: Option<AudioBinding>,
 }
 
 impl AudioEncoder {
@@ -770,7 +772,16 @@ impl AudioEncoder {
     pub fn open(channel: c_int, attributes: &AudioEncoderAttributes) -> Result<Self, Error> {
         let mut attributes = *attributes;
         check(unsafe { RK_MPI_AENC_CreateChn(channel, &mut attributes) })?;
-        Ok(Self { channel })
+        Ok(Self {
+            channel,
+            binding: None,
+        })
+    }
+
+    /// Bind a capture channel to this encoder and take ownership of the edge.
+    pub fn bind(mut self, source: Channel, destination: Channel) -> Result<Self, Error> {
+        self.binding = Some(AudioBinding::open(source, destination)?);
+        Ok(self)
     }
 
     /// Take the next encoded block, waiting up to `timeout_ms`.
@@ -802,6 +813,8 @@ impl AudioEncoder {
 
 impl Drop for AudioEncoder {
     fn drop(&mut self) {
+        // Remove the system edge before destroying the endpoint it targets.
+        drop(self.binding.take());
         unsafe { RK_MPI_AENC_DestroyChn(self.channel) };
     }
 }
@@ -859,12 +872,32 @@ impl core::fmt::Debug for AudioBlock<'_> {
     }
 }
 
-/// Connect a capture channel to an encoder channel.
+/// An active capture-to-encoder binding.
 ///
-/// This is what turns the microphone into encoded blocks without the engine
-/// copying audio: the device writes into the encoder.
-pub fn bind(source: Channel, destination: Channel) -> Result<(), Error> {
-    check(unsafe { RK_MPI_SYS_Bind(&source, &destination) })
+/// A bound AENC channel cannot be safely destroyed while the system still owns
+/// the edge. The reference's short-lived audio helper explicitly unbinds first;
+/// keeping that edge owned here makes the same ordering unavoidable for the
+/// long-lived microphone thread.
+struct AudioBinding {
+    source: Channel,
+    destination: Channel,
+}
+
+impl AudioBinding {
+    /// Create and own a capture-to-encoder edge.
+    fn open(source: Channel, destination: Channel) -> Result<Self, Error> {
+        check(unsafe { RK_MPI_SYS_Bind(&source, &destination) })?;
+        Ok(Self {
+            source,
+            destination,
+        })
+    }
+}
+
+impl Drop for AudioBinding {
+    fn drop(&mut self) {
+        let _ = check(unsafe { RK_MPI_SYS_UnBind(&self.source, &self.destination) });
+    }
 }
 
 /// The capture-channel parameters the reference engine uses: one frame of depth,

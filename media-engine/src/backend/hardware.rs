@@ -55,6 +55,13 @@ const DEFAULT_VOLUME: i32 = 100;
 /// Samples the decoder may produce in one call.
 const PCM_SAMPLES: usize = 4096;
 
+/// Samples in one safe raw-PCM playback block: 20 ms at the 16-kHz talkback
+/// input rate, matching the daemon's normal audio cadence and the probe path.
+const SPEAKER_PCM_SAMPLES_PER_BLOCK: usize = 320;
+
+/// Duration of one raw-PCM playback block, in microseconds: 20 ms at 16 kHz.
+const SPEAKER_PCM_BLOCK_DURATION_US: u64 = 20_000;
+
 /// Frames the device is asked to hold (reference value).
 const DEVICE_FRAMES: u32 = 4;
 
@@ -191,9 +198,15 @@ impl Speaker {
             media_log!("media_pcm_payload_error={}", payload.len());
             return;
         }
-        // The reference engine applies an attenuation shift to every sample here;
-        // the shift is zero, so the samples are played as they arrive.
-        self.play_block(payload, 1, timestamp_us);
+        // AO accepts the short blocks used by the normal talkback cadence, but a
+        // whole HTTP body can be much larger. Split it before handing it to the
+        // device; on this card a large single external block can fault inside AO.
+        let block_bytes = SPEAKER_PCM_SAMPLES_PER_BLOCK * core::mem::size_of::<i16>();
+        for (index, block) in payload.chunks(block_bytes).enumerate() {
+            let block_timestamp = timestamp_us
+                .saturating_add((index as u64).saturating_mul(SPEAKER_PCM_BLOCK_DURATION_US));
+            self.play_block(block, 1, block_timestamp);
+        }
     }
 
     /// Decode one AAC access unit and play whatever frames it yields.

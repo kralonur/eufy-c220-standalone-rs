@@ -69,9 +69,29 @@ const DEFAULT_VOLUME: u32 = 100;
 #[derive(Clone, Default)]
 pub struct MediaEngineSlot {
     handle: Arc<Mutex<Option<MediaEngineHandle>>>,
+    /// What the companion last reported the IR hardware to be doing: 0 until it
+    /// has reported at all, 1 for day (IR off), 2 for night (IR on). The
+    /// commanded mode cannot answer this, because in automatic mode the command
+    /// stays `auto` all night while the LED is on.
+    night_vision: Arc<AtomicU8>,
 }
 
 impl MediaEngineSlot {
+    /// Record the companion's own day/night report.
+    pub fn set_night_vision(&self, night: bool) {
+        self.night_vision
+            .store(if night { 2 } else { 1 }, Ordering::Release);
+    }
+
+    /// The reported IR state, or `None` until the companion has reported one.
+    fn night_vision(&self) -> Option<bool> {
+        match self.night_vision.load(Ordering::Acquire) {
+            1 => Some(false),
+            2 => Some(true),
+            _ => None,
+        }
+    }
+
     /// Publish the current media-engine command handle.
     pub fn set(&self, handle: MediaEngineHandle) -> io::Result<()> {
         let mut current = self
@@ -874,6 +894,16 @@ pub(crate) async fn status_response(inner: &Arc<ControlInner>) -> Vec<u8> {
     let mode_name = ["auto", "night", "day"]
         .get(mode as usize)
         .unwrap_or(&"auto");
+    // `active` is what the hardware is doing. A forced mode answers it on the
+    // spot, because the companion applies it in the same call that accepts the
+    // command; in automatic mode only the companion knows, so its report is used
+    // and the last resort is "off". Deriving it from the commanded mode alone
+    // reports the infrared as off for the whole of every automatic night.
+    let night_vision = match mode {
+        1 => true,
+        2 => false,
+        _ => inner.media.night_vision().unwrap_or(false),
+    };
     let (total_kb, free_kb, available_kb, cached_kb) = memory_kb();
     let uptime = uptime_seconds();
     let temperature = temperature_celsius();
@@ -889,7 +919,7 @@ pub(crate) async fn status_response(inner: &Arc<ControlInner>) -> Vec<u8> {
         pan_of(&position),
         tilt_of(&position),
         talkback.contains(r#""talking":true"#),
-        mode == 1,
+        night_vision,
         host = security::host_label("HOST_NAME", "c220")
             .map(|label| format!("{label}.local"))
             .unwrap_or_else(|_| "c220.local".to_string()),

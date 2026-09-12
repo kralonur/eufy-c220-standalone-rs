@@ -54,10 +54,6 @@ const HTTP_PASSWORD_FILE_ENV: &str = "HTTP_PASSWORD_FILE";
 /// Explicit audio enable override used during board bring-up.
 const STANDALONE_AUDIO_ENV: &str = "STANDALONE_AUDIO";
 
-/// Override for the media engine's executable, for bringing up the Rust engine
-/// beside the deployed one.
-const MEDIA_ENGINE_PROGRAM_ENV: &str = "MEDIA_ENGINE_PROGRAM";
-
 /// Optional LAN time server for the SNTP clock sync. Without it the default
 /// gateway is asked, which is the only other thing guaranteed to be on the LAN.
 const NTP_HOST_ENV: &str = "NTP_HOST";
@@ -329,8 +325,6 @@ async fn run_firmware() -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut media_task = tokio::task::spawn_blocking(move || {
         let media_config = MediaEngineConfig {
             audio_enabled,
-            program: security::path(MEDIA_ENGINE_PROGRAM_ENV)
-                .unwrap_or_else(|| MediaEngineConfig::default().program),
             ..MediaEngineConfig::default()
         };
         run_media_loop(
@@ -413,6 +407,15 @@ fn run_media_loop(
                     // streaming is not opted in instead of stopping the loop.
                     if audio_enabled {
                         rtsp.push_audio_record(&record)?;
+                    }
+                }
+                Some(record) if record.kind == RecordKind::NightMode => {
+                    // The companion reports the IR hardware state whenever it
+                    // changes and once per connection. It is the only honest
+                    // source for it: in automatic mode the commanded mode stays
+                    // `auto` through the whole night.
+                    if let Some(night) = record.payload.first() {
+                        media_slot.set_night_vision(*night != 0);
                     }
                 }
                 Some(_) => {}

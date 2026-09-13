@@ -2,10 +2,10 @@
 //!
 //! These exist only for the camera target: they declare the Rockchip MPI, AIQ
 //! and FDK AAC interfaces the engine drives, and they cannot be linked anywhere
-//! else. Everything here follows the reference `native/c220-media-engine.c` -
-//! the structures are the ones it declares by hand, and the size assertions it
-//! carries are ported with them, because a wrong layout here is a memory
-//! corruption bug on the camera rather than a compile error.
+//! else. Everything here follows the legacy C engine, which declared these
+//! structures by hand: the layouts and their size assertions are ported with
+//! them, because a wrong layout here is a memory corruption bug on the camera
+//! rather than a compile error.
 //!
 //! Three conventions are worth knowing before reading on:
 //!

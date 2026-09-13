@@ -1,8 +1,7 @@
 //! Command-line contract of the media engine process.
 //!
-//! The option set and defaults mirror the reference `native/c220-media-engine.c`
-//! so the firmware can launch either binary with the same arguments. Two
-//! deliberate differences are documented on [`parse_arguments`].
+//! The option set and defaults keep the legacy C engine's launcher contract
+//! unchanged. Two deliberate differences are documented on [`parse_arguments`].
 
 use alloc::string::{String, ToString};
 

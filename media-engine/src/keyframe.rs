@@ -1,6 +1,6 @@
 //! HEVC access-unit inspection.
 //!
-//! Ported from the reference `native/c220-media-engine.c`, which marks a record
+//! Ported from the legacy C engine, which marks a record
 //! as a keyframe when its access unit contains an HEVC IRAP picture.
 
 /// NAL unit types that begin a new group of pictures: BLA_W_LP through

@@ -1,4 +1,4 @@
-# Media engine (Rust port of `native/c220-media-engine.c`)
+# Media engine
 
 This crate will own the Rockchip sensor/ISP/VENC/AI/AO hardware in one process,
 replacing the C engine, and speak the shared `C220` record protocol over the

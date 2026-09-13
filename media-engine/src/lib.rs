@@ -1,7 +1,7 @@
 //! Camera-side media engine for the Eufy C220.
 //!
 //! This crate owns the Rockchip sensor/ISP/VENC/AI/AO hardware in one process,
-//! replacing `native/c220-media-engine.c`, and speaks the `C220` record protocol
+//! replacing the legacy C engine, and speaks the `C220` record protocol
 //! over a private Unix socket to the Rust firmware service.
 //!
 //! # Platform constraints

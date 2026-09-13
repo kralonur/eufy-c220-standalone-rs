@@ -2,8 +2,8 @@
 //!
 //! This is the binary boundary between the Rust firmware service and the
 //! camera-side media engine that owns the Rockchip hardware. The header layout
-//! and record-kind values were reverse-engineered from the reference
-//! `native/c220-media-engine.c` and are not a Eufy network or P2P protocol.
+//! and record-kind values were reverse-engineered from the legacy C engine and
+//! are not a Eufy network or P2P protocol.
 //!
 //! The crate is `no_std` because the media engine links the camera's uClibc
 //! runtime directly and must not carry a thread-local segment (the board's

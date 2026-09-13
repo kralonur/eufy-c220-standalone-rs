@@ -15,10 +15,9 @@ Rust service layer:
 
 The Rust engine is `no_std` + `alloc` on the camera so its executable has no
 `PT_TLS` segment, and it uses the camera's uClibc entry point and vendor
-libraries through hand-written FFI. `c220-media-engine.c` and its builder are
-retained as the reverse-engineered reference implementation, but are not
-staged by the package script. `c220-start.S` is used only by that legacy C
-builder; the Rust engine carries its own entry stub.
+libraries through hand-written FFI, including its own entry stub. The legacy C
+engine and its builder have been removed now that the Rust engine owns the
+hardware.
 
 ## Build inputs
 

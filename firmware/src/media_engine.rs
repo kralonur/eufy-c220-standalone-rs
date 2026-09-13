@@ -1,10 +1,10 @@
 //! Owner for the camera-local native media engine.
 //!
 //! The companion process owns the sensor/ISP/V4L2/VENC hardware and exposes
-//! encoded records over a private Unix socket. This Rust boundary is based on
-//! the reverse-engineered launch arguments and shutdown behavior in
-//! `native/c220-media-engine.c`; the companion is part of our camera firmware,
-//! not a vendor/P2P client.
+//! encoded records over a private Unix socket. This Rust boundary keeps the
+//! reverse-engineered launch arguments and shutdown behavior of the legacy C
+//! engine; the companion is part of our camera firmware, not a vendor/P2P
+//! client.
 
 use crate::media::{MediaRecord, RecordKind, read_record, write_record};
 use std::io;

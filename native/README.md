@@ -334,13 +334,33 @@ Two things that cost an hour and are worth knowing before touching mtd6:
   md5 there is evidence about the flash itself.
 
 - Verify the **whole** image, not just that `dd` reported success. Observed on this
-  board: after a write of a 64 KiB-multiple image through
+  board twice: after a write of a 64 KiB-multiple image through
   `/dev/block/by-name/home`, blocks 0..18 read back byte-identical and the *last*
-  erase block still held the previous image, `sync` notwithstanding. The squashfs
-  metadata lives at the end of the image, so rebooting there would have mounted
-  nothing. Rewriting through the block device and giving the writeback a moment
-  settled it, and the md5 of the full read then matched. Read back and compare
-  before rebooting; if the tail differs, write again and read again.
+  erase block of the write holds something else, `sync` notwithstanding. The
+  squashfs metadata lives at the end of the image, so rebooting there mounts
+  nothing - a camera with a readable superblock and an unreadable id table, which
+  looks like a dead device and cannot be repaired over the network.
+
+  **Rewriting does not fix it.** This block device drops the final erase block of
+  every write, so a second identical write drops it again. Write one extra 64 KiB
+  block instead, which makes the real last block interior and gets it programmed:
+
+  ```sh
+  # 21 blocks for a 20-block image: the 21st is padding and may be anything.
+  dd if=/tmp/blocks-plus-one.img of=/dev/block/by-name/home bs=65536 count=21 conv=notrunc
+  dd if=/dev/mtd6 bs=65536 count=20 | md5sum     # must equal the image
+  ```
+
+  The character device is not the answer either: `dd of=/dev/mtd6` programs
+  without erasing, and NOR flash can only clear bits, so every block whose content
+  differs comes back as the AND of the old and new bytes. Read through
+  `/dev/mtd6`, write through the block device.
+
+  Two writes are therefore mandatory around any `/home` change: read back the
+  whole written range through `/dev/mtd6` and compare it against the image, then
+  reboot and re-check that the services came up. Skipping the comparison is what
+  bricked this camera once; the programmer is the fallback, and a full-chip dump
+  taken while the camera last worked is what makes that fallback quick.
 
 ### Talkback: queue implemented, writer must not block the runtime
 

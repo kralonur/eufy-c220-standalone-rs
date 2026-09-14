@@ -362,6 +362,35 @@ Two things that cost an hour and are worth knowing before touching mtd6:
   bricked this camera once; the programmer is the fallback, and a full-chip dump
   taken while the camera last worked is what makes that fallback quick.
 
+### Verifying a deployment
+
+`native/verify-c220-deployment.sh` is the gate a `/home` write ends with. It checks
+the camera in layers, so whatever it can reach is still useful:
+
+- `health` and the port map need nothing but the network;
+- `/status` and the RTSPS probe need the HTTP and RTSP credentials;
+- the engine, firmware and `/dev/mtd6` hashes, the fatal-signal count, the engine
+  process count and the amplifier pin need the one-boot maintenance shell.
+
+The shell is armed through `POST /maintenance/enable` and closed again before the
+script exits, so it never leaves a root shell listening. That window is one boot
+only, which is why the on-camera checks are reported as `SKIP` - not as failures -
+when a second run happens in the same boot: reboot to run them again.
+
+The image is compared through the character device, which is the only read that
+answers for the flash rather than for a cache.
+
+```sh
+C220_NVRAM=/path/to/nvram/system \
+C220_IMAGE=/tmp/c220-home-padded.img \
+C220_ENGINE_MD5=<engine md5> C220_FIRMWARE_MD5=<firmware md5> \
+  native/verify-c220-deployment.sh
+```
+
+Exit status is 0 only when nothing failed; skipped checks are counted and printed,
+because "not verified" is not the same as "verified". `--network-only` runs the
+reachability and configuration checks without credentials.
+
 ### Talkback: queue implemented, writer must not block the runtime
 
 The queued speaker path is implemented (`SpeakerFrame`, a bounded channel, a writer

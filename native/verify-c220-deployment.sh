@@ -221,11 +221,29 @@ shell_session() {
 }
 
 arm_maintenance_shell() {
-    curl -skS --digest --user "$HTTP_USER:$HTTP_PASSWORD" -X POST --max-time 10 \
-        "https://$CAMERA:8080/maintenance/enable" >/dev/null 2>&1 || return 1
-    # telnetd needs a moment to accept the first connection.
-    sleep 2
-    return 0
+    enable_code=$(curl -skS -o /dev/null -w '%{http_code}' --digest \
+        --user "$HTTP_USER:$HTTP_PASSWORD" -X POST --max-time 10 \
+        "https://$CAMERA:8080/maintenance/enable" 2>/dev/null) || enable_code=000
+    # 202 is a fresh start, 200 means this boot's window is already armed; both
+    # are answered before the listener is proven to exist.
+    case $enable_code in 200|202) ;; *) return 1 ;; esac
+    wait_for_port "$CAMERA" 23 10
+}
+
+close_maintenance_shell() {
+    # Closing the window matters more than the last line of output: it is a root
+    # shell on the LAN, and this boot's copy is single use anyway.
+    shell_session 'killall telnetd' >/dev/null 2>&1 || true
+}
+
+wait_for_port() {
+    waited=0
+    while [ "$waited" -lt "$3" ]; do
+        port_open "$1" "$2" && return 0
+        sleep 1
+        waited=$((waited + 1))
+    done
+    return 1
 }
 
 check_camera() {
@@ -257,14 +275,11 @@ check_camera() {
     fi
 
     if ! arm_maintenance_shell; then
-        fail camera "the maintenance shell could not be armed"
-        return 0
-    fi
-    # The window is one boot only and telnetd is not restarted once it has been
-    # killed, so a second run in the same boot has nothing to talk to. Saying so is
-    # better than reporting every on-camera check as a failure.
-    if ! port_open "$CAMERA" 23; then
-        skip camera "this boot's maintenance window is spent; reboot to run the on-camera checks"
+        # A failed spawn clears the firmware's one-shot flag, so the usual causes
+        # are a spent window (200) or a spawn error (503). Either way the checks
+        # below were not performed, and saying so is the point of this script.
+        fail camera "the maintenance window did not open (HTTP $enable_code); reboot and retry"
+        close_maintenance_shell
         return 0
     fi
 
@@ -284,9 +299,7 @@ $commands"
     fi
 
     output=$(shell_session "$commands")
-    # Closing the window matters more than the last line of output: it is a root
-    # shell on the LAN, and this boot's copy is single use anyway.
-    shell_session 'killall telnetd' >/dev/null 2>&1 || true
+    close_maintenance_shell
 
     if [ -n "$ENGINE_MD5" ]; then
         if printf '%s' "$output" | grep -q "^$ENGINE_MD5  /home/c220-media-engine"; then

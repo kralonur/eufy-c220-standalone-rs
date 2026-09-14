@@ -374,8 +374,9 @@ the camera in layers, so whatever it can reach is still useful:
 
 The shell is armed through `POST /maintenance/enable` and closed again before the
 script exits, so it never leaves a root shell listening. That window is one boot
-only, which is why the on-camera checks are reported as `SKIP` - not as failures -
-when a second run happens in the same boot: reboot to run them again.
+only: a second run in the same boot cannot reopen it, so the on-camera group is
+reported as a failure with the API's HTTP status and the camera has to be
+rebooted to verify it. A missing verification is never reported as a pass.
 
 The image is compared through the character device, which is the only read that
 answers for the flash rather than for a cache.

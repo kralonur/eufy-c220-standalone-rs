@@ -648,7 +648,7 @@ as any camera with a reset button, and it is why physical access is the boundary
 | Camera does not appear on your network at all | It has no valid configuration or cannot see the SSID. Use the 5-second rescue and check `/tmp/c220-wifi.log`, or boot with a `wifi.txt` card |
 | The card seems to be ignored | Was it in **before** power-on? Is it FAT32? Are the file names exactly `provision.txt` / `wifi.txt`, in the card's root, with no `.txt.txt`? Read `/tmp/c220-recovery.log` - it records what it found and why it refused |
 | The camera joined `RescueAP` instead of your network | Its Wi-Fi profile is missing or was wiped (for example after a factory reset), or the stored network cannot be reached. Provision it again |
-| You need a shell but have no card and cannot hold the button | `POST /maintenance/enable` on the control API opens port 23 for one boot. It needs the HTTP Digest password, and closes again after a reboot |
+| You need a shell but have no card and cannot hold the button | `POST /maintenance/enable` on the control API opens port 23 for one boot. It needs the HTTP Digest password, and closes again after a reboot. If it reports that the shell did not start listening, ask again - the firmware clears its one-shot flag for that case |
 | Nothing works at all | The recovery paths above cover everything except a corrupted flash. Chip-level recovery with a CH341A programmer (partition map, offsets, read-before-write) is documented in `native/README.md`, under chip-level recovery |
 
 ### Logs
@@ -726,6 +726,7 @@ except `/healthz`.
 | `POST /night_mode` | `{"mode":0\|1\|2}` - `0` automatic, `1` force night (IR on), `2` force day (IR off) |
 | `POST /talkback/status`, `/talkback/start`, `/talkback/stop`, `/talkback/clear`, `/talkback/pcm`, `/talkback/audio`, `/talkback/volume` | two-way audio |
 | `POST /maintenance/enable` | opens the root shell on port 23 for the current boot |
+| `POST /reboot` | restarts the camera; authenticated like every other route |
 
 ### Last resort: plaintext bring-up mode
 

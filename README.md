@@ -13,7 +13,8 @@ library).
 
 - **RTSPS** on port 322, H.265 2304x1296 plus G.711 audio, Digest authentication.
 - **HTTPS API** on 8080 (TLS + Digest): `/status`, `/ptz/*`, `/night_mode`,
-  `/talkback/*`, `/snapshot`, `/healthz`.
+  `/talkback/*`, `/snapshot`, `/healthz`, and the privileged `/maintenance/enable`
+  and `/reboot`.
 - **MQTT** with Home Assistant discovery: availability, status, PTZ, night mode,
   talkback state; commands reuse the same handlers as the HTTP API.
 - **mDNS**: each camera answers to `<name>.local` and advertises `_rtsp._tcp`, with the
@@ -30,8 +31,9 @@ library).
 ## Design rules this project follows
 
 - **Fail closed.** `RTSP_PORT=0`, `RTSPS_PORT=322`, `API_TLS=1` by default. There is no
-  firmware upload, flash or reboot endpoint. Only `POST /maintenance/enable` — over TLS
-  with Digest auth — opens a one-boot Telnet shell.
+  firmware upload or flash endpoint. Two privileged routes exist, both over TLS with
+  Digest auth: `POST /maintenance/enable` opens a one-boot Telnet shell, and
+  `POST /reboot` restarts the camera.
 - **The card slot is a credential.** Recovery reads data; it never executes card
   content.
 - **Trust is out of band.** mDNS publishes names, never fingerprints; verification

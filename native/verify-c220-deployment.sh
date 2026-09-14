@@ -290,7 +290,7 @@ check_camera() {
         # A failed spawn clears the firmware's one-shot flag, so the usual causes
         # are a spent window (200) or a spawn error (503). Either way the checks
         # below were not performed, and saying so is the point of this script.
-        fail camera "the maintenance window did not open (HTTP $enable_code); reboot and retry"
+        fail camera "the maintenance window did not open (HTTP $enable_code); POST /reboot and retry"
         close_maintenance_shell
         return 0
     fi

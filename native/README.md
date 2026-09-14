@@ -170,12 +170,19 @@ plaintext/anonymous defaults for that boot and is consumed by the startup
 hook. Do not create it in production. Secure packaging also removes the
 unauthenticated Telnet and arbitrary SD/NVRAM root-script hooks.
 
-For deliberate maintenance, the authenticated TLS control API exposes only
+For deliberate maintenance, the authenticated TLS control API exposes
 `POST /maintenance/enable`. It starts the existing `/usr/sbin/telnetd` on port
 23 with `/bin/sh` for the current boot. The route is unavailable unless both
 Digest credentials and the control-plane TLS acceptor are configured; the
-startup script kills stale Telnet processes at the next boot. Use it only from
-a trusted LAN and close/reboot the camera when finished.
+startup script kills stale Telnet processes at the next boot. It proves the shell
+is really listening before reporting success, and clears its one-shot flag when it
+is not, so a spawn that never bound its port can be asked for again. Use it only
+from a trusted LAN and close the window when finished.
+
+`POST /reboot` restarts the board. It exists because this firmware has no other
+remote way to refresh the one-boot shell window, which made every deployment step
+cost physical access to the camera; it is authenticated exactly like the
+maintenance route, and it answers before the network goes away.
 
 ### Chip-level recovery (CH341A, UART)
 
@@ -374,9 +381,9 @@ the camera in layers, so whatever it can reach is still useful:
 
 The shell is armed through `POST /maintenance/enable` and closed again before the
 script exits, so it never leaves a root shell listening. That window is one boot
-only: a second run in the same boot cannot reopen it, so the on-camera group is
-reported as a failure with the API's HTTP status and the camera has to be
-rebooted to verify it. A missing verification is never reported as a pass.
+only: a second run in the same boot cannot reopen it, which is what `POST /reboot`
+is for. When the window does not open, the on-camera group is reported as a failure
+carrying the API's HTTP status instead of a pass.
 
 The image is compared through the character device, which is the only read that
 answers for the flash rather than for a cache.

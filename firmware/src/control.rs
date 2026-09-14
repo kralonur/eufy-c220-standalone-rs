@@ -52,6 +52,22 @@ const MAINTENANCE_SHELL_PATH: &str = "/bin/sh";
 /// there for a loaded one-core board, not for the usual case.
 const MAINTENANCE_LISTEN_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Reboot command, and the argument it is given.
+///
+/// The bare name is deliberate: it is what the factory-reset script uses on this
+/// camera, resolved through the PATH the boot script exports. `-f` reboots without
+/// asking init to unwind, which is the form this board is known to complete - the
+/// graceful path has been seen to leave a camera that answers ping and runs
+/// nothing.
+const REBOOT_PROGRAM: &str = "reboot";
+const REBOOT_ARGUMENT: &str = "-f";
+
+/// Delay between accepting a reboot request and pulling the board down.
+///
+/// The client that asked for the reboot should get its answer first, and one round
+/// trip on a LAN is well inside this.
+const REBOOT_DELAY: Duration = Duration::from_millis(500);
+
 /// One connection attempt while waiting for that listener, and the pause between
 /// attempts. Both are short: a local connect either succeeds at once or fails at
 /// once, and the loop around them carries the deadline.
@@ -529,6 +545,7 @@ async fn dispatch(inner: &Arc<ControlInner>, request: HttpRequest) -> Vec<u8> {
         ("POST", "/talkback/volume") => talkback_volume(inner, &request.body).await,
         ("POST", "/night_mode") => night_mode(inner, &request.body).await,
         ("POST", "/maintenance/enable") => maintenance_enable(inner).await,
+        ("POST", "/reboot") => reboot().await,
         ("GET", "/ptz/position") | ("GET", "/ptz/status") => ptz_position(inner).await,
         ("POST", "/ptz/move") => ptz_move(inner, &request.body).await,
         ("POST", "/ptz/rotate") => ptz_rotate(inner, &request.body).await,
@@ -628,6 +645,26 @@ async fn maintenance_listener_is_up(port: u16) -> bool {
         }
         tokio::time::sleep(LISTEN_PROBE_INTERVAL).await;
     }
+}
+
+/// Reboot the board, after the answer to this request has been sent.
+///
+/// This is the second privileged route, beside the maintenance shell, and it exists
+/// because everything the deployment needs a reboot for - a new certificate, a new
+/// network, refreshing the one-boot shell - otherwise costs physical access. Like
+/// the shell it is reachable only over TLS with Digest credentials.
+async fn reboot() -> Vec<u8> {
+    tokio::spawn(async {
+        tokio::time::sleep(REBOOT_DELAY).await;
+        // NVRAM is journalled and the clock's stored time is deliberately cheap to
+        // lose, but syncing first costs nothing and an abrupt reset is still worse.
+        unsafe { libc::sync() };
+        match Command::new(REBOOT_PROGRAM).arg(REBOOT_ARGUMENT).spawn() {
+            Ok(_) => tracing::warn!("rebooting on request through the control API"),
+            Err(error) => tracing::error!(%error, "could not reboot"),
+        }
+    });
+    json_response(202, "Accepted", r#"{"status":"ok","rebooting":true}"#)
 }
 
 pub(crate) async fn talkback_start(inner: &Arc<ControlInner>) -> Vec<u8> {
@@ -1266,6 +1303,20 @@ mod tests {
         let free_port = free.local_addr().expect("bound address").port();
         drop(free);
         assert!(!maintenance_listener_is_up(free_port).await);
+    }
+
+    #[tokio::test]
+    async fn the_reboot_route_is_not_public() {
+        // Only the unauthorized path is exercised on purpose: a test that got past
+        // the digest check here would ask the machine running the tests to reboot.
+        let mut config = ControlServerConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)));
+        config.auth = Some(Arc::new(
+            DigestAuth::new("admin", "test-password").expect("test entropy should be available"),
+        ));
+        let server = ControlServer::start(config, MediaEngineSlot::default(), None)
+            .expect("control server should start");
+        let response = post(server.local_addr(), "/reboot", &[]).await;
+        assert!(response.starts_with("HTTP/1.1 401 Unauthorized"));
     }
 
     #[tokio::test]

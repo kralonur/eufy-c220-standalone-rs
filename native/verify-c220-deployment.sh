@@ -220,12 +220,24 @@ shell_session() {
     printf '%s\nexit\n' "$1" | timeout 60 nc "$CAMERA" 23 2>/dev/null | tr -d '\r'
 }
 
-arm_maintenance_shell() {
-    enable_code=$(curl -skS -o /dev/null -w '%{http_code}' --digest \
+maintenance_request() {
+    code=$(curl -skS -o /dev/null -w '%{http_code}' --digest \
         --user "$HTTP_USER:$HTTP_PASSWORD" -X POST --max-time 10 \
-        "https://$CAMERA:8080/maintenance/enable" 2>/dev/null) || enable_code=000
-    # 202 is a fresh start, 200 means this boot's window is already armed; both
-    # are answered before the listener is proven to exist.
+        "https://$CAMERA:8080/maintenance/enable" 2>/dev/null) || true
+    printf '%s' "${code:-000}"
+}
+
+arm_maintenance_shell() {
+    enable_code=$(maintenance_request)
+    # 503 is the firmware saying it spawned the shell and it never listened. It
+    # clears its one-shot flag in that case, so asking again is a real retry
+    # rather than the no-op it would be after a 200.
+    if [ "$enable_code" = 503 ]; then
+        enable_code=$(maintenance_request)
+    fi
+    # 202 is a fresh start and 200 means this boot's window is already armed;
+    # both are answered before the listener is proven, which is why the port is
+    # what decides.
     case $enable_code in 200|202) ;; *) return 1 ;; esac
     wait_for_port "$CAMERA" 23 10
 }

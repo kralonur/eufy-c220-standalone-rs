@@ -14,7 +14,7 @@ use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, mpsc};
@@ -36,8 +36,27 @@ const MAX_BODY_LEN: usize = 64 * 1024;
 
 /// Existing factory telnetd invocation used for a deliberate one-boot shell.
 const TELNETD_PATH: &str = "/usr/sbin/telnetd";
-const TELNETD_PORT: &str = "23";
+
+/// Port the one-boot maintenance shell listens on.
+///
+/// One number, because it is both the argument `telnetd` is given and the address
+/// the engine probes to prove that shell exists.
+const MAINTENANCE_PORT: u16 = 23;
 const MAINTENANCE_SHELL_PATH: &str = "/bin/sh";
+
+/// How long a freshly spawned `telnetd` is given to bind its port before the
+/// window is called a failure.
+///
+/// It daemonises, so the spawn only proves the launcher exited cleanly. Measured
+/// on the camera the listener appears in well under a second, and the margin is
+/// there for a loaded one-core board, not for the usual case.
+const MAINTENANCE_LISTEN_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// One connection attempt while waiting for that listener, and the pause between
+/// attempts. Both are short: a local connect either succeeds at once or fails at
+/// once, and the loop around them carries the deadline.
+const LISTEN_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
+const LISTEN_PROBE_INTERVAL: Duration = Duration::from_millis(200);
 
 /// AAC talkback access units use the validated 64 ms native cadence.
 const AAC_FRAME_DURATION_US: u64 = 64_000;
@@ -509,7 +528,7 @@ async fn dispatch(inner: &Arc<ControlInner>, request: HttpRequest) -> Vec<u8> {
         ("POST", "/talkback/audio") => talkback_audio(inner, request.body).await,
         ("POST", "/talkback/volume") => talkback_volume(inner, &request.body).await,
         ("POST", "/night_mode") => night_mode(inner, &request.body).await,
-        ("POST", "/maintenance/enable") => maintenance_enable(inner),
+        ("POST", "/maintenance/enable") => maintenance_enable(inner).await,
         ("GET", "/ptz/position") | ("GET", "/ptz/status") => ptz_position(inner).await,
         ("POST", "/ptz/move") => ptz_move(inner, &request.body).await,
         ("POST", "/ptz/rotate") => ptz_rotate(inner, &request.body).await,
@@ -519,7 +538,7 @@ async fn dispatch(inner: &Arc<ControlInner>, request: HttpRequest) -> Vec<u8> {
     }
 }
 
-fn maintenance_enable(inner: &Arc<ControlInner>) -> Vec<u8> {
+async fn maintenance_enable(inner: &Arc<ControlInner>) -> Vec<u8> {
     if !inner.maintenance_available {
         return error_response(
             404,
@@ -533,12 +552,15 @@ fn maintenance_enable(inner: &Arc<ControlInner>) -> Vec<u8> {
         return json_response(
             200,
             "OK",
-            r#"{"status":"ok","maintenance":"telnet","enabled":true,"port":23}"#,
+            &format!(
+                r#"{{"status":"ok","maintenance":"telnet","enabled":true,"port":{MAINTENANCE_PORT}}}"#
+            ),
         );
     }
 
+    let port = MAINTENANCE_PORT.to_string();
     let result = Command::new(TELNETD_PATH)
-        .args(["-p", TELNETD_PORT, "-l", MAINTENANCE_SHELL_PATH])
+        .args(["-p", port.as_str(), "-l", MAINTENANCE_SHELL_PATH])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -552,6 +574,16 @@ fn maintenance_enable(inner: &Arc<ControlInner>) -> Vec<u8> {
             tokio::task::spawn_blocking(move || {
                 let _ = child.wait();
             });
+            if !maintenance_listener_is_up(MAINTENANCE_PORT).await {
+                // Seen on this camera: a clean spawn whose shell never listened.
+                // Keeping the flag armed would make that permanent for the boot,
+                // so it is cleared and the caller may ask again.
+                inner
+                    .maintenance_telnet_started
+                    .store(false, Ordering::Release);
+                tracing::error!(pid, "maintenance Telnet was spawned but never listened");
+                return error_response(503, "maintenance Telnet did not start listening");
+            }
             tracing::warn!(
                 pid,
                 "TLS/Digest-authorized maintenance Telnet enabled for the current boot"
@@ -559,7 +591,9 @@ fn maintenance_enable(inner: &Arc<ControlInner>) -> Vec<u8> {
             json_response(
                 202,
                 "Accepted",
-                r#"{"status":"ok","maintenance":"telnet","enabled":true,"port":23}"#,
+                &format!(
+                    r#"{{"status":"ok","maintenance":"telnet","enabled":true,"port":{MAINTENANCE_PORT}}}"#
+                ),
             )
         }
         Err(error) => {
@@ -569,6 +603,30 @@ fn maintenance_enable(inner: &Arc<ControlInner>) -> Vec<u8> {
             tracing::error!(%error, "could not start maintenance Telnet");
             error_response(503, "maintenance Telnet could not be started")
         }
+    }
+}
+
+/// Whether something is listening on the maintenance port.
+///
+/// The probe is what separates "telnetd was spawned" from "a shell can actually be
+/// reached", which is the difference between a window that works and one the
+/// operator only discovers is missing when they need it.
+async fn maintenance_listener_is_up(port: u16) -> bool {
+    let address = SocketAddr::from(([127, 0, 0, 1], port));
+    let deadline = Instant::now() + MAINTENANCE_LISTEN_TIMEOUT;
+    loop {
+        let attempt = tokio::time::timeout(
+            LISTEN_PROBE_TIMEOUT,
+            tokio::net::TcpStream::connect(address),
+        )
+        .await;
+        if matches!(attempt, Ok(Ok(_))) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(LISTEN_PROBE_INTERVAL).await;
     }
 }
 
@@ -1193,6 +1251,21 @@ mod tests {
         .expect("control server should start");
         let response = post(server.local_addr(), "/maintenance/enable", &[]).await;
         assert!(response.starts_with("HTTP/1.1 404 Not Found"));
+    }
+
+    #[tokio::test]
+    async fn the_maintenance_probe_tells_a_listener_from_a_free_port() {
+        // The one-shot window is kept only when a shell is really reachable, so a
+        // probe that answered "up" for anything would defeat the fix.
+        let listener = StdTcpListener::bind(("127.0.0.1", 0)).expect("test listener");
+        let bound_port = listener.local_addr().expect("bound address").port();
+        assert!(maintenance_listener_is_up(bound_port).await);
+        drop(listener);
+
+        let free = StdTcpListener::bind(("127.0.0.1", 0)).expect("test listener");
+        let free_port = free.local_addr().expect("bound address").port();
+        drop(free);
+        assert!(!maintenance_listener_is_up(free_port).await);
     }
 
     #[tokio::test]

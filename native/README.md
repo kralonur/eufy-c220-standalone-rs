@@ -413,6 +413,15 @@ Verified by ear on 2026-09-16, at volume 60, with both paths: a three-tone patte
 (440/880/1760 Hz) came out of the speaker twice, once from raw PCM and once through
 the AAC decoder, and a ten-second 500-2000 Hz sweep was smooth end to end.
 
+Measured as well, by recording the camera's own microphone over RTSPS (PCMA, 8 kHz)
+while the speaker played: an ascending set (500/1000/2000 Hz) sent as raw PCM and a
+descending set (2000/1000/500 Hz) sent as AAC both came back in the intended order,
+with the peaks on the expected frequencies and the expected 0.6 s tone / 0.4 s gap
+spacing. What the recording also shows is that this speaker is not flat: 1 kHz
+arrives around ten times stronger than 500 Hz or 2 kHz (rms 2500 against 200-350 in
+the same capture). That is the driver in a small sealed enclosure, not the path, and
+it is the reason a low-frequency test tone sounds faint however high the volume is.
+
 What the camera does **not** do is invent audio it never received. Fed at real time it
 plays continuously; fed more slowly it runs dry and the gaps are audible. That is the
 whole of the "stutter" story, and it is measurement, not theory:

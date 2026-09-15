@@ -71,8 +71,9 @@ talkback (with a queued speaker path), continuous PTZ, night mode, mDNS, factory
 reset and SD-card recovery.
 
 Known gaps, stated plainly: the first command after a boot (audio or motor) can be
-lost; speaker audio is not yet smooth under load; and long-term stability over weeks
-is unproven rather than assumed.
+lost; talkback is smooth only when the client feeds it at real time, because the
+camera does not invent audio it never received; and long-term stability over weeks is
+unproven rather than assumed.
 
 ## Licensing note
 

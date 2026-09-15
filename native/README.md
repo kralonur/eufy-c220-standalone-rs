@@ -399,56 +399,33 @@ Exit status is 0 only when nothing failed; skipped checks are counted and printe
 because "not verified" is not the same as "verified". `--network-only` runs the
 reachability and configuration checks without credentials.
 
-### Talkback: queue implemented, writer must not block the runtime
+### Talkback: what the speaker path does, and what the client owes it
 
-The queued speaker path is implemented (`SpeakerFrame`, a bounded channel, a writer
-task, `try_send` with a 503 when full) and deployed. One flaw remains, found by
-measurement rather than reasoning: a single chunk took **20 s** (the client timeout)
-while the rest took ~60 ms.
+The speaker path is queued, not inline: `talkback_pcm` and `talkback_audio` reserve a
+timestamp and `try_send` a `SpeakerFrame` into a bounded channel
+(`AUDIO_QUEUE_FRAMES` = 32, so a couple of seconds of slack at the usual chunk size),
+a writer task drains it, and a full queue is answered with `503 "speaker queue is
+full"` instead of blocking. The write itself runs on `spawn_blocking`, so the engine's
+socket write never occupies a Tokio worker - that was the earlier flaw, and the fix
+is in the code, not pending.
 
-The cause is that the writer task performs the engine write inside the Tokio runtime.
-The engine socket write is blocking I/O, and the runtime is single-threaded on this
-one-core board, so a slow write stalls the accept loop and every other connection.
-The fix is to get the write off the runtime:
+Verified by ear on 2026-09-16, at volume 60, with both paths: a three-tone pattern
+(440/880/1760 Hz) came out of the speaker twice, once from raw PCM and once through
+the AAC decoder, and a ten-second 500-2000 Hz sweep was smooth end to end.
 
-- Use `std::sync::mpsc::sync_channel` (bounded, `try_send`) and a plain
-  `std::thread` writer, or `spawn_blocking` with `blocking_recv()`.
-- In the writer, call a *synchronous* command path (take `command_lock`, then call the
-  engine handle method) rather than awaiting `send_command`. The engine write is
-  blocking I/O either way, so an OS thread is the honest place for it.
-- Keep the handler's `try_send` and the 503-on-full response exactly as they are:
-  that part is correct and is what makes the client's pacing independent of the
-  engine's.
+What the camera does **not** do is invent audio it never received. Fed at real time it
+plays continuously; fed more slowly it runs dry and the gaps are audible. That is the
+whole of the "stutter" story, and it is measurement, not theory:
 
-### Known gap: talkback audio is written inline
+| how the client sent 10 s of audio | wall time | result |
+| --- | --- | --- |
+| one curl per 100 ms chunk, paced for a 100 ms budget | 17.8 s | choppy - the feed was 1.8x slower than the audio |
+| the same, paced to compensate for the per-request cost | 9.6 s | smooth |
 
-Push-to-talk audio stutters, and this is a regression against the reference bridge
-rather than a network problem. The reference queued audio and wrote it from a
-dedicated thread (`speaker.rs`: a bounded channel, `TrySendError::Full` reported as
-"speaker queue is full"); this firmware writes each frame to the engine synchronously
-from the HTTP handler, so the engine's playback pacing becomes the client's pacing and
-one slow write stretches the next chunk into silence.
-
-The fix, ready to implement:
-
-1. Add a bounded `tokio::sync::mpsc` channel to the control state (~`AUDIO_QUEUE_FRAMES
-   = 32` frames, roughly two seconds of slack) carrying
-   `enum SpeakerFrame { Pcm { data: Vec<u8>, timestamp_us: u64 }, Aac { .. } }`.
-2. Spawn a writer task in `ControlServer::start` that drains it with
-   `send_command(&inner, true, ..)` calling `send_speaker_pcm`/`send_speaker_aac`. The
-   `true` audio flag already keeps the audio path off the control mutex.
-3. Make `talkback_pcm` and `talkback_audio` `try_send` and answer immediately:
-   `200 {"status":"ok","bytes_sent":N,"queued":true}`, or `503 "speaker queue is full;
-   send audio at or below real time"`. The timestamp is still reserved at enqueue time
-   so pacing stays continuous.
-4. Leave start/stop/volume synchronous: only the payload is queued, so a stalled write
-   can never block a stop.
-
-Measured before the fix, from this machine over the LAN: one 100 ms chunk costs about
-53 ms end to end including a fresh TLS connection, and 20 sequential chunks run at a
-61 ms median with a 129 ms maximum, against a 100 ms real-time budget. Those numbers
-include per-request connection and Digest setup, so they are an upper bound - but the
-serialisation they show is the mechanism behind the stutter.
+A fresh TLS connection with a Digest handshake costs about 78 ms, so a client that
+opens one connection per chunk has already spent most of a 100 ms budget before the
+camera sees anything. A real client holds the connection open and streams; that is the
+case these numbers say nothing about, and the one that matters.
 
 ### Discovery by name (mDNS)
 

@@ -883,7 +883,13 @@ pub(crate) async fn ptz_center(inner: &Arc<ControlInner>) -> Vec<u8> {
     }
     let task_inner = Arc::clone(inner);
     tokio::task::spawn_blocking(move || {
-        let _lock = task_inner.ptz_lock.lock();
+        // Deliberately not holding the PTZ lock for the whole sweep: it takes half
+        // a minute, and holding it would make `/ptz/position` - the one way to watch
+        // progress, and the reason the flag above exists - block until the sweep
+        // finished, with clients timing out against it in the meantime. Each ioctl
+        // locks the device on its own, so the camera stays answerable; a move or a
+        // stop from another client interleaves, and the park is still the last
+        // thing that happens.
         match ptz.center() {
             Ok(()) => match ptz.position() {
                 Ok((pan, tilt)) => tracing::info!(pan, tilt, "PTZ centred"),

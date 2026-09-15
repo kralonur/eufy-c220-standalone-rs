@@ -70,10 +70,9 @@ Working and hardware-verified: RTSPS with verified TLS, the control API, MQTT,
 talkback (with a queued speaker path), continuous PTZ, night mode, mDNS, factory
 reset and SD-card recovery.
 
-Known gaps, stated plainly: the first command after a boot (audio or motor) can be
-lost; talkback is smooth only when the client feeds it at real time, because the
-camera does not invent audio it never received; and long-term stability over weeks is
-unproven rather than assumed.
+Known gaps, stated plainly: talkback is smooth only when the client feeds it at real
+time, because the camera does not invent audio it never received; and long-term
+stability over weeks is unproven rather than assumed.
 
 ## Licensing note
 

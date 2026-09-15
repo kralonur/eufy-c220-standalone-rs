@@ -722,7 +722,8 @@ except `/healthz`.
 | `GET /healthz` | liveness, no password |
 | `GET /ptz/position` | current pan and tilt |
 | `POST /ptz/move` | `{"direction":"left\|right\|up\|down","degrees":1..355,"speed":0..10}` |
-| `POST /ptz/stop`, `POST /ptz/center` | stop, or return to centre |
+| `POST /ptz/stop` | stop moving |
+| `POST /ptz/center` | re-home and park: both axes are driven onto both of their travel ends first (left, right, up, down), then to the centre. Takes about thirty seconds, so it answers `202` immediately and reports progress as `"centering":true` on `GET /ptz/position`; a second call while it runs answers `409` |
 
 Pan runs over 0..355 degrees and tilt over 0..75, with the park position at pan 178 /
 tilt 38. A command that would move *past* one of those ends is answered
@@ -730,6 +731,12 @@ tilt 38. A command that would move *past* one of those ends is answered
 This is worth knowing because a fresh boot reports pan 0, which is the left end, so
 the first `left` command of a boot looks like it was ignored. Read
 `GET /ptz/position` when the answer matters, or move the other way first.
+
+Centring is not a plain move to 178/38: the driver counts its own steps, so a bare
+move lands wherever its arithmetic believes the centre is, which drifts once the head
+has been nudged by hand or has lost steps. `POST /ptz/center` therefore sweeps to each
+end - a mechanical reference - and parks from there, which is what makes the result
+repeatable. Measured: 179/39 against the 178/38 target.
 | `POST /night_mode` | `{"mode":0\|1\|2}` - `0` automatic, `1` force night (IR on), `2` force day (IR off) |
 | `POST /talkback/status`, `/talkback/start`, `/talkback/stop`, `/talkback/clear`, `/talkback/pcm`, `/talkback/audio`, `/talkback/volume` | two-way audio |
 | `POST /maintenance/enable` | opens the root shell on port 23 for the current boot |

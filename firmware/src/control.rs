@@ -232,6 +232,7 @@ impl ControlServer {
             lockout: config.lockout,
             maintenance_available,
             maintenance_telnet_started: AtomicBool::new(false),
+            centering: AtomicBool::new(false),
             active: AtomicBool::new(false),
             next_timestamp_us: AtomicU64::new(0),
             volume: AtomicU32::new(DEFAULT_VOLUME),
@@ -296,6 +297,9 @@ pub(crate) struct ControlInner {
     /// The shell route is exposed only on the authenticated TLS listener.
     maintenance_available: bool,
     maintenance_telnet_started: AtomicBool,
+    /// Whether a centring sweep is running. It takes about thirty seconds, so it is
+    /// accepted and run outside the request that asked for it.
+    centering: AtomicBool,
     active: AtomicBool,
     next_timestamp_us: AtomicU64,
     volume: AtomicU32,
@@ -769,11 +773,12 @@ pub(crate) async fn night_mode(inner: &Arc<ControlInner>, body: &[u8]) -> Vec<u8
 }
 
 pub(crate) async fn ptz_position(inner: &Arc<ControlInner>) -> Vec<u8> {
+    let centering = inner.centering.load(Ordering::Acquire);
     match send_ptz(inner, |ptz| ptz.position()).await {
         Ok((pan, tilt)) => json_response(
             200,
             "OK",
-            &format!(r#"{{"status":"ok","pan":{pan},"tilt":{tilt}}}"#),
+            &format!(r#"{{"status":"ok","pan":{pan},"tilt":{tilt},"centering":{centering}}}"#),
         ),
         Err(error) => ptz_error_response(error),
     }
@@ -859,20 +864,38 @@ pub(crate) async fn ptz_stop(inner: &Arc<ControlInner>) -> Vec<u8> {
     }
 }
 
+/// Sweep both axes onto their travel ends and park the head at the centre.
+///
+/// Accepted rather than performed inline: the sequence takes about thirty seconds,
+/// which is longer than a client's request timeout and longer than this camera's
+/// control plane should hold a connection open for. The response says the work has
+/// started, `/ptz/position` reports whether it is still running, and a second
+/// request while one is in flight is refused with 409 rather than starting a second
+/// sweep on the same motors.
 pub(crate) async fn ptz_center(inner: &Arc<ControlInner>) -> Vec<u8> {
-    match send_ptz(inner, |ptz| {
-        ptz.center(5)?;
-        ptz.position()
-    })
-    .await
-    {
-        Ok((pan, tilt)) => json_response(
-            200,
-            "OK",
-            &format!(r#"{{"status":"ok","pan":{pan},"tilt":{tilt}}}"#),
-        ),
-        Err(error) => ptz_error_response(error),
+    let Some(ptz) = inner.ptz.clone() else {
+        return ptz_error_response(PtzFailure::Unavailable(
+            "PTZ controller is not available".to_string(),
+        ));
+    };
+    if inner.centering.swap(true, Ordering::AcqRel) {
+        return error_response(409, "PTZ centring is already running");
     }
+    let task_inner = Arc::clone(inner);
+    tokio::task::spawn_blocking(move || {
+        let _lock = task_inner.ptz_lock.lock();
+        match ptz.center() {
+            Ok(()) => match ptz.position() {
+                Ok((pan, tilt)) => tracing::info!(pan, tilt, "PTZ centred"),
+                Err(error) => {
+                    tracing::warn!(%error, "PTZ centred but its position could not be read")
+                }
+            },
+            Err(error) => tracing::warn!(%error, "PTZ centring did not finish"),
+        }
+        task_inner.centering.store(false, Ordering::Release);
+    });
+    json_response(202, "Accepted", r#"{"status":"ok","centering":true}"#)
 }
 
 fn reserve_timestamp(inner: &ControlInner, duration_us: u64) -> u64 {

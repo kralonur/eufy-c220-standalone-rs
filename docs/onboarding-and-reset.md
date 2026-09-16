@@ -712,7 +712,22 @@ Home Assistant discovery is **opt-in**: the camera publishes its entities to
 `STANDALONE_MQTT_DISCOVERY=1` is set. Without that line the broker still gets
 telemetry and commands under the camera's own topic prefix, but Home Assistant
 has no entities to drive - so a dashboard control that does nothing is worth
-checking for this first.
+checking for this first. Discovery creates two night-vision entities: a *Night
+mode* select for `auto`/`night`/`day`, and an *Infrared* switch whose state is
+the LED itself - turning it on forces night, turning it off forces day, and
+`auto` is chosen from the select.
+
+Two traps live on the Home Assistant side of that discovery. Every entity must
+carry a `unique_id`: without one Home Assistant creates the state but keeps it out
+of its registry, so the device shows up under MQTT with nothing attached to it.
+And Home Assistant defaults a switch's `state_on`/`state_off` to its *command*
+payloads, which is why the *Infrared* switch spells out `ON`/`OFF` separately - it
+commands `night`/`day` but the camera reports the LED as `ON`/`OFF`. Changing a
+payload is not enough on its own: an entity that already exists only gets its
+configuration updated, so remove the config topic (publish an empty retained
+message) and publish the corrected one again, or reload the MQTT integration. The
+camera republishes its own payload on every MQTT connect, so the firmware - not the
+broker - is the source of truth; patch the topic by hand and it will revert.
 
 ### The control API
 

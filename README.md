@@ -11,7 +11,8 @@ library).
 
 ## What it does
 
-- **RTSPS** on port 322, H.265 2304x1296 plus G.711 audio, Digest authentication.
+- **RTSPS** on port 322, H.265 2304x1296 plus G.711 microphone audio (opt-in, see
+  below) and an ONVIF-style talkback backchannel, Digest authentication.
 - **HTTPS API** on 8080 (TLS + Digest): `/status`, `/ptz/*`, `/night_mode`,
   `/talkback/*`, `/healthz`, and the privileged `/maintenance/enable` and
   `/reboot`.

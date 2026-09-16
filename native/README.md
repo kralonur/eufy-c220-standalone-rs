@@ -579,9 +579,22 @@ and open a root shell. That is the same trust level as the card slot, and it is
 the point - they are the recovery routes that need no tools and no working
 network.
 
-Microphone capture is opt-in. Create the root-owned marker
-`/home/nvram/system/.standalone_audio_enable` before starting the service when
-RTSP microphone audio is required; leave it absent to keep capture disabled.
+Microphone capture is opt-in, and nothing in this repository or the image creates
+the switch: a freshly deployed camera has no microphone track until you ask for one.
+Create the root-owned marker `/home/nvram/system/.standalone_audio_enable` before
+starting the service when RTSP microphone audio is required; leave it absent to keep
+capture disabled. Absent means the firmware also launches the engine with
+`--no-audio`, so the capture device is never opened - this is not a mute, it is the
+microphone not being started. `STANDALONE_AUDIO=1` in the service's environment
+overrides the marker either way, which is what a bench run wants; production scripts
+set neither.
+
+How to tell which state a running camera is in: read its SDP. The microphone is
+`trackID=1` (`m=audio` ... `a=control:trackID=1`), and it is absent when capture is
+disabled. The backchannel (`a=control:backchannel`, marked `a=sendonly`) is a
+separate media for audio *going to* the speaker and stays advertised either way, so a
+client that counts audio tracks will see two when the microphone is on and one when
+it is off.
 
 ### Clock
 

@@ -4,7 +4,7 @@
 //! in challenges or logs. The nonce is authenticated with a process-local key
 //! and expires, so a captured digest response cannot be replayed indefinitely.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use md5::{Digest as _, Md5};
 use sha2::Sha256;
 use std::collections::HashMap;
@@ -142,7 +142,7 @@ impl DigestAuth {
     }
 
     fn nonce_mac(&self, stamp: u64) -> String {
-        let mut mac = <HmacSha256 as Mac>::new_from_slice(&self.nonce_secret)
+        let mut mac = <HmacSha256 as KeyInit>::new_from_slice(&self.nonce_secret)
             .expect("HMAC accepts every key length");
         mac.update(stamp.to_string().as_bytes());
         hex(&mac.finalize().into_bytes())

@@ -11,6 +11,8 @@ use media::RecordKind;
 use media_engine::{MediaEngine, MediaEngineConfig, MediaEngineStopHandle};
 use ptz::PtzController;
 use rtsp::{RtspServer, RtspServerConfig, RtspsConfig};
+use tracing_subscriber::layer::{Layer as _, SubscriberExt as _};
+use tracing_subscriber::util::SubscriberInitExt as _;
 
 pub mod clock;
 pub mod control;
@@ -97,12 +99,24 @@ fn install_crypto_provider() {
 }
 
 fn initialize_logging() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+    // `RUST_LOG` takes the same `target=level` directives as before. Parsing
+    // them with `Targets` rather than `EnvFilter` avoids the regex directive
+    // engine, which costs a quarter of the binary for syntax this daemon does
+    // not use; malformed values fall back to `info`, as they did with
+    // `EnvFilter`.
+    let filter = std::env::var("RUST_LOG")
+        .ok()
+        .and_then(|value| value.parse::<tracing_subscriber::filter::Targets>().ok())
+        .unwrap_or_else(|| {
+            tracing_subscriber::filter::Targets::new()
+                .with_default(tracing_subscriber::filter::LevelFilter::INFO)
+        });
+    let _ = tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .with_filter(filter),
         )
-        .with_target(false)
         .try_init();
 }
 

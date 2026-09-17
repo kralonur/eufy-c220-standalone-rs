@@ -1,0 +1,12 @@
+# Opening a root shell on the camera, from a card.
+#
+# This file is read for its PRESENCE, not its contents: any file with this name on
+# a card that is present at boot starts /usr/sbin/telnetd on port 23 with /bin/sh.
+# That is the way back in when the network configuration is broken.
+#
+# Remove the card and reboot to close it again. Whoever can insert a card can open
+# this shell, which is why the card slot is a credential: keep it where the
+# camera's credentials deserve to be.
+#
+# Plaintext and unauthenticated on the LAN, so use it on a network you trust, and
+# treat anything typed into it as visible.

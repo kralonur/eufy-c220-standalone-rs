@@ -1,0 +1,13 @@
+# Move the camera to a different Wi-Fi network, from a card, with no console.
+#
+# Copy this file to the root of a FAT32 card and edit the values. The card is
+# read on every boot it is present, so REMOVE IT afterwards or it keeps
+# overriding the stored network.
+#
+# MODE is WPA, WEP or NONE. A WPA PSK is 8 to 63 characters; an SSID is at most
+# 32. Comment lines like these are ignored, and quotes around a value are
+# optional.
+
+SSID=MyNetwork
+PSK=my-wifi-password
+MODE=WPA

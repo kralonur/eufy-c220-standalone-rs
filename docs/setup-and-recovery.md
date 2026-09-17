@@ -5,31 +5,30 @@ cloud, no phone app. It speaks **RTSPS** (encrypted RTSP) to your NVR or media
 server and exposes a small **HTTPS control API** for pan/tilt, night mode and
 talkback. Everything except `/healthz` requires authentication.
 
-This document covers the three things you will actually do in practice:
+Installing the firmware itself - the card, the root shell, the harvest, building and
+writing the image - is [README steps 1-5](../README.md#install).
+This document is everything from step 6 onwards, in full:
 
-- **Set up a camera** that is new or has just been reset ([Part 1](#part-1-set-up-a-camera))
-- **Reset a camera** back to a blank state, or put it into rescue mode ([Part 2](#part-2-reset-and-rescue))
-- **Get out of trouble** when the camera is unreachable ([Part 3](#part-3-recovery-playbook))
+- **Provisioning a camera** that is new, reset or unprovisioned, and the choices in it:
+  credentials, certificate, name ([Part 1](#part-1-provisioning-and-configuration))
+- **Resetting a camera** to a blank state, or into rescue mode ([Part 2](#part-2-reset-and-rescue))
+- **Getting out of trouble** when the camera is unreachable ([Part 3](#part-3-recovery-playbook))
+- **Looking things up**: card formats, where files live, the control API, the boot
+  sequence ([Part 4](#part-4---reference))
 
 If you only read one thing: **a camera with no credentials is not reachable on
-your network** - it waits for you to provision it. Setting it up means giving it
-your Wi-Fi details and the passwords you want, and the easiest way to do that is
-a microSD card with one text file on it.
+your network** - it waits for you to provision it, which is one text file on a card.
 
 ---
 
-## What you need
+## What you need for this part
 
-| item | notes |
-| --- | --- |
-| The camera | powered from its USB-C lead, nothing else needed |
-| A microSD card | **FAT32**, any size, any label. It does not need to be empty |
-| A card reader for your computer | this is what makes setup a one-step job |
-| A plain text editor | Notepad, TextEdit, VS Code - anything that saves plain text |
-| Your Wi-Fi name and password | a 2.4 GHz network - this model's radio is 2.4 GHz |
-| A phone that can share a hotspot | **only** needed if you have no card reader (see [Route B](#route-b-no-card-reader-use-the-rescue-hotspot)) |
+Installation is behind you ([README steps 1-5](../README.md#install)), so provisioning
+asks for very little: a card reader, a plain text editor (anything that saves plain
+text), and your Wi-Fi name and password. A phone that can share a hotspot is only
+needed if you have no card reader.
 
-Decide now which route you will use:
+Decide which route you will use:
 
 - **You have a card reader** -> [Route A: SD card](#route-a-sd-card-recommended). Recommended. No hotspot, no terminal, no shell.
 - **You have no card reader** -> [Route B: rescue hotspot](#route-b-no-card-reader-use-the-rescue-hotspot). Works, but you will type commands.
@@ -47,9 +46,13 @@ Decide now which route you will use:
 
 ---
 
-## Part 1: set up a camera
+## Part 1: provisioning and configuration
 
-### Step 1: choose your credentials
+README steps 6-9 are this part: giving the camera your network and your credentials,
+and the choices that go with them. The card route below is the one to take; the rescue
+hotspot is for when you have no card reader at all.
+
+### Credentials
 
 You need two username/password pairs. They are separate on purpose: your NVR gets
 the RTSP pair, your control scripts get the HTTP pair.
@@ -65,7 +68,7 @@ Passwords may contain spaces and symbols such as `!#%` - just not quotes or `\`.
 
 Generate them rather than inventing them, for example `openssl rand -base64 24`.
 
-### Step 2: decide about the certificate
+### The certificate
 
 The camera must serve TLS, so either way something has to make your clients trust
 the certificate it presents. Choose by what you already run:
@@ -110,7 +113,7 @@ The full walkthrough, including signing with your own CA and the mistakes that
 make a camera refuse to start, is [Using your own certificate](#using-your-own-certificate)
 further down.
 
-### Step 3: know your camera's name
+### The camera's name
 
 Every camera answers to a name of its own over **mDNS**, derived from the board's
 serial number, so it is `camera-<serial>.local` - the serial printed on the camera,
@@ -596,7 +599,7 @@ it would remove and keeps.
 
 ### After a reset: getting back to normal
 
-A reset camera is a new camera, so go back to [Part 1](#part-1-set-up-a-camera).
+A reset camera is a new camera, so go back to [Part 1](#part-1-provisioning-and-configuration).
 With a card that is one step; without one it is the hotspot and shell route.
 
 While it is unprovisioned, the camera joins the rescue hotspot and opens the
@@ -628,7 +631,7 @@ boot.
    one - the new owner should not inherit your keys.
 3. What stays on the camera is the hardware identity: the board serial
    (`.pcbsn`), country and radio calibration. Nothing you configured remains.
-4. The new owner follows [Part 1](#part-1-set-up-a-camera) with their own
+4. The new owner follows [Part 1](#part-1-provisioning-and-configuration) with their own
    network and their own passwords.
 
 A reset camera will still trust anybody who can physically reach it: whoever can
@@ -651,7 +654,7 @@ as any camera with a reset button, and it is why physical access is the boundary
 | The card seems to be ignored | Was it in **before** power-on? Is it FAT32? Are the file names exactly `provision.txt` / `wifi.txt`, in the card's root, with no `.txt.txt`? Read `/tmp/c220-recovery.log` - it records what it found and why it refused |
 | The camera joined `RescueAP` instead of your network | Its Wi-Fi profile is missing or was wiped (for example after a factory reset), or the stored network cannot be reached. Provision it again |
 | You need a shell but have no card and cannot hold the button | `POST /maintenance/enable` on the control API opens port 23 for one boot. It needs the HTTP Digest password, and closes again after a reboot. If it reports that the shell did not start listening, ask again - the firmware clears its one-shot flag for that case |
-| Nothing works at all | The recovery paths above cover everything except a corrupted flash. Chip-level recovery with a CH341A programmer (partition map, offsets, read-before-write) is documented in `native/README.md`, under chip-level recovery |
+| Nothing works at all | The recovery paths above cover everything except a corrupted flash. Chip-level recovery with a CH341A programmer (partition map, offsets, read-before-write) is documented in [`docs/camera-internals.md`](camera-internals.md#chip-level-recovery-ch341a-uart) |
 
 ### Logs
 

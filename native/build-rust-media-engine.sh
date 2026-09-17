@@ -9,7 +9,7 @@ set -eu
 # bindings land) the vendor libraries, so CAMERA_ROOT is a build input even
 # before the hardware code exists.
 #
-# See media-engine/README.md for the platform constraints this build encodes.
+# See docs/media-engine.md for the platform constraints this build encodes.
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)

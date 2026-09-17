@@ -1,90 +1,18 @@
-# Native media companion
+# Camera internals and operational notes
 
-> Setting up, resetting or recovering a camera from the outside is documented for
-the owner in [`docs/onboarding-and-reset.md`](../docs/onboarding-and-reset.md).
-> This file documents the build and the internals.
+How the device behaves, what this firmware replaces, and the traps found on this
+board: flashing, going back to the factory firmware, chip-level recovery, discovery,
+the clock, the talkback path, and the deployment check that a write ends with.
 
-`media-engine/` is the native runtime companion built and deployed by this
-repository. It owns the camera hardware path that cannot be replaced by the
-Rust service layer:
+This is the reference to read when something is wrong or when you are about to do
+something irreversible. It is not the way in:
 
-- Rockchip AIQ/V4L2/VENC video capture and encoding;
-- Rockchip AI/AENC microphone capture;
-- Rockchip AO speaker playback and FDK AAC decoding; and
-- the shared `C220` Unix-socket record protocol.
+- setting a camera up, resetting it, and the recovery playbook are in
+  [`setup-and-recovery.md`](setup-and-recovery.md);
+- building the firmware and the media engine, and the vendor inputs they need, are in
+  [`building.md`](building.md).
 
-The Rust engine is `no_std` + `alloc` on the camera so its executable has no
-`PT_TLS` segment, and it uses the camera's uClibc entry point and vendor
-libraries through hand-written FFI, including its own entry stub. The legacy C
-engine and its builder have been removed now that the Rust engine owns the
-hardware.
-
-## Build inputs
-
-The source, build logic, and minimum factory ARM library/IQ bundle are
-contained in this repository under `native/camera-rootfs/`. Set `CAMERA_ROOT`
-to another compatible extraction when building for a different factory
-firmware revision. The expected layout is:
-
-```text
-<CAMERA_ROOT>/rootfs/lib/libc.so.0
-<CAMERA_ROOT>/rootfs/oem/usr/lib/librockit.so
-<CAMERA_ROOT>/rootfs/oem/usr/lib/librkaiq.so
-<CAMERA_ROOT>/rootfs/oem/usr/lib/libsmartIr.so
-<CAMERA_ROOT>/home/lib/libfdk-aac.so.1
-```
-
-The checked-in bundle contains the complete transitive library closure for
-the validated camera revision. These factory libraries are not reimplemented
-or replaced by the companion; they are linked dynamically and must remain at
-their matching paths in the deployed camera image.
-
-Build the companion with:
-
-```sh
-CAMERA_ROOT="$PWD/native/camera-rootfs" ./native/build-rust-media-engine.sh
-```
-
-The output defaults to `dist/c220-media-engine-rust`. Copy that binary into the
-camera image as `/home/c220-media-engine`; the Rust firmware uses that path by
-default. The package script performs this rename while staging the `/home`
-overlay.
-
-## Camera package
-
-The repository includes the Rust target linker in `.cargo/config.toml` and
-`native/arm-linker.sh`. Build both executables and create a `/home` overlay with:
-
-```sh
-./native/package-c220.sh
-```
-
-The default output is `dist/c220-home`. It contains the Rust `c220-firmware`,
-the Rust `c220-media-engine`, `lib/libfdk-aac.so.1`, the sensor calibration
-blob, and `script/c220-startup.sh`. When `BASE_HOME` is supplied, the superseded
-`c220-daemon` and split `c220-hw-*` helpers are removed by default so they
-cannot race the unified service and the image fits the `/home` partition. To
-preserve an existing factory `/home` tree and optionally create a squashfs
-image:
-
-```sh
-BASE_HOME=/path/to/preserved/home \\
-INSTALL_STARTUP_HOOK=1 \\
-SQUASHFS_OUT=dist/c220-home.squashfs \\
-./native/package-c220.sh
-```
-
-The startup hook is appended only when `INSTALL_STARTUP_HOOK=1`; this keeps
-boot-image changes explicit. `SECURE_DEPLOYMENT=1` is the default and removes
-legacy media binaries plus vendor/custom SD-card, NVRAM root-script, RescueAP,
-and Telnet hooks from a preserved `app.sh`. `SECURE_DEPLOYMENT=0` is only for
-a deliberate offline board bring-up. `SQUASHFS_OUT` refuses images larger than
-the camera's 4,915,200-byte `/home` partition. Set `REMOVE_LEGACY_MEDIA=0` only
-for a deliberate compatibility/debug image. Do not flash an image until its
-size, checksum, factory rollback path, and camera boot behavior have been
-checked.
-
-### Wi-Fi bootstrap
+## Wi-Fi bootstrap
 
 The factory vendor application was the component that started the supplicant and
 the DHCP client, and secure packaging removes it. `script/c220-wifi.sh` now owns
@@ -127,7 +55,7 @@ invalid configuration stops the service rather than opening a fallback:
 API, and both listeners require Digest credentials. `/healthz` is the only
 intentionally unauthenticated endpoint.
 
-#### The certificate is generated on first boot
+### The certificate is generated on first boot
 
 A new camera is not left needing a certificate authority: when neither
 `STANDALONE_RTSP_CERT_FILE` nor `STANDALONE_RTSP_KEY_FILE` exists, the firmware
@@ -184,15 +112,27 @@ remote way to refresh the one-boot shell window, which made every deployment ste
 cost physical access to the camera; it is authenticated exactly like the
 maintenance route, and it answers before the network goes away.
 
-### Chip-level recovery (CH341A, UART)
+## Chip-level recovery (CH341A, UART)
 
 Everything the running camera can do for itself needs no programmer: credentials,
 Wi-Fi, configuration and the whole `/home` image are recoverable from a card, the
-button, or the rescue network. `flashrom` on a CH341A is for the states where the
+button, or the rescue network. A factory camera can be entered the same way before
+this firmware is on it at all: the vendor boot script runs `iq.sh` from a FAT32 card
+as root, which is what `native/factory-bootstrap/iq.sh` is for and how the first
+install is done (see README.md). `flashrom` on a CH341A is for the states where the
 camera cannot run at all - a damaged bootloader, kernel or rootfs - and for a flash
 write that failed part way. This project only ever writes `mtd6` (the `home`
 partition, which holds the firmware itself); the vendor partitions below it are
 never touched.
+
+![The camera's mainboard with the enclosure removed](images/c220-mainboard.jpg)
+
+*The board with the cover off: the Rockchip **RV1103G1**, the `POWER`, `SPEAKER` and
+`MIC1` connectors, the Wi-Fi module in its shield, and where the vendor's serial and part
+label sits - redacted here, because it identifies one camera and the firmware derives its
+mDNS name from that serial. Nothing on this board is touched for a normal install: the
+card is the way in, and this photo is here so you know what you are looking at if you do
+open it.*
 
 The flash chip is a 16 MiB GD25Q128E. **Pin the chip name**, because autoprobe can
 select a different 16 MiB part and write the wrong thing:
@@ -200,6 +140,12 @@ select a different 16 MiB part and write the wrong thing:
 ```sh
 CHIP='GD25Q128E/GD25B128E/GD25R128E/GD25Q127C'
 ```
+
+![The GD25Q128E flash chip next to the lens](images/c220-flash-gd25q128e.jpg)
+
+*The chip itself, marked `25Q128ESIG`: SOIC-8 next to the lens, which is the awkward
+part of getting a clip onto it. The blue dot marks pin 1. That green wire is the
+vendor's antenna lead, not a modification of ours.*
 
 A full-chip read or write takes about two to three minutes. The layout, computed
 from `/proc/mtd` and confirmed against a full dump:
@@ -250,7 +196,7 @@ verified it - it needs a USB-TTL adapter that was not available while the rest o
 this was tested - so treat the baud rate and the shell as expected rather than
 proven.
 
-### Receiving RTSPS: SDP direction attributes and certificate verification
+## Receiving RTSPS: SDP direction attributes and certificate verification
 
 Two things about consuming this camera's RTSPS are worth knowing, both discovered the
 hard way while wiring it into a containerised NVR.
@@ -286,7 +232,7 @@ printed, and it is the anchor: a wrong fingerprint stops the connection rather t
 producing a warning. Publish it only on the host loopback, and let the NVR read that
 plain local stream, because a second listener on the LAN is a second way in.
 
-#### When the camera's certificate changes
+### When the camera's certificate changes
 
 A pin is tied to one certificate, so it stops working when the certificate is
 replaced. That happens when:
@@ -318,7 +264,21 @@ another NVR - needs the same update. Clients that trust a CA instead are unaffec
 this, which is the one advantage a CA keeps: the anchor outlives every certificate
 that is issued from it.
 
-### Flashing the home partition on this board
+## Flashing the home partition on this board
+
+The image has to reach the camera on a card first: there is no `scp`, no usable `wget`
+and no mtd-utils on the board, and the mount point depends on what is running.
+`native/c220-recovery.sh` mounts a card read-only at `/tmp/sd`, and factory firmware
+booted from a card (`native/factory-bootstrap/iq.sh`) has it at `/mnt/sdcard`. Pad the
+image before it travels, because the write discards its last erase block (below):
+
+```sh
+# on the computer: pad to a 64 KiB multiple, then add the one block the write
+# itself discards, and note the block count for the dd below
+cp dist/c220-home.squashfs /tmp/write.img
+truncate -s $(( ($(stat -c %s /tmp/write.img) + 65535) / 65536 * 65536 + 65536 )) /tmp/write.img
+echo "$(( $(stat -c %s /tmp/write.img) / 65536 )) blocks to write"
+```
 
 Two things that cost an hour and are worth knowing before touching mtd6:
 
@@ -369,7 +329,42 @@ Two things that cost an hour and are worth knowing before touching mtd6:
   bricked this camera once; the programmer is the fallback, and a full-chip dump
   taken while the camera last worked is what makes that fallback quick.
 
-### Verifying a deployment
+## Going back to the factory firmware
+
+The undo is the `/home` image that was on the camera before this firmware, and it is
+written exactly like any other image: same `dd`, same 64 KiB alignment, same read-back
+through `/dev/mtd6`. Two things are different, and both matter.
+
+- **The factory image fills the partition**, because it was the whole partition to
+  begin with. Take it from your own dump of `mtd6` (taken before this firmware was
+  installed), or cut the `home` region out of a full-chip dump with `dd` at the offset
+  and size in the layout table above; `unsquashfs` reads it if you want to look
+  before writing.
+- **The padding block does not fit.** Writing one block past the end of a
+  full-partition image would run past the partition, so the trick that makes the real
+  last block interior is not available - and the last block is exactly where the
+  squashfs id table lives. So write it, read the whole range back through
+  `/dev/mtd6`, and if the last block does not match, **stop and use the programmer**
+instead of rebooting. This path has not been exercised for a full-partition write;
+the smaller images this project ships are, and that is why they use the extra block.
+
+What that write does *not* touch is NVRAM, which is a separate partition mounted at
+`/home/nvram` and is never written by this project. The files this firmware keeps
+there (credentials, its certificate and key, the `standalone_*` configuration and
+markers) are simply unread once the vendor `/home` is back, so they are inert; remove
+them for a clean camera:
+
+```sh
+rm -rf /home/nvram/system/standalone_* /home/nvram/system/.standalone_*
+rm -f /home/nvram/custom.sh
+```
+
+The vendor's own Wi-Fi profile and region tables live in the same partition and are
+not ours to delete. With the factory `/home` restored and those leftovers gone, the
+camera behaves like a factory one from the outside: the vendor partitions below
+`/home` were never touched.
+
+## Verifying a deployment
 
 `native/verify-c220-deployment.sh` is the gate a `/home` write ends with. It checks
 the camera in layers, so whatever it can reach is still useful:
@@ -399,7 +394,7 @@ Exit status is 0 only when nothing failed; skipped checks are counted and printe
 because "not verified" is not the same as "verified". `--network-only` runs the
 reachability and configuration checks without credentials.
 
-### Talkback: what the speaker path does, and what the client owes it
+## Talkback: what the speaker path does, and what the client owes it
 
 The speaker path is queued, not inline: `talkback_pcm` and `talkback_audio` reserve a
 timestamp and `try_send` a `SpeakerFrame` into a bounded channel
@@ -436,7 +431,7 @@ opens one connection per chunk has already spent most of a 100 ms budget before 
 camera sees anything. A real client holds the connection open and streams; that is the
 case these numbers say nothing about, and the one that matters.
 
-### Discovery by name (mDNS)
+## Discovery by name (mDNS)
 
 The camera answers for its own name on the local network and advertises its stream,
 so a client does not have to be told an address and a generated certificate can be
@@ -472,7 +467,7 @@ Clients still need mDNS themselves. Docker containers do not have it: a containe
 that must resolve `.local` wants a hosts entry (one line in compose) or host
 networking, and Android apps generally cannot resolve `.local` at all.
 
-### Card recovery
+## Card recovery
 
 A camera with no working network has no other management path, and reaching it
 physically is slow. `script/c220-recovery.sh` therefore keeps a narrowly bounded
@@ -486,7 +481,7 @@ read-only with `nosuid,nodev,noexec`, and only these files are recognised:
 | `cert.pem`, `key.pem` | install a certificate and key instead of letting the firmware generate a self-signed pair; both are required |
 | `maintenance.txt` | starts the root shell on port 23 for that boot only |
 
-#### Setting up a camera with a card
+### Setting up a camera with a card
 
 Write `provision.txt` in the card's root, put the card in the camera and power it
 on. The camera writes the Wi-Fi profile, both password files, the configuration
@@ -526,7 +521,7 @@ where the camera's credentials deserve to be, and leave it out of the camera in
 normal operation. The recovery log is written to `/tmp/c220-recovery.log` on each
 boot.
 
-### Button recovery and factory reset
+## Button recovery and factory reset
 
 The physical reset button has two tiers, separated on purpose so a short press can
 never destroy a working camera's credentials:
@@ -553,7 +548,7 @@ PSK=my-hotspot-password
 in `/home/nvram/system/standalone_rescue.conf` (mode 0600, parsed as data and
 never sourced).
 
-### Unprovisioned state
+## Unprovisioned state
 
 A camera with no `standalone_auth.conf` cannot start any service - that is the
 fail-closed rule - so `script/c220-recovery.sh` treats it as unprovisioned and
@@ -596,7 +591,7 @@ separate media for audio *going to* the speaker and stays advertised either way,
 client that counts audio tracks will see two when the microphone is on and one when
 it is off.
 
-### Clock
+## Clock
 
 This board has no RTC. The boot script restores the last known time from
 `/home/nvram/system/.last_known_time`, which is plausible by construction and can

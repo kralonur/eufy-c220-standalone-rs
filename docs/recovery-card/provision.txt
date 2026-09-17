@@ -1,0 +1,38 @@
+# Provision a camera completely from a card: network plus service credentials,
+# written before the services start on the boot the card is present for. This is
+# the whole setup for a new owner and needs no shell.
+#
+# Copy this file to the root of a FAT32 card, replace every value, and remove the
+# card once the camera is up: the values are re-applied on every boot the card is
+# present.
+#
+# Rules: comment and blank lines are ignored, quotes around a value are optional,
+# only the first line for a key is read.
+#   usernames  1-32 characters from A-Z a-z 0-9 . _ @ -
+#   passwords  1-128 characters, no control characters, no quotes, no backslashes
+#   SSID at most 32 characters, WPA PSK 8-63 characters
+
+# --- network (the same keys wifi.txt takes) -------------------------------
+SSID=MyNetwork
+PSK=my-wifi-password
+MODE=WPA
+
+# --- service credentials (all four are required) --------------------------
+RTSP_USER=frigate
+RTSP_PASSWORD=replace-with-a-long-random-password
+HTTP_USER=admin
+HTTP_PASSWORD=replace-with-another-long-random-password
+
+# --- optional ------------------------------------------------------------
+# The encrypted RTSP port. 322 is the default; 0 would retire the listener, and
+# secure mode refuses to start without one, so leave this alone unless you want a
+# different port.
+#RTSPS_PORT=322
+
+# A LAN time server. The board has no RTC, so this is what sets the clock; the
+# gateway is tried as a fallback but many routers do not answer SNTP.
+#NTP_HOST=192.168.1.1
+
+# The camera's own name: used for mDNS (<name>.local) and inside the generated
+# certificate. Defaults to camera-<serial>.
+#HOST_NAME=c220-living-room

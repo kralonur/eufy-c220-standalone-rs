@@ -59,6 +59,22 @@ ls /home/os03b10_*.bin
 A file there means the harvest and the build work as documented. Nothing there means
 the camera is a different revision: read [`docs/camera-internals.md`](docs/camera-internals.md) first.
 
+### Other Eufy cameras
+
+This is built and verified for the C220 / T8W11, and only for that. But the vendor does
+not appear to write a firmware stack per model: the way in, the shape of the image and
+the boot script this project drives are all *theirs*, and they are shared across a line
+of Rockchip-based cameras. Since the entry point is that shared path rather than anything
+C220-specific, another camera from the same family is a plausible target rather than a
+hopeless one - untested, and not claimed.
+
+What would have to be re-measured is in
+[camera internals](docs/camera-internals.md#which-parts-are-bound-to-this-board): the sensor
+calibration blob, the capture and PTZ device nodes, the amplifier pin and button ladder,
+the audio devices, the ISP tuning files, and the versions of the vendor libraries. Take a
+full-chip dump and a factory `/home` before writing anything, and read
+[Recovery](#recovery) first.
+
 ## Install
 
 Nine steps, once. Steps 1-5 put this firmware on the camera, steps 6-9 give it your

@@ -610,3 +610,40 @@ because many routers do not answer SNTP at all - on the tested network the
 gateway stayed silent and only a LAN host could set the clock. Digest nonces and
 TLS do not depend on an accurate clock; log timestamps and any future timestamp
 signing do.
+
+## Which parts are bound to this board
+
+Everything above is written for the C220 / T8W11. This section exists because the vendor's
+cameras look like a family rather than a stack per model: if another Rockchip-based Eufy
+camera is tried, this is what has to be measured again, and what probably carries over as
+it is. None of it is claimed to work elsewhere.
+
+Comes from the vendor's own firmware, so likely the same on a sibling model:
+
+- **The way in.** The vendor boot script runs `iq.sh` from a FAT32 card as root, which is
+  the vendor's hook and not ours - see [Install](../README.md#install) in the README.
+- **The shape of the image.** `/home` is a squashfs on `mtd6`, written through
+  `/dev/block/by-name/home`, with the erase-block behaviour described above.
+- **The framework around it.** `/home/script/app.sh`, `/home/app/*` (`anker_t8w11*`,
+  `ipclink_eufy`, `tinymix`), `/home/nvram`, and the vendor libraries under
+  `/oem/usr/lib`.
+
+Bound to this board, and therefore to be measured first:
+
+| what | where it is set | value here |
+| --- | --- | --- |
+| sensor calibration blob | `native/package-c220.sh` | `os03b10_CMK-OT2117-PC1_30IRC-F16.bin` |
+| capture device | the engine and the firmware | `/dev/video12` |
+| PTZ device | `firmware/src/ptz.rs` | `/dev/motor` |
+| amplifier enable pin | `media-engine/src/backend/hardware.rs` | GPIO 102 |
+| ALSA devices | the engine | `hw:0,0`, `hw:1,0` |
+| button ladder | `native/c220-button.sh` | SARADC, pressed below 800 (idle 1020-1023, held 557-561) |
+| ISP tuning | the harvested bundle | `cac_map_hw_2560x1440.bin`, `iqfiles/` |
+| vendor libraries and versions | `native/camera-rootfs`, harvested per camera | `librockit`, `librkaiq`, `libsmartIr`, `librga`, `librockchip_mpp`, `libfdk-aac` |
+
+The IP address of the wireless module and the sensor itself are the other two things that
+differ in practice: both are inside the harvested bundle rather than assumed, which is why
+the harvest exists.
+
+Treat a first write on an untried model as an experiment: a full-chip dump and a factory
+`/home` first, and the programmer as the fallback.

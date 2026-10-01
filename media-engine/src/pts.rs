@@ -24,6 +24,18 @@ impl Counter {
         }
     }
 
+    /// Keep fallback timestamps anchored to valid capture time, so one missing
+    /// timestamp cannot jump back to the beginning of the stream.
+    pub fn capture_or_advance(&mut self, capture: Option<u64>) -> u64 {
+        match capture {
+            Some(time) => {
+                self.next_us = time;
+                time
+            }
+            None => self.advance(),
+        }
+    }
+
     /// Return the next timestamp, advancing the counter.
     ///
     /// Wrapping matches the reference engine's unsigned counter arithmetic.
@@ -58,6 +70,15 @@ mod tests {
 
         assert_eq!(counter.advance(), 20_000);
         assert_eq!(counter.advance(), 40_000);
+    }
+
+    #[test]
+    fn missing_capture_time_continues_from_the_sensor_clock() {
+        let mut counter = Counter::new(1_000_000 / 15);
+        assert_eq!(counter.capture_or_advance(Some(1_000_000)), 1_000_000);
+        assert_eq!(counter.capture_or_advance(None), 1_066_666);
+        assert_eq!(counter.capture_or_advance(Some(1_133_333)), 1_133_333);
+        assert_eq!(counter.capture_or_advance(None), 1_199_999);
     }
 
     #[test]

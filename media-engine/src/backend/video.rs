@@ -94,9 +94,9 @@ const POLL_TIMEOUT_MS: i32 = 3000;
 /// Pause after a failed hand-off, in microseconds (reference value).
 const SEND_RETRY_PAUSE_US: u32 = 2000;
 
-/// Timestamp step for a frame the driver did not stamp, in microseconds: the
-/// reference engine's 50 ms.
-const FALLBACK_STEP_US: u64 = 50_000;
+/// SI conversion used to derive unstamped-frame cadence from the configured
+/// sensor rate, rather than assuming the reference engine's fixed 50 ms.
+const MICROSECONDS_PER_SECOND: u64 = 1_000_000;
 
 /// Frames between statistics lines (reference value).
 const STATS_INTERVAL: u64 = 75;
@@ -360,7 +360,7 @@ fn capture_loop(
 ) {
     let mut access_unit = vec![0_u8; MAX_ACCESS_UNIT];
     let mut stream = EncodedStreamBuffer::<MAX_PACKS>::new();
-    let mut fallback = Counter::new(FALLBACK_STEP_US);
+    let mut fallback = Counter::new(MICROSECONDS_PER_SECOND / u64::from(fps.max(1)));
     let mut stats = Stats::default();
 
     while !shutdown.requested() {
@@ -389,7 +389,7 @@ fn capture_loop(
         // encoder reads it.
         input.flush();
 
-        let pts_us = frame.timestamp_us().unwrap_or_else(|| fallback.advance());
+        let pts_us = fallback.capture_or_advance(frame.timestamp_us());
         stats.last_pts_us = pts_us;
         let base = input.as_mut_slice().as_mut_ptr();
         let info = VideoFrameInfo {

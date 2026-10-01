@@ -270,7 +270,7 @@ impl MediaEngineHandle {
     }
 
     /// Send one command record to the companion.
-    pub fn write_record(&self, record: &MediaRecord) -> io::Result<()> {
+    pub fn write_record<P: AsRef<[u8]>>(&self, record: &MediaRecord<P>) -> io::Result<()> {
         let mut socket = self
             .socket
             .lock()
@@ -285,7 +285,7 @@ impl MediaEngineHandle {
             codec: 0,
             keyframe: false,
             timestamp_us: 0,
-            payload: Vec::new(),
+            payload: &[],
         })
     }
 
@@ -304,7 +304,7 @@ impl MediaEngineHandle {
             codec: 0,
             keyframe: true,
             timestamp_us,
-            payload: pcm.to_vec(),
+            payload: pcm,
         })
     }
 
@@ -323,7 +323,7 @@ impl MediaEngineHandle {
             codec: 0,
             keyframe: false,
             timestamp_us,
-            payload: aac.to_vec(),
+            payload: aac,
         })
     }
 
@@ -340,7 +340,7 @@ impl MediaEngineHandle {
             codec: 0,
             keyframe: false,
             timestamp_us: 0,
-            payload: volume.to_le_bytes().to_vec(),
+            payload: volume.to_le_bytes(),
         })
     }
 
@@ -357,7 +357,7 @@ impl MediaEngineHandle {
             codec: 0,
             keyframe: false,
             timestamp_us: 0,
-            payload: vec![mode],
+            payload: [mode],
         })
     }
 

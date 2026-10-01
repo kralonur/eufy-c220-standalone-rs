@@ -182,6 +182,9 @@ dependencies = [
 [[package]]
 name = "c220-media-protocol"
 version = "0.1.0"
+dependencies = [
+ "memchr",
+]
 
 [[package]]
 name = "cc"

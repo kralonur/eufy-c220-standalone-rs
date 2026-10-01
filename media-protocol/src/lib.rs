@@ -14,6 +14,8 @@
 
 extern crate alloc;
 
+pub mod annex_b;
+
 use alloc::vec::Vec;
 use core::fmt;
 
@@ -183,20 +185,23 @@ impl Header {
 }
 
 /// One camera-local media record.
+///
+/// Incoming records own their payload by default. Outgoing records can borrow
+/// a slice or use a fixed-size array without allocating or copying it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MediaRecord {
+pub struct MediaRecord<P = Vec<u8>> {
     pub kind: RecordKind,
     pub codec: u8,
     pub keyframe: bool,
     pub timestamp_us: u64,
-    pub payload: Vec<u8>,
+    pub payload: P,
 }
 
-impl MediaRecord {
+impl<P: AsRef<[u8]>> MediaRecord<P> {
     /// Build the validated header describing this record.
     pub fn header(&self) -> Result<Header, ProtocolError> {
         Header::new(
-            self.payload.len(),
+            self.payload.as_ref().len(),
             self.timestamp_us,
             self.keyframe,
             self.kind,

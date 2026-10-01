@@ -7,7 +7,7 @@
 pub use c220_media_protocol::{MediaRecord, RecordKind};
 
 use c220_media_protocol::{FRAME_HEADER_LEN, Header, ProtocolError};
-use std::io::{self, Read, Write};
+use std::io::{self, IoSlice, Read, Write};
 
 /// Read one record from a byte stream.
 ///
@@ -16,10 +16,15 @@ use std::io::{self, Read, Write};
 /// boundary unusable.
 pub fn read_record<R: Read>(reader: &mut R) -> io::Result<Option<MediaRecord>> {
     let mut header = [0_u8; FRAME_HEADER_LEN];
-    if reader.read(&mut header[..1])? == 0 {
-        return Ok(None);
-    }
-    reader.read_exact(&mut header[1..])?;
+    let received = loop {
+        match reader.read(&mut header) {
+            Ok(0) => return Ok(None),
+            Ok(count) => break count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    };
+    reader.read_exact(&mut header[received..])?;
 
     let header = Header::parse(&header).map_err(invalid_data)?;
     let mut payload = vec![0_u8; header.payload_len()];
@@ -35,10 +40,24 @@ pub fn read_record<R: Read>(reader: &mut R) -> io::Result<Option<MediaRecord>> {
 }
 
 /// Write one complete record to a byte stream.
-pub fn write_record<W: Write>(record: &MediaRecord, writer: &mut W) -> io::Result<()> {
-    let header = record.header().map_err(invalid_input)?;
-    writer.write_all(&header.encode())?;
-    writer.write_all(&record.payload)
+pub fn write_record<W: Write, P: AsRef<[u8]>>(
+    record: &MediaRecord<P>,
+    writer: &mut W,
+) -> io::Result<()> {
+    let header = record.header().map_err(invalid_input)?.encode();
+    let mut slices = [IoSlice::new(&header), IoSlice::new(record.payload.as_ref())];
+    let mut remaining = &mut slices[..];
+    // A vectored write can stop in either slice. Keep the record boundary
+    // intact even for writers that only implement scalar writes.
+    while !remaining.is_empty() {
+        match writer.write_vectored(remaining) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(written) => IoSlice::advance_slices(&mut remaining, written),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 fn invalid_data(error: ProtocolError) -> io::Error {
@@ -72,6 +91,101 @@ mod tests {
             .expect("record should be present");
 
         assert_eq!(decoded, original);
+    }
+
+    struct ShortIo {
+        bytes: Cursor<Vec<u8>>,
+        limit: usize,
+        interrupted: bool,
+    }
+
+    impl Read for ShortIo {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            if std::mem::take(&mut self.interrupted) {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            let count = output.len().min(self.limit);
+            self.bytes.read(&mut output[..count])
+        }
+    }
+
+    impl Write for ShortIo {
+        fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+            self.write_vectored(&[IoSlice::new(input)])
+        }
+
+        fn write_vectored(&mut self, input: &[IoSlice<'_>]) -> io::Result<usize> {
+            if std::mem::take(&mut self.interrupted) {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            let mut remaining = self.limit;
+            let mut written = 0;
+            for slice in input {
+                let count = remaining.min(slice.len());
+                self.bytes.write_all(&slice[..count])?;
+                remaining -= count;
+                written += count;
+            }
+            Ok(written)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // Short writes can stop inside either iovec or cross their boundary;
+    // interruptions at the first header byte must not be reported as EOF.
+    #[test]
+    fn round_trips_borrowed_records_with_short_and_interrupted_io() {
+        for payload in [&[][..], &[0xab; 31][..]] {
+            let record = MediaRecord {
+                kind: RecordKind::SPEAKER_PCM,
+                codec: 0,
+                keyframe: true,
+                timestamp_us: 20_000,
+                payload,
+            };
+            for limit in [
+                1,
+                FRAME_HEADER_LEN - 1,
+                FRAME_HEADER_LEN,
+                FRAME_HEADER_LEN + 1,
+            ] {
+                let mut stream = ShortIo {
+                    bytes: Cursor::new(Vec::new()),
+                    limit,
+                    interrupted: true,
+                };
+                write_record(&record, &mut stream).expect("short vectored writes should finish");
+                stream.bytes.set_position(0);
+                stream.interrupted = true;
+                let decoded = read_record(&mut stream)
+                    .expect("interrupted reads should retry")
+                    .expect("record should be present");
+                assert_eq!(decoded.header(), record.header());
+                assert_eq!(decoded.payload, payload);
+                assert_eq!(read_record(&mut stream).expect("EOF"), None);
+            }
+        }
+        let record = MediaRecord {
+            kind: RecordKind::SPEAKER_CLEAR,
+            codec: 0,
+            keyframe: false,
+            timestamp_us: 0,
+            payload: &[],
+        };
+        let mut stream = ShortIo {
+            bytes: Cursor::new(Vec::new()),
+            limit: 0,
+            interrupted: false,
+        };
+        assert_eq!(
+            write_record(&record, &mut stream)
+                .expect_err("zero write must fail")
+                .kind(),
+            io::ErrorKind::WriteZero
+        );
     }
 
     #[test]

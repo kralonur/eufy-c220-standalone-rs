@@ -10,26 +10,11 @@ const IRAP_NAL_TYPES: core::ops::RangeInclusive<u8> = 16..=23;
 /// Whether an Annex B HEVC access unit contains an IRAP picture.
 ///
 /// Both 3-byte and 4-byte start codes are accepted, matching the reference
-/// implementation. The scan walks every byte rather than parsing NAL units,
-/// which is what the encoder's output requires in practice.
+/// implementation. Inspect only headers so an IRAP can be recognized without
+/// scanning its entire body or building a NAL index.
 pub fn detect(data: &[u8]) -> bool {
-    // The reference loop runs while `index + 4 < data.len()`, so the last four
-    // bytes are never treated as a start code.
-    for index in 0..data.len().saturating_sub(4) {
-        let offset = if data[index..].starts_with(&[0, 0, 1]) {
-            index + 3
-        } else if data[index..].starts_with(&[0, 0, 0, 1]) {
-            index + 4
-        } else {
-            continue;
-        };
-        // `offset` is always within the buffer: the first branch needs three
-        // bytes and the second four, both guaranteed by the loop bound.
-        if IRAP_NAL_TYPES.contains(&((data[offset] >> 1) & 0x3f)) {
-            return true;
-        }
-    }
-    false
+    c220_media_protocol::annex_b::headers(data)
+        .any(|header| header.len() == 2 && IRAP_NAL_TYPES.contains(&((header[0] >> 1) & 0x3f)))
 }
 
 #[cfg(test)]

@@ -4,23 +4,30 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-base64 = { workspace = true }
+base64 = { workspace = true, default-features = false, features = ["std"] }
 bytes = { workspace = true }
 # Shared camera-local media framing, also used by the no_std media engine.
 c220-media-protocol = { path = "../media-protocol" }
-hmac = { workspace = true }
+hmac = { workspace = true, default-features = false }
 libc = { workspace = true }
-md-5 = { workspace = true }
-mdns-sd = { workspace = true }
-rcgen = { workspace = true }
-rtp = { workspace = true }
+md-5 = { workspace = true, default-features = false }
+mdns-sd = { workspace = true, default-features = false }
+# Enable std search acceleration for the shared protocol's Annex-B iterator.
+memchr = { workspace = true }
+rand = { workspace = true, default-features = false, features = ["std_rng", "sys_rng"] }
+rcgen = { workspace = true, default-features = false, features = ["pem", "ring"] }
+roxmltree = { workspace = true }
 rtsp-runtime = { workspace = true, features = ["tokio"] }
 rtsp-types = { workspace = true }
-rumqttc = { workspace = true }
-rustls = { workspace = true, features = ["ring", "std"] }
-rustls-pki-types = { workspace = true, features = ["std"] }
-sha2 = { workspace = true }
+rtp = { workspace = true }
+rumqttc = { workspace = true, default-features = false, features = ["use-rustls-no-provider"] }
+rustls = { workspace = true, default-features = false, features = ["ring", "std"] }
+rustls-pki-types = { workspace = true, default-features = false, features = ["std"] }
+sha1 = { workspace = true, default-features = false }
+sha2 = { workspace = true, default-features = false }
+time = { workspace = true, features = ["parsing", "formatting"] }
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
-tokio-rustls = { workspace = true, features = ["ring"] }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true, features = ["fmt"] }
+tokio-rustls = { workspace = true, default-features = false, features = ["ring"] }
+tracing = { workspace = true, default-features = false, features = ["std"] }
+tracing-subscriber = { workspace = true, default-features = false, features = ["fmt"] }
+zeroize = { workspace = true }

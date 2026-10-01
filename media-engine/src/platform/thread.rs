@@ -34,6 +34,12 @@ pub struct Thread {
     joined: bool,
 }
 
+// SAFETY: pthread_t is an opaque runtime token, not a pointer to Rust data.
+// pthread_join/detach accept handles from other threads. Mutation requires &mut
+// Thread, and moving/sharing it does not duplicate ownership of the handle.
+unsafe impl Send for Thread {}
+unsafe impl Sync for Thread {}
+
 impl Thread {
     /// Wait for the thread to finish.
     pub fn join(&mut self) {

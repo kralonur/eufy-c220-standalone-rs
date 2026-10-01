@@ -10,8 +10,10 @@
 //! libcs, so it is over-sized here and only ever touched through libc.
 
 use super::Error;
+use alloc::boxed::Box;
 use core::cell::UnsafeCell;
-use core::mem::size_of;
+use core::marker::PhantomData;
+use core::mem::{ManuallyDrop, size_of};
 use core::ops::{Deref, DerefMut};
 
 /// Storage for a `pthread_mutex_t`, larger than any libc's definition of it.
@@ -22,7 +24,9 @@ const _: () = assert!(size_of::<Storage>() >= 48);
 
 /// A mutual-exclusion lock around a value.
 pub struct Mutex<T> {
-    storage: Storage,
+    // A pthread mutex must keep its initialization address. UnsafeCell also
+    // permits libc to mutate its state through shared references to this lock.
+    storage: ManuallyDrop<Box<UnsafeCell<Storage>>>,
     value: UnsafeCell<T>,
 }
 
@@ -37,43 +41,91 @@ impl<T> Mutex<T> {
     /// Initializing can fail in principle (the libc reports `ENOMEM`), so the
     /// caller sees it rather than a lock that misbehaves later.
     pub fn new(value: T) -> Result<Self, Error> {
-        let mutex = Self {
-            storage: Storage([0; 64]),
-            value: UnsafeCell::new(value),
-        };
-        // As with the thread calls, the error code is the return value: pthreads
-        // do not report through `errno`.
-        let status = unsafe { libc::pthread_mutex_init(mutex.storage(), core::ptr::null()) };
+        let storage = Box::new(UnsafeCell::new(Storage([0; 64])));
+        let mut attributes = Storage([0; 64]);
+        let attributes = (&mut attributes as *mut Storage).cast();
+        // SAFETY: aligned, oversized storage for the opaque native attributes.
+        let status = unsafe { libc::pthread_mutexattr_init(attributes) };
         if status != 0 {
             return Err(Error::from_errno(status));
         }
-        Ok(mutex)
+        // SAFETY: attributes are initialized. Explicit NORMAL semantics make
+        // reentrant locking deadlock rather than invoking DEFAULT's POSIX UB.
+        let mut status =
+            unsafe { libc::pthread_mutexattr_settype(attributes, libc::PTHREAD_MUTEX_NORMAL) };
+        if status == 0 {
+            // SAFETY: the allocation stays at this address until destruction,
+            // and the attributes are initialized. Only construct Self after
+            // success so failure never destroys an uninitialized native mutex.
+            status = unsafe { libc::pthread_mutex_init(storage.get().cast(), attributes) };
+        }
+        // SAFETY: initialization succeeded, regardless of later operations.
+        unsafe { libc::pthread_mutexattr_destroy(attributes) };
+        if status != 0 {
+            return Err(Error::from_errno(status));
+        }
+        Ok(Self {
+            storage: ManuallyDrop::new(storage),
+            value: UnsafeCell::new(value),
+        })
     }
 
     /// Block until the lock is free, then hold it.
     pub fn lock(&self) -> Result<Guard<'_, T>, Error> {
+        // SAFETY: construction initialized the native mutex at this address;
+        // UnsafeCell permits libc's interior mutation while locking.
         let status = unsafe { libc::pthread_mutex_lock(self.storage()) };
         if status != 0 {
             return Err(Error::from_errno(status));
         }
-        Ok(Guard { mutex: self })
+        Ok(Guard {
+            mutex: self,
+            _not_send: PhantomData,
+        })
     }
 
     fn storage(&self) -> *mut libc::pthread_mutex_t {
-        &self.storage as *const Storage as *mut libc::pthread_mutex_t
+        self.storage.get().cast()
     }
 }
 
 impl<T> Drop for Mutex<T> {
     fn drop(&mut self) {
-        unsafe { libc::pthread_mutex_destroy(self.storage()) };
+        // A safe caller can forget a guard, leaving the mutex locked. POSIX
+        // forbids destroying that mutex, so leak its storage in that case,
+        // just as std's pthread-backed mutex does.
+        // SAFETY: this mutex is initialized at a stable address. Exclusive
+        // ownership rules out other users except a forgotten guard.
+        if unsafe { libc::pthread_mutex_trylock(self.storage()) } == 0 {
+            // SAFETY: trylock acquired the mutex on this thread; unlock before
+            // destroying it, then free its backing storage exactly once.
+            unsafe {
+                libc::pthread_mutex_unlock(self.storage());
+                libc::pthread_mutex_destroy(self.storage());
+                ManuallyDrop::drop(&mut self.storage);
+            }
+        }
     }
 }
 
-/// The lock while it is held; releasing it happens on drop.
+/// The lock while it is held; releasing it happens on the acquiring thread.
+///
+/// A pthread mutex must not be unlocked by another thread, so a guard is not
+/// `Send`, even when its protected value is:
+///
+/// ```compile_fail
+/// use c220_media_engine::platform::sync::Guard;
+/// fn require_send<T: Send>() {}
+/// require_send::<Guard<'static, u32>>();
+/// ```
 pub struct Guard<'a, T> {
     mutex: &'a Mutex<T>,
+    _not_send: PhantomData<*mut ()>,
 }
+
+// SAFETY: a shared guard only exposes &T, and cannot unlock or mutate it.
+// Requiring T: Sync prevents sharing interior-mutable non-Sync values.
+unsafe impl<T: Sync> Sync for Guard<'_, T> {}
 
 impl<T> Deref for Guard<'_, T> {
     type Target = T;
@@ -93,6 +145,8 @@ impl<T> DerefMut for Guard<'_, T> {
 
 impl<T> Drop for Guard<'_, T> {
     fn drop(&mut self) {
+        // SAFETY: this non-Send guard holds the lock on the acquiring thread,
+        // and the borrowed mutex keeps its native storage alive.
         unsafe { libc::pthread_mutex_unlock(self.mutex.storage()) };
     }
 }
@@ -125,6 +179,13 @@ mod tests {
         }
 
         assert_eq!(*mutex.lock().expect("lock should succeed"), 4 * increments);
+    }
+
+    #[test]
+    fn dropping_a_mutex_with_a_forgotten_guard_is_safe() {
+        let mutex = Mutex::new(0_u32).expect("mutex should initialize");
+        core::mem::forget(mutex.lock().expect("lock should succeed"));
+        drop(mutex);
     }
 
     #[test]

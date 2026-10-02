@@ -111,6 +111,16 @@ pub struct UnixStream {
 }
 
 impl UnixStream {
+    /// Own a close-on-exec duplicate so a queued writer cannot retain a stale fd.
+    pub(crate) fn try_clone(&self) -> Result<Self, Error> {
+        // SAFETY: fcntl duplicates this live descriptor; the result is newly owned.
+        let fd = unsafe { libc::fcntl(self.fd, libc::F_DUPFD_CLOEXEC, 0) };
+        if fd < 0 {
+            return Err(Error::last());
+        }
+        Ok(Self { fd })
+    }
+
     /// Ask the kernel for a receive timeout.
     ///
     /// Best effort: the reference engine ignores the result too, and a read that
@@ -175,13 +185,46 @@ impl Drop for UnixStream {
 /// Separate from [`UnixStream`] because record producers hold the daemon's
 /// descriptor rather than the stream that owns it.
 pub(crate) fn write_all(descriptor: c_int, buffer: &[u8]) -> Result<(), Error> {
-    let mut remaining = buffer;
-    while !remaining.is_empty() {
+    write_all_vectored(descriptor, buffer, &[])
+}
+
+/// Send a record's header and payload together without concatenating them.
+/// Callers must serialize producers for the entire operation, including retries.
+pub(crate) fn write_all_vectored(
+    descriptor: c_int,
+    mut first: &[u8],
+    mut second: &[u8],
+) -> Result<(), Error> {
+    let start = monotonic_ms()?;
+    while !first.is_empty() || !second.is_empty() {
+        let remaining = IPC_WRITE_TIMEOUT_MS.saturating_sub(monotonic_ms()?.saturating_sub(start));
+        if remaining == 0 {
+            return Err(Error::from_errno(libc::ETIMEDOUT));
+        }
+        let mut vectors = [
+            libc::iovec {
+                iov_base: first.as_ptr() as *mut c_void,
+                iov_len: first.len(),
+            },
+            libc::iovec {
+                iov_base: second.as_ptr() as *mut c_void,
+                iov_len: second.len(),
+            },
+        ];
+        // SAFETY: A zeroed msghdr represents no address or ancillary data.
+        // Both iovecs point to live immutable slices for this synchronous send;
+        // sendmsg does not modify their contents despite the C pointer types.
+        let mut message: libc::msghdr = unsafe { mem::zeroed() };
+        message.msg_iov = vectors.as_mut_ptr();
+        message.msg_iovlen = vectors.len() as _;
+        // SAFETY: The message and its two buffers remain valid until sendmsg
+        // returns. MSG_NOSIGNAL turns a disconnected peer into EPIPE rather
+        // than terminating the process, independent of signal installation.
         let written = unsafe {
-            libc::write(
+            libc::sendmsg(
                 descriptor,
-                remaining.as_ptr() as *const c_void,
-                remaining.len(),
+                &message,
+                libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT,
             )
         };
         if written < 0 {
@@ -189,14 +232,67 @@ pub(crate) fn write_all(descriptor: c_int, buffer: &[u8]) -> Result<(), Error> {
             if error.is_interrupted() {
                 continue;
             }
+            if error.would_block() {
+                let mut socket = libc::pollfd {
+                    fd: descriptor,
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                // SAFETY: one live pollfd; the timeout is a bounded millisecond count.
+                let status = unsafe { libc::poll(&mut socket, 1, remaining as libc::c_int) };
+                if status == 0 {
+                    return Err(Error::from_errno(libc::ETIMEDOUT));
+                }
+                if status < 0 && !Error::last().is_interrupted() {
+                    return Err(Error::last());
+                }
+                continue;
+            }
             return Err(error);
         }
         if written == 0 {
             return Err(Error::from_errno(libc::EPIPE));
         }
-        remaining = &remaining[written as usize..];
+        let written = written as usize;
+        if written < first.len() {
+            first = &first[written..];
+        } else {
+            second = &second[written - first.len()..];
+            first = &[];
+        }
     }
     Ok(())
+}
+
+/// Two-second private IPC write budget: a wedged daemon must not retain the
+/// writer and vendor capture buffers indefinitely. Unlike SO_SNDTIMEO this is
+/// one monotonic deadline across all partial sends and interruptions.
+const IPC_WRITE_TIMEOUT_MS: u64 = 2_000;
+
+fn monotonic_ms() -> Result<u64, Error> {
+    // The legacy Linux syscall uses kernel word-sized timespec fields. Calling
+    // musl's time64 binding against vendor uClibc would use the wrong ABI.
+    #[repr(C)]
+    struct KernelTimespec {
+        seconds: KernelTime,
+        nanoseconds: KernelTime,
+    }
+    let mut time = KernelTimespec {
+        seconds: 0,
+        nanoseconds: 0,
+    };
+    // SAFETY: CLOCK_MONOTONIC writes one correctly sized kernel timespec.
+    let status = unsafe {
+        libc::syscall(
+            libc::SYS_clock_gettime,
+            libc::CLOCK_MONOTONIC,
+            &mut time as *mut KernelTimespec,
+        )
+    };
+    if status < 0 {
+        return Err(Error::last());
+    }
+    Ok((time.seconds as u64).saturating_mul(1_000) + time.nanoseconds as u64 / 1_000_000)
 }
 
 fn bind_address(fd: c_int, path: &CString) -> Result<(), Error> {
@@ -265,6 +361,52 @@ mod tests {
 
         assert_eq!(client.join().expect("client thread"), *b"pong");
         std::fs::remove_file(&path).expect("socket file should be removable");
+    }
+
+    // The new scatter/gather writer must retry partial sends without losing
+    // the header boundary, and a disconnected daemon must not raise SIGPIPE.
+    #[test]
+    fn vectored_writes_handle_large_payloads_and_disconnected_peers() {
+        use std::os::fd::{AsRawFd, IntoRawFd};
+        let (writer, mut reader) = StdStream::pair().expect("socket pair");
+        let descriptor = writer.as_raw_fd();
+        let buffer_size: c_int = 1_024;
+        // SAFETY: descriptor is live; buffer_size is a correctly sized int
+        // socket option. The small send buffer forces the record across sends.
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(
+                    descriptor,
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    &buffer_size as *const c_int as *const c_void,
+                    size_of::<c_int>() as libc::socklen_t,
+                )
+            },
+            0
+        );
+        let header = *b"C220-test-header";
+        let payload = alloc::vec![0xab; 512 * 1024];
+        let expected = [header.as_slice(), payload.as_slice()].concat();
+        let receive = std::thread::spawn(move || {
+            let mut bytes = alloc::vec![0; expected.len()];
+            reader.read_exact(&mut bytes).expect("read complete record");
+            assert_eq!(bytes, expected);
+        });
+        write_all_vectored(descriptor, &header, &payload).expect("send complete record");
+        receive.join().expect("receiver thread");
+
+        let (writer, reader) = StdStream::pair().expect("socket pair");
+        let writer = UnixStream {
+            fd: writer.into_raw_fd(),
+        };
+        drop(reader);
+        assert_eq!(
+            write_all_vectored(writer.raw_fd(), &header, &payload)
+                .expect_err("disconnected peer")
+                .errno(),
+            Some(libc::EPIPE)
+        );
     }
 
     #[test]

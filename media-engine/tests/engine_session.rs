@@ -4,9 +4,12 @@
 //! connect, read the greeting, send commands and watch a malformed session end.
 //! This is the code the camera runs, with only the backend mocked.
 
-use c220_media_engine::backend::MockBackend;
+use c220_media_engine::backend::{Backend, MockBackend};
 use c220_media_engine::cli::EngineConfig;
+use c220_media_engine::client::RecordSink;
+use c220_media_engine::commands::Command;
 use c220_media_engine::engine::Engine;
+use c220_media_engine::platform::Error;
 use c220_media_engine::platform::signal::Shutdown;
 use c220_media_protocol::{FRAME_HEADER_LEN, Header, RecordKind};
 use std::io::{Read, Write};
@@ -24,6 +27,10 @@ struct Harness {
 
 impl Harness {
     fn start(name: &str) -> Self {
+        Self::start_with_backend(name, MockBackend::new())
+    }
+
+    fn start_with_backend(name: &str, mut backend: impl Backend + Send + 'static) -> Self {
         let path = format!(
             "/tmp/c220-media-engine-session-{}-{name}.sock",
             std::process::id()
@@ -35,8 +42,8 @@ impl Harness {
         let mut engine = Engine::bind(&config).expect("engine should bind");
         let stop = engine.stop_handle();
         let session = std::thread::spawn(move || {
-            let mut backend = MockBackend::new();
             engine.serve(&mut backend);
+            backend.shutdown();
         });
         Self {
             path,
@@ -167,6 +174,70 @@ fn serves_a_second_session_after_the_first_ends() {
     );
     drop(second);
 
+    harness.finish();
+}
+
+struct FloodingBackend {
+    inner: MockBackend,
+    go: Option<std::sync::mpsc::Receiver<()>>,
+    producer: Option<JoinHandle<()>>,
+}
+
+impl Backend for FloodingBackend {
+    fn start(&mut self, sink: Arc<RecordSink>, _: Arc<Shutdown>) -> Result<(), Error> {
+        let go = self.go.take().expect("one start");
+        self.producer = Some(std::thread::spawn(move || {
+            go.recv().expect("start producer after greeting");
+            let payload = vec![0xab; c220_media_protocol::MAX_PAYLOAD_LEN];
+            let _ = sink.send(RecordKind::VIDEO, 2, true, 0, &payload);
+        }));
+        Ok(())
+    }
+
+    fn command(&mut self, command: Command<'_>, sink: &RecordSink) -> Result<(), Error> {
+        self.inner.command(command, sink)
+    }
+
+    fn night_mode(&self) -> (bool, bool) {
+        self.inner.night_mode()
+    }
+
+    fn shutdown(&mut self) {
+        if let Some(producer) = self.producer.take() {
+            producer.join().expect("producer should exit");
+        }
+    }
+}
+
+// Rejection must wake a video producer blocked in a full send buffer before
+// detaching its locked sink. Keeping the first peer open reproduces the deadlock.
+#[test]
+fn a_malformed_session_releases_a_backpressured_producer() {
+    let (go, receiver) = std::sync::mpsc::channel();
+    let backend = FloodingBackend {
+        inner: MockBackend::new(),
+        go: Some(receiver),
+        producer: None,
+    };
+    let harness = Harness::start_with_backend("backpressure", backend);
+    let mut first = harness.connect();
+    assert_eq!(read_record(&mut first).0, RecordKind::NIGHT_MODE);
+    go.send(()).expect("start video producer");
+    let mut header = [0; FRAME_HEADER_LEN];
+    first.read_exact(&mut header).expect("video write started");
+    assert_eq!(
+        Header::parse(&header).expect("video header").payload_len(),
+        c220_media_protocol::MAX_PAYLOAD_LEN
+    );
+    // Do not drain the multi-megabyte payload. The producer is blocked while
+    // the independent session reader rejects this deliberately corrupt header.
+    first
+        .write_all(&[0; FRAME_HEADER_LEN])
+        .expect("bad command header");
+    let mut second = harness.connect();
+    assert_eq!(read_record(&mut second).0, RecordKind::NIGHT_MODE);
+    drop(first);
+    drop(second);
     harness.finish();
 }
 

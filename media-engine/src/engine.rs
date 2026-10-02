@@ -9,7 +9,7 @@ use crate::platform::signal::Shutdown;
 use crate::platform::{self, Error, media_log};
 use alloc::ffi::CString;
 use alloc::sync::Arc;
-use alloc::vec;
+use alloc::vec::Vec;
 use c220_media_protocol::ProtocolError;
 
 /// Retry delay after a failed accept, matching the reference engine.
@@ -110,6 +110,9 @@ impl Engine {
             media_log!("media_greeting_error={}", error);
         }
 
+        // Talkback arrives continuously. Retain bounded command storage for
+        // the session instead of allocating for every PCM block.
+        let mut payload = Vec::new();
         loop {
             let header = match client::read_header(client, stop) {
                 Ok(HeaderRead::Header(header)) => header,
@@ -142,7 +145,7 @@ impl Engine {
                 break;
             }
 
-            let mut payload = vec![0_u8; header.payload_len()];
+            payload.resize(header.payload_len(), 0);
             if !payload.is_empty() {
                 match client::read_exact(client, &mut payload, stop) {
                     Ok(Outcome::Filled) => {}
@@ -173,8 +176,11 @@ impl Engine {
             }
         }
 
-        // The sink is detached before the socket closes, so a producer cannot
-        // write to a descriptor that has already been reused.
+        // Wake a producer blocked on a daemon that stopped reading before
+        // acquiring the sink lock. Otherwise a rejected command could deadlock
+        // here while that producer waits for the same daemon to drain video.
+        client.shutdown();
+        // Detach before closing so a producer cannot use a recycled descriptor.
         if let Err(error) = self.sink.detach() {
             media_log!("media_client_detach_error={error}");
         }

@@ -4,111 +4,16 @@
 //! `c220-media-protocol` crate); this module is the socket side of it. Reads
 //! belong to the session thread, which serves commands, and writes can come from
 //! anywhere - the session thread's own greeting and night-mode records, and the
-//! producer threads for microphone and video - so writes go through [`RecordSink`],
-//! which holds the connection and one lock.
+//! producer threads for microphone and video. [`RecordSink`] owns a bounded
+//! queue and a writer thread, so vendor capture never waits for socket I/O.
 
 use crate::platform::Error;
-use crate::platform::net::{self, UnixStream};
-use crate::platform::sync::Mutex;
-use c220_media_protocol::{FRAME_HEADER_LEN, Header, ProtocolError, RecordKind};
-use core::sync::atomic::{AtomicI32, Ordering};
-
-/// The descriptor value that means "no daemon connected".
-const NO_DESCRIPTOR: i32 = -1;
-
-/// The connected daemon, as record producers see it.
-///
-/// The reference engine keeps the same thing in a global descriptor plus
-/// `client_lock`; keeping them together means the descriptor cannot change while
-/// a record is half-written, and that a detached sink is never a stale one.
-pub struct RecordSink {
-    descriptor: AtomicI32,
-    writes: Mutex<()>,
-}
-
-impl RecordSink {
-    /// Create a sink with no daemon attached.
-    pub fn new() -> Result<Self, Error> {
-        Ok(Self {
-            descriptor: AtomicI32::new(NO_DESCRIPTOR),
-            writes: Mutex::new(())?,
-        })
-    }
-
-    /// Whether a daemon is connected.
-    pub fn connected(&self) -> bool {
-        self.descriptor.load(Ordering::SeqCst) != NO_DESCRIPTOR
-    }
-
-    /// Point the sink at the session's socket.
-    pub fn attach(&self, stream: &UnixStream) -> Result<(), Error> {
-        // Taking the lock means a write already in flight finishes before the
-        // descriptor changes.
-        let _writes = self.writes.lock()?;
-        self.descriptor.store(stream.raw_fd(), Ordering::SeqCst);
-        Ok(())
-    }
-
-    /// Forget the session, before its socket is closed.
-    pub fn detach(&self) -> Result<(), Error> {
-        let _writes = self.writes.lock()?;
-        self.descriptor.store(NO_DESCRIPTOR, Ordering::SeqCst);
-        Ok(())
-    }
-
-    /// Write one record.
-    ///
-    /// A missing daemon is not an error: a producer simply has nowhere to send
-    /// its record, which is what the reference engine's `client_current() >= 0`
-    /// check amounts to.
-    pub fn send(
-        &self,
-        kind: RecordKind,
-        codec: u8,
-        keyframe: bool,
-        timestamp_us: u64,
-        payload: &[u8],
-    ) -> Result<(), Error> {
-        let _writes = self.writes.lock()?;
-        let descriptor = self.descriptor.load(Ordering::SeqCst);
-        if descriptor == NO_DESCRIPTOR {
-            return Ok(());
-        }
-        write_record_to(descriptor, kind, codec, keyframe, timestamp_us, payload)
-    }
-
-    /// Write the night-mode state the daemon expects on connect.
-    ///
-    /// The payload is the current mode and whether it was chosen manually, which
-    /// is what the reference engine sends at the start of every client session.
-    pub fn send_night_mode(&self, night: bool, manual: bool) -> Result<(), Error> {
-        let payload = [u8::from(night), u8::from(manual)];
-        self.send(RecordKind::NIGHT_MODE, 0, false, 0, &payload)
-    }
-}
-
-/// Write one record to a connected descriptor.
-///
-/// The header is built here so an oversized payload is rejected before anything
-/// reaches the socket.
-fn write_record_to(
-    descriptor: i32,
-    kind: RecordKind,
-    codec: u8,
-    keyframe: bool,
-    timestamp_us: u64,
-    payload: &[u8],
-) -> Result<(), Error> {
-    let header = match Header::new(payload.len(), timestamp_us, keyframe, kind, codec) {
-        Ok(header) => header,
-        Err(error) => {
-            crate::platform::media_log!("media_record_rejected={}", error);
-            return Err(Error::from_errno(libc::EINVAL));
-        }
-    };
-    net::write_all(descriptor, &header.encode())?;
-    net::write_all(descriptor, payload)
-}
+use crate::platform::net::UnixStream;
+#[cfg(test)]
+use c220_media_protocol::RecordKind;
+use c220_media_protocol::{FRAME_HEADER_LEN, Header, ProtocolError};
+mod queue;
+pub use queue::RecordSink;
 
 /// The first part of a record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -178,7 +83,7 @@ mod tests {
         alloc::format!("/tmp/c220-media-engine-{}-{name}.sock", std::process::id())
     }
 
-    fn connected_pair(name: &str) -> (UnixStream, StdStream, alloc::string::String) {
+    pub(super) fn connected_pair(name: &str) -> (UnixStream, StdStream, alloc::string::String) {
         let path = socket_path(name);
         let listener = UnixListener::bind(&path).expect("listener should bind");
         let client = std::thread::spawn({
@@ -238,14 +143,14 @@ mod tests {
         sink.attach(&server).expect("attach should succeed");
         sink.send_night_mode(false, true)
             .expect("attached send should work");
-        sink.detach().expect("detach should succeed");
-        sink.send_night_mode(true, false)
-            .expect("a send after detach is not an error");
-
-        // Only the attached record arrived.
+        // Observe delivery before detaching: detach intentionally purges pending
+        // records rather than letting them leak into a later session.
         let (header, payload) = read_record(&mut client);
         assert_eq!(header.kind(), RecordKind::NIGHT_MODE);
         assert_eq!(payload, [0, 1]);
+        sink.detach().expect("detach should succeed");
+        sink.send_night_mode(true, false)
+            .expect("a send after detach is not an error");
 
         drop(client);
         std::fs::remove_file(&path).expect("socket file should be removable");
@@ -257,8 +162,8 @@ mod tests {
         let sink = Arc::new(RecordSink::new().expect("sink should initialize"));
         sink.attach(&server).expect("attach should succeed");
 
-        // Small enough that neither producer can fill the socket buffer and
-        // block before the test reads.
+        // Deliberately burst faster than capture: overload may drop audio, but
+        // records delivered by concurrent producers must never interleave.
         const RECORDS: usize = 20;
         let producers: Vec<_> = (0..2)
             .map(|_| {
@@ -275,14 +180,22 @@ mod tests {
             producer.join().expect("producer should finish");
         }
 
-        // Every record arrives whole: the header and its payload are never
-        // interleaved with another thread's.
-        for _ in 0..RECORDS * 2 {
+        // State feedback is retained behind surviving audio as a flush marker.
+        sink.send_night_mode(true, true)
+            .expect("marker should enqueue");
+        let mut records = 0;
+        loop {
             let (header, payload) = read_record(&mut client);
+            if header.kind() == RecordKind::NIGHT_MODE {
+                assert_eq!(payload, [1, 1]);
+                break;
+            }
             assert_eq!(header.kind(), RecordKind::AUDIO_CAPTURE);
             assert_eq!(payload.len(), 320);
             assert!(payload.iter().all(|byte| *byte == 0xab));
+            records += 1;
         }
+        assert!(records > 0 && records <= RECORDS * 2);
 
         drop(client);
         std::fs::remove_file(&path).expect("socket file should be removable");

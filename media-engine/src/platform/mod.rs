@@ -14,6 +14,7 @@ use core::ffi::c_int;
 use core::fmt;
 
 pub mod alloc;
+pub(crate) mod event;
 pub mod file;
 pub mod net;
 pub mod signal;

@@ -723,6 +723,7 @@ async fn handle_request(
             uri,
             &authorization,
             SystemTime::now(),
+            peer.ip(),
         );
         if outcome != Outcome::Authorized {
             if outcome == Outcome::Denied && !authorization.is_empty() {

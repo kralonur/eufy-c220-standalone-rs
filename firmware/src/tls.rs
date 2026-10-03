@@ -3,9 +3,15 @@
 //! Certificate and private-key paths are supplied from writable camera NVRAM;
 //! no key material is embedded in the firmware image.
 
+#[cfg(test)]
+mod hardening_tests;
+
 use rustls_pki_types::pem::PemObject;
 use std::io;
 use std::path::Path;
+use std::time::Duration;
+use tokio::net::TcpStream;
+use tokio_rustls::server::TlsStream;
 
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -14,6 +20,21 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 #[cfg(unix)]
 const INSECURE_KEY_MODE_BITS: u32 = 0o077;
 use tokio_rustls::TlsAcceptor;
+
+/// A five-second LAN handshake budget bounds idle clients before authentication.
+#[cfg(not(test))]
+pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(300);
+
+pub(crate) async fn accept(
+    acceptor: TlsAcceptor,
+    stream: TcpStream,
+) -> io::Result<TlsStream<TcpStream>> {
+    tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TLS handshake timed out"))?
+}
 
 /// Build a TLS server acceptor from a PEM certificate chain and private key.
 ///
@@ -59,14 +80,20 @@ pub fn build_acceptor(cert_file: &Path, key_file: &Path) -> io::Result<TlsAccept
         )));
     }
     #[cfg(unix)]
-    if key_metadata.uid() != 0 || key_metadata.permissions().mode() & INSECURE_KEY_MODE_BITS != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!(
-                "key {} must be root-owned and mode 0600 or stricter",
-                key_file.display()
-            ),
-        ));
+    {
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        let ours = unsafe { libc::geteuid() };
+        if (key_metadata.uid() != 0 && key_metadata.uid() != ours)
+            || key_metadata.permissions().mode() & INSECURE_KEY_MODE_BITS != 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "key {} must be owned by root or the service user and mode 0600 or stricter",
+                    key_file.display()
+                ),
+            ));
+        }
     }
     let key = rustls_pki_types::PrivateKeyDer::from_pem_file(key_file).map_err(|error| {
         io::Error::other(format!("key {} is unreadable: {error}", key_file.display()))

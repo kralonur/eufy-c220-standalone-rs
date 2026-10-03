@@ -8,6 +8,7 @@ use crate::digest::DigestAuth;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use zeroize::Zeroizing;
 
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -16,6 +17,13 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 /// users. Password files must keep all of these bits clear.
 #[cfg(unix)]
 const INSECURE_SECRET_MODE_BITS: u32 = 0o077;
+
+/// Deployment admission budget, including unauthenticated connections and TLS
+/// handshakes: eight concurrent API requests leave room for polling and controls.
+pub(crate) const MAX_CONTROL_CONNECTIONS: usize = 8;
+
+/// Shared RTSP/RTSPS admission budget, including pre-authentication and TLS.
+pub(crate) const MAX_RTSP_CONNECTIONS: usize = 4;
 
 /// Longest DNS label, from RFC 1035.
 const MAX_HOST_LABEL_LENGTH: usize = 63;
@@ -73,14 +81,14 @@ fn env_string(variable: &str) -> io::Result<Option<String>> {
 
 /// Read a secret from the file named by `variable`, applying the same ownership and
 /// mode checks the service credentials get. Returns `None` when unset.
-pub fn secret_file(variable: &str) -> io::Result<Option<String>> {
+pub fn secret_file(variable: &str) -> io::Result<Option<Zeroizing<String>>> {
     match env_string(variable)? {
         Some(path) => read_secret_file(&path, variable).map(Some),
         None => Ok(None),
     }
 }
 
-fn read_secret_file(path: &str, variable: &str) -> io::Result<String> {
+fn read_secret_file(path: &str, variable: &str) -> io::Result<Zeroizing<String>> {
     let path = Path::new(path);
     if !path.is_absolute() {
         return Err(io::Error::new(
@@ -108,25 +116,31 @@ fn read_secret_file(path: &str, variable: &str) -> io::Result<String> {
     }
     #[cfg(unix)]
     {
-        if metadata.uid() != 0 || metadata.permissions().mode() & INSECURE_SECRET_MODE_BITS != 0 {
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        let ours = unsafe { libc::geteuid() };
+        if (metadata.uid() != 0 && metadata.uid() != ours)
+            || metadata.permissions().mode() & INSECURE_SECRET_MODE_BITS != 0
+        {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!(
-                    "{variable} must be root-owned and mode 0600 or stricter: {}",
+                    "{variable} must be owned by root or the service user and mode 0600 or stricter: {}",
                     path.display()
                 ),
             ));
         }
     }
-    std::fs::read_to_string(path).map_err(|error| {
-        io::Error::new(
-            error.kind(),
-            format!(
-                "{variable} points to unreadable file {}: {error}",
-                path.display()
-            ),
-        )
-    })
+    std::fs::read_to_string(path)
+        .map(Zeroizing::new)
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "{variable} points to unreadable file {}: {error}",
+                    path.display()
+                ),
+            )
+        })
 }
 
 /// Read the camera's own name: the mDNS host name and the first name in a

@@ -506,6 +506,7 @@ async fn authorize_request(
         &request.uri,
         authorization,
         SystemTime::now(),
+        peer.ip(),
     );
     if outcome == Outcome::Authorized {
         inner.lockout.record_success(peer.ip()).await;

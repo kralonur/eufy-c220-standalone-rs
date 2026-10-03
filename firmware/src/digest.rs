@@ -11,8 +11,10 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read};
 use std::net::IpAddr;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::Mutex as StdMutex;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
+use zeroize::Zeroizing;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -24,7 +26,7 @@ const NONCE_MAX_AGE: Duration = Duration::from_secs(300);
 pub const REALM: &str = "eufy-c220";
 
 /// Digest algorithm offered by a service.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum Algorithm {
     Sha256,
     Md5,
@@ -62,7 +64,7 @@ fn hex(bytes: &[u8]) -> String {
     output
 }
 
-fn constant_time_eq(left: &str, right: &str) -> bool {
+pub(crate) fn constant_time_eq(left: &str, right: &str) -> bool {
     let (left, right) = (left.as_bytes(), right.as_bytes());
     if left.len() != right.len() {
         return false;
@@ -82,32 +84,66 @@ pub enum Outcome {
     Denied,
 }
 
+/// Bound the recent authenticated nonce-count cache to avoid retaining an
+/// unbounded number of client-generated cnonces. This is a deployment budget,
+/// not a promise of replay protection after a cache entry has been evicted.
+const MAX_REPLAY_ENTRIES: usize = 256;
+
+/// Policy bound on client-generated cnonces retained in the replay cache. RFC
+/// 7616 does not fix their length; common clients use only a few dozen bytes.
+const MAX_CNONCE_LEN: usize = 256;
+
+/// Our nonce: at most twenty decimal u64 digits, one colon, sixty-four hex
+/// SHA-256 MAC characters. Reject padding before retaining client input.
+const MAX_NONCE_LEN: usize = 85;
+
 /// Credentials and nonce state for one protected service.
 pub struct DigestAuth {
     username: String,
-    password: String,
-    nonce_secret: [u8; 32],
+    ha1_sha256: Zeroizing<String>,
+    ha1_md5: Zeroizing<String>,
+    nonce_secret: Zeroizing<[u8; 32]>,
     max_nonce_age: Duration,
+    replay: StdMutex<HashMap<ReplayKey, ReplayUse>>,
+}
+
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct ReplayKey {
+    peer: IpAddr,
+    nonce: String,
+    cnonce: String,
+    algorithm: Algorithm,
+}
+
+struct ReplayUse {
+    nonce_count: u32,
+    last_seen: Instant,
 }
 
 impl DigestAuth {
     /// Construct an authenticator using the camera's CSPRNG.
-    pub fn new(username: impl Into<String>, password: impl Into<String>) -> io::Result<Self> {
+    pub fn new(username: impl Into<String>, password: &str) -> io::Result<Self> {
         let username = username.into();
-        let password = password.into();
         if username.trim().is_empty() || password.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "Digest username and password must not be empty",
             ));
         }
-        let mut nonce_secret = [0_u8; 32];
-        File::open("/dev/urandom")?.read_exact(&mut nonce_secret)?;
+        // Digest needs only HA1. Clear the temporary plaintext combination and
+        // clear the retained password-equivalent hashes when the service drops.
+        let ha1_input = Zeroizing::new(format!("{username}:{REALM}:{password}"));
+        let ha1_sha256 = Zeroizing::new(Algorithm::Sha256.hash(ha1_input.as_bytes()));
+        let ha1_md5 = Zeroizing::new(Algorithm::Md5.hash(ha1_input.as_bytes()));
+        let mut nonce_secret = Zeroizing::new([0_u8; 32]);
+        File::open("/dev/urandom")?.read_exact(nonce_secret.as_mut())?;
         Ok(Self {
             username,
-            password,
+            ha1_sha256,
+            ha1_md5,
             nonce_secret,
             max_nonce_age: NONCE_MAX_AGE,
+            replay: StdMutex::new(HashMap::new()),
         })
     }
 
@@ -121,9 +157,8 @@ impl DigestAuth {
     pub fn challenge(&self, now: SystemTime, algorithm: Algorithm) -> String {
         let nonce = self.nonce(now);
         format!(
-            "Digest realm=\"{REALM}\", qop=\"auth\", algorithm={}, nonce=\"{nonce}\", opaque=\"{}\"",
-            algorithm.token(),
-            hex(&self.nonce_secret[..8])
+            "Digest realm=\"{REALM}\", qop=\"auth\", algorithm={}, nonce=\"{nonce}\"",
+            algorithm.token()
         )
     }
 
@@ -142,7 +177,7 @@ impl DigestAuth {
     }
 
     fn nonce_mac(&self, stamp: u64) -> String {
-        let mut mac = <HmacSha256 as KeyInit>::new_from_slice(&self.nonce_secret)
+        let mut mac = <HmacSha256 as KeyInit>::new_from_slice(self.nonce_secret.as_ref())
             .expect("HMAC accepts every key length");
         mac.update(stamp.to_string().as_bytes());
         hex(&mac.finalize().into_bytes())
@@ -155,6 +190,7 @@ impl DigestAuth {
         uri: &str,
         authorization: &str,
         now: SystemTime,
+        peer: IpAddr,
     ) -> Outcome {
         let Some(fields) = parse_digest_header(authorization) else {
             return Outcome::Denied;
@@ -180,6 +216,9 @@ impl DigestAuth {
         let Some(nonce) = fields.get("nonce") else {
             return Outcome::Denied;
         };
+        if nonce.len() > MAX_NONCE_LEN {
+            return Outcome::Denied;
+        }
         match self.check_nonce(nonce, now) {
             NonceCheck::Valid => {}
             NonceCheck::Stale => return Outcome::Stale,
@@ -191,26 +230,104 @@ impl DigestAuth {
         let algorithm = match fields.get("algorithm") {
             Some(value) => match Algorithm::from_token(value) {
                 Some(algorithm) => algorithm,
-                None => return Outcome::Stale,
+                None => return Outcome::Denied,
             },
             None => Algorithm::Md5,
         };
-        let ha1 = algorithm.hash(format!("{}:{REALM}:{}", self.username, self.password).as_bytes());
+        let ha1 = match algorithm {
+            Algorithm::Sha256 => &self.ha1_sha256,
+            Algorithm::Md5 => &self.ha1_md5,
+        };
+        let ha1 = ha1.as_str();
         let ha2 = algorithm.hash(format!("{method}:{uri}").as_bytes());
-        let expected = match fields.get("qop") {
+        let replay = match fields.get("qop") {
             Some(qop) if qop.eq_ignore_ascii_case("auth") => {
                 let (Some(nc), Some(cnonce)) = (fields.get("nc"), fields.get("cnonce")) else {
                     return Outcome::Denied;
                 };
-                algorithm.hash(format!("{ha1}:{nonce}:{nc}:{cnonce}:{qop}:{ha2}").as_bytes())
+                let Some(nonce_count) = parse_nonce_count(nc) else {
+                    return Outcome::Denied;
+                };
+                if cnonce.is_empty()
+                    || cnonce.len() > MAX_CNONCE_LEN
+                    || cnonce.bytes().any(|byte| byte.is_ascii_whitespace())
+                {
+                    return Outcome::Denied;
+                }
+                Some((nonce_count, cnonce.as_str()))
             }
-            None => algorithm.hash(format!("{ha1}:{nonce}:{ha2}").as_bytes()),
+            None => None,
             Some(_) => return Outcome::Denied,
         };
-        if constant_time_eq(response, &expected) {
-            Outcome::Authorized
-        } else {
-            Outcome::Denied
+        let response_input = Zeroizing::new(match fields.get("qop") {
+            Some(qop) if qop.eq_ignore_ascii_case("auth") => {
+                let (Some(nc), Some(cnonce)) = (fields.get("nc"), fields.get("cnonce")) else {
+                    return Outcome::Denied;
+                };
+                format!("{ha1}:{nonce}:{nc}:{cnonce}:{qop}:{ha2}")
+            }
+            None => format!("{ha1}:{nonce}:{ha2}"),
+            Some(_) => return Outcome::Denied,
+        });
+        let expected = algorithm.hash(response_input.as_bytes());
+        if !constant_time_eq(response, &expected) {
+            return Outcome::Denied;
+        }
+        if let Some((nonce_count, cnonce)) = replay
+            && !self.accept_nonce_count(peer, nonce, cnonce, algorithm, nonce_count)
+        {
+            return Outcome::Denied;
+        }
+        Outcome::Authorized
+    }
+
+    fn accept_nonce_count(
+        &self,
+        peer: IpAddr,
+        nonce: &str,
+        cnonce: &str,
+        algorithm: Algorithm,
+        nonce_count: u32,
+    ) -> bool {
+        let now = Instant::now();
+        let mut replay = match self.replay.lock() {
+            Ok(replay) => replay,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        replay.retain(|_, use_| now.duration_since(use_.last_seen) <= self.max_nonce_age);
+        let key = ReplayKey {
+            peer,
+            nonce: nonce.to_string(),
+            cnonce: cnonce.to_string(),
+            algorithm,
+        };
+        if !replay.contains_key(&key) && replay.len() >= MAX_REPLAY_ENTRIES {
+            let Some(oldest) = replay
+                .iter()
+                .min_by_key(|(_, use_)| use_.last_seen)
+                .map(|(key, _)| key.clone())
+            else {
+                return false;
+            };
+            replay.remove(&oldest);
+        }
+        match replay.entry(key) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(ReplayUse {
+                    nonce_count,
+                    last_seen: now,
+                });
+                true
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let previous = entry.get_mut();
+                if nonce_count <= previous.nonce_count {
+                    return false;
+                }
+                previous.nonce_count = nonce_count;
+                previous.last_seen = now;
+                true
+            }
         }
     }
 
@@ -242,6 +359,16 @@ fn unix_seconds(at: SystemTime) -> u64 {
     at.duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
+}
+
+fn parse_nonce_count(value: &str) -> Option<u32> {
+    // RFC 7616 nonce counts are eight hexadecimal digits and start at one.
+    if value.len() != 8 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    u32::from_str_radix(value, 16)
+        .ok()
+        .filter(|count| *count != 0)
 }
 
 /// Parse `Digest key=value, key="value"` without splitting commas inside quotes.
@@ -414,6 +541,7 @@ mod tests {
     const USER: &str = "camera";
     const PASSWORD: &str = "s3cret-passphrase";
     const URI: &str = "/live";
+    const PEER: IpAddr = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
 
     fn client_header(
         auth: &DigestAuth,
@@ -455,10 +583,58 @@ mod tests {
             for qop in [true, false] {
                 let header = client_header(&auth, "DESCRIBE", URI, PASSWORD, algorithm, qop, now());
                 assert_eq!(
-                    auth.authorize("DESCRIBE", URI, &header, now()),
+                    auth.authorize("DESCRIBE", URI, &header, now(), PEER),
                     Outcome::Authorized
                 );
             }
+        }
+    }
+
+    // Replaying a signed, unexpired response must not repeat an authenticated
+    // operation. Increasing counts and independent peers still work.
+    #[test]
+    fn tracks_authenticated_nonce_counts_without_poisoning_them_on_failure() {
+        let auth = DigestAuth::new(USER, PASSWORD).unwrap();
+        let algorithm = Algorithm::Sha256;
+        let header = client_header(&auth, "DESCRIBE", URI, PASSWORD, algorithm, true, now());
+        assert_eq!(
+            auth.authorize("DESCRIBE", URI, &header, now(), PEER),
+            Outcome::Authorized
+        );
+        assert_eq!(
+            auth.authorize("DESCRIBE", URI, &header, now(), PEER),
+            Outcome::Denied
+        );
+        let other = IpAddr::V6(std::net::Ipv6Addr::LOCALHOST);
+        assert_eq!(
+            auth.authorize("DESCRIBE", URI, &header, now(), other),
+            Outcome::Authorized
+        );
+
+        let nonce = auth.nonce(now());
+        let ha1 = algorithm.hash(format!("{USER}:{REALM}:{PASSWORD}").as_bytes());
+        let ha2 = algorithm.hash(format!("DESCRIBE:{URI}").as_bytes());
+        let count = "00000002";
+        let cnonce = "0a4f113b";
+        let response =
+            algorithm.hash(format!("{ha1}:{nonce}:{count}:{cnonce}:auth:{ha2}").as_bytes());
+        let next = format!(
+            "Digest username=\"{USER}\", realm=\"{REALM}\", nonce=\"{nonce}\", uri=\"{URI}\", response=\"{response}\", algorithm=SHA-256, qop=auth, nc={count}, cnonce=\"{cnonce}\""
+        );
+        assert_eq!(
+            auth.authorize("SETUP", URI, &next, now(), PEER),
+            Outcome::Denied
+        );
+        assert_eq!(
+            auth.authorize("DESCRIBE", URI, &next, now(), PEER),
+            Outcome::Authorized
+        );
+        assert_eq!(
+            auth.authorize("DESCRIBE", URI, &header, now(), PEER),
+            Outcome::Denied
+        );
+        for invalid in ["0", "00000000", "0000000g", "000000001"] {
+            assert!(parse_nonce_count(invalid).is_none());
         }
     }
 
@@ -475,7 +651,7 @@ mod tests {
             now(),
         );
         assert_eq!(
-            auth.authorize("DESCRIBE", URI, &wrong, now()),
+            auth.authorize("DESCRIBE", URI, &wrong, now(), PEER),
             Outcome::Denied
         );
         let right = client_header(
@@ -488,15 +664,18 @@ mod tests {
             now(),
         );
         assert_eq!(
-            auth.authorize("DESCRIBE", "/other", &right, now()),
+            auth.authorize("DESCRIBE", "/other", &right, now(), PEER),
             Outcome::Denied
         );
         let mismatched_uri = right.replace("uri=\"/live\"", "uri=\"/other\"");
         assert_eq!(
-            auth.authorize("DESCRIBE", URI, &mismatched_uri, now()),
+            auth.authorize("DESCRIBE", URI, &mismatched_uri, now(), PEER),
             Outcome::Denied
         );
-        assert_eq!(auth.authorize("SETUP", URI, &right, now()), Outcome::Denied);
+        assert_eq!(
+            auth.authorize("SETUP", URI, &right, now(), PEER),
+            Outcome::Denied
+        );
     }
 
     #[test]
@@ -504,6 +683,44 @@ mod tests {
         assert!(parse_digest_header("Digest username=one, username=two").is_none());
         assert!(parse_digest_header("Digest username=\"unterminated").is_none());
         assert!(parse_digest_header("Digest username=one trailing").is_none());
+    }
+
+    // Even an authenticated client must not retain oversized header fields in
+    // the bounded-entry replay cache (otherwise its byte usage was unbounded).
+    #[test]
+    fn replay_cache_fields_have_byte_bounds() {
+        let auth = DigestAuth::new(USER, PASSWORD).unwrap();
+        let nonce = auth.nonce(now());
+        let algorithm = Algorithm::Sha256;
+        let ha1 = algorithm.hash(format!("{USER}:{REALM}:{PASSWORD}").as_bytes());
+        let ha2 = algorithm.hash(format!("DESCRIBE:{URI}").as_bytes());
+        for (nonce, cnonce, expected) in [
+            (
+                nonce.clone(),
+                "x".repeat(MAX_CNONCE_LEN),
+                Outcome::Authorized,
+            ),
+            (
+                nonce.clone(),
+                "x".repeat(MAX_CNONCE_LEN + 1),
+                Outcome::Denied,
+            ),
+            (
+                format!("{}{nonce}", "0".repeat(MAX_NONCE_LEN + 1 - nonce.len())),
+                "padded".to_string(),
+                Outcome::Denied,
+            ),
+        ] {
+            let response =
+                algorithm.hash(format!("{ha1}:{nonce}:00000001:{cnonce}:auth:{ha2}").as_bytes());
+            let header = format!(
+                "Digest username=\"{USER}\", realm=\"{REALM}\", nonce=\"{nonce}\", uri=\"{URI}\", response=\"{response}\", algorithm=SHA-256, qop=auth, nc=00000001, cnonce=\"{cnonce}\""
+            );
+            assert_eq!(
+                auth.authorize("DESCRIBE", URI, &header, now(), PEER),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -521,7 +738,13 @@ mod tests {
             now(),
         );
         assert_eq!(
-            auth.authorize("DESCRIBE", URI, &header, now() + Duration::from_secs(31)),
+            auth.authorize(
+                "DESCRIBE",
+                URI,
+                &header,
+                now() + Duration::from_secs(31),
+                PEER
+            ),
             Outcome::Stale
         );
     }

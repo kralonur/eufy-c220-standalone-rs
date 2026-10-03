@@ -8,7 +8,8 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -114,6 +115,38 @@ pub const fn driver_speed(speed: u8) -> i32 {
 #[derive(Debug)]
 pub struct PtzController {
     file: Mutex<File>,
+    generation: AtomicU64,
+}
+
+/// A timeout may stop only the continuous movement it actually started.
+pub(crate) struct Motion {
+    controller: Arc<PtzController>,
+    generation: u64,
+}
+
+struct Calibration<'a> {
+    generation: u64,
+    cancelled: &'a dyn Fn() -> bool,
+}
+
+impl Calibration<'_> {
+    fn check(&self, controller: &PtzController) -> io::Result<()> {
+        if (self.cancelled)() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "PTZ calibration cancelled",
+            ));
+        }
+        controller.check_generation(self.generation)
+    }
+}
+
+impl Motion {
+    pub fn stop(self) -> io::Result<()> {
+        self.controller
+            .command(None, Some(self.generation), "owned PTZ stop")
+            .map(|_| ())
+    }
 }
 
 impl PtzController {
@@ -128,6 +161,7 @@ impl PtzController {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         let ptz = Self {
             file: Mutex::new(file),
+            generation: AtomicU64::new(0),
         };
         ptz.initialize()?;
         info!(path = %path.display(), "PTZ controller initialized");
@@ -167,14 +201,30 @@ impl PtzController {
 
     /// Start continuous movement. Call [`Self::stop`] when the request ends.
     pub fn start_move(&self, direction: PtzDirection, speed: u8) -> io::Result<()> {
+        self.start_generation(direction, speed).map(|_| ())
+    }
+
+    pub(crate) fn start_owned(
+        self: &Arc<Self>,
+        direction: PtzDirection,
+        speed: u8,
+    ) -> io::Result<Motion> {
+        let generation = self.start_generation(direction, speed)?;
+        Ok(Motion {
+            controller: Arc::clone(self),
+            generation,
+        })
+    }
+
+    fn start_generation(&self, direction: PtzDirection, speed: u8) -> io::Result<u64> {
         if direction == PtzDirection::Stop {
-            return self.stop();
+            return self.command(None, None, "PTZ stop");
         }
         let direction_code = Self::direction_code(direction).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "stop is not a move direction")
         })?;
         let move_arg = [1_i32, direction_code, driver_speed(speed), -1_i32];
-        self.move_ioctl(&move_arg, "continuous PTZ move")
+        self.command(Some(&move_arg), None, "continuous PTZ move")
     }
 
     /// Move by a bounded number of degrees, respecting the current software
@@ -194,7 +244,7 @@ impl PtzController {
         })?;
         let (pan, tilt) = self.position()?;
         if Self::at_limit(direction, pan, tilt) {
-            return Ok(());
+            return self.stop();
         }
         let remaining = match direction {
             PtzDirection::Left => pan,
@@ -209,22 +259,71 @@ impl PtzController {
     }
 
     fn move_ioctl(&self, move_arg: &[i32; 4], operation: &str) -> io::Result<()> {
-        let file = self
-            .file
-            .lock()
-            .map_err(|_| io::Error::other("PTZ device lock poisoned"))?;
-        let result = unsafe { ioctl(file.as_raw_fd(), PTZ_IOC_MOVE, move_arg.as_ptr()) };
-        check_ioctl(result, operation)
+        self.command(Some(move_arg), None, operation).map(|_| ())
     }
 
-    /// Stop all PTZ motion.
+    /// Stop motion and invalidate an older calibration's remaining legs.
     pub fn stop(&self) -> io::Result<()> {
+        self.command(None, None, "PTZ stop").map(|_| ())
+    }
+
+    fn check_generation(&self, expected: u64) -> io::Result<()> {
+        if self.generation.load(Ordering::Acquire) != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "PTZ centring superseded by another command",
+            ));
+        }
+        Ok(())
+    }
+
+    fn command(
+        &self,
+        arguments: Option<&[i32; 4]>,
+        expected: Option<u64>,
+        operation: &str,
+    ) -> io::Result<u64> {
+        self.command_if(arguments, expected, operation, || false)
+    }
+
+    fn command_if(
+        &self,
+        arguments: Option<&[i32; 4]>,
+        expected: Option<u64>,
+        operation: &str,
+        cancelled: impl Fn() -> bool,
+    ) -> io::Result<u64> {
         let file = self
             .file
             .lock()
             .map_err(|_| io::Error::other("PTZ device lock poisoned"))?;
-        let result = unsafe { ioctl(file.as_raw_fd(), PTZ_IOC_STOP, 0) };
-        check_ioctl(result, "PTZ stop")
+        if cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "PTZ calibration cancelled",
+            ));
+        }
+        let generation = match expected {
+            Some(generation) => {
+                self.check_generation(generation)?;
+                generation
+            }
+            None => self
+                .generation
+                .fetch_add(1, Ordering::AcqRel)
+                .wrapping_add(1),
+        };
+        let request = if arguments.is_some() {
+            PTZ_IOC_MOVE
+        } else {
+            PTZ_IOC_STOP
+        };
+        let arguments = arguments.map_or(std::ptr::null(), |arguments| arguments.as_ptr());
+        // SAFETY: the live file and optional four-word driver argument remain
+        // valid throughout ioctl. Token checks and commands share the same lock.
+        let result = unsafe { ioctl(file.as_raw_fd(), request, arguments) };
+        check_ioctl(result, operation)?;
+        Ok(generation)
     }
 
     /// Read current position as `(pan, tilt)` degrees.
@@ -251,13 +350,25 @@ impl PtzController {
     /// whole sequence - left end, right end, up end, down end, park - lands within
     /// a degree of 178/38 in about thirty seconds.
     ///
-    /// The legs are issued one at a time, so a stop or a move from another client
-    /// interleaves instead of waiting; the park at the end is what the caller asked
-    /// for, and it is the last thing that happens.
+    /// A newer move or stop cancels the remaining legs, including the park.
     pub fn center(&self) -> io::Result<()> {
-        self.stop()?;
+        self.center_until(|| false)
+    }
+
+    pub(crate) fn center_until(&self, cancelled: impl Fn() -> bool) -> io::Result<()> {
+        let calibration = Calibration {
+            generation: self.command_if(None, None, "PTZ calibration stop", &cancelled)?,
+            cancelled: &cancelled,
+        };
         let (pan, _) = self.position()?;
-        self.move_axis_to(pan, 0, PtzDirection::Right, PtzDirection::Left, SWEEP_SPEED)?;
+        self.move_axis_to(
+            pan,
+            0,
+            PtzDirection::Right,
+            PtzDirection::Left,
+            SWEEP_SPEED,
+            &calibration,
+        )?;
         let (pan, _) = self.position()?;
         self.move_axis_to(
             pan,
@@ -265,9 +376,17 @@ impl PtzController {
             PtzDirection::Right,
             PtzDirection::Left,
             SWEEP_SPEED,
+            &calibration,
         )?;
         let (_, tilt) = self.position()?;
-        self.move_axis_to(tilt, 0, PtzDirection::Down, PtzDirection::Up, SWEEP_SPEED)?;
+        self.move_axis_to(
+            tilt,
+            0,
+            PtzDirection::Down,
+            PtzDirection::Up,
+            SWEEP_SPEED,
+            &calibration,
+        )?;
         let (_, tilt) = self.position()?;
         self.move_axis_to(
             tilt,
@@ -275,6 +394,7 @@ impl PtzController {
             PtzDirection::Down,
             PtzDirection::Up,
             SWEEP_SPEED,
+            &calibration,
         )?;
 
         // The park keeps the speed it always used: the legs end against a
@@ -286,6 +406,7 @@ impl PtzController {
             PtzDirection::Right,
             PtzDirection::Left,
             PARK_SPEED,
+            &calibration,
         )?;
         let (_, tilt) = self.position()?;
         self.move_axis_to(
@@ -294,6 +415,7 @@ impl PtzController {
             PtzDirection::Down,
             PtzDirection::Up,
             PARK_SPEED,
+            &calibration,
         )?;
         Ok(())
     }
@@ -305,7 +427,9 @@ impl PtzController {
         positive_direction: PtzDirection,
         negative_direction: PtzDirection,
         speed: u8,
+        calibration: &Calibration<'_>,
     ) -> io::Result<()> {
+        calibration.check(self)?;
         if current == target {
             return Ok(());
         }
@@ -314,10 +438,23 @@ impl PtzController {
         } else {
             negative_direction
         };
-        self.move_step(direction, (target - current).abs(), speed)?;
+        let direction = Self::direction_code(direction).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "calibration requires an axis direction",
+            )
+        })?;
+        let arguments = [1, direction, driver_speed(speed), (target - current).abs()];
+        self.command_if(
+            Some(&arguments),
+            Some(calibration.generation),
+            "PTZ calibration move",
+            calibration.cancelled,
+        )?;
         let deadline = Instant::now() + POSITION_MOVE_TIMEOUT;
         loop {
             thread::sleep(POSITION_POLL_INTERVAL);
+            calibration.check(self)?;
             let (pan, tilt) = self.position()?;
             let position = match positive_direction {
                 PtzDirection::Left | PtzDirection::Right => pan,
@@ -328,7 +465,12 @@ impl PtzController {
                 return Ok(());
             }
             if Instant::now() >= deadline {
-                let _ = self.stop();
+                let _ = self.command_if(
+                    None,
+                    Some(calibration.generation),
+                    "PTZ calibration timeout stop",
+                    calibration.cancelled,
+                );
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     format!("PTZ did not reach {target} degrees; current position {position}"),
@@ -409,6 +551,52 @@ mod tests {
         }
         assert_eq!(driver_speed(3), PTZ_SPEED_SLOW);
         assert_eq!(driver_speed(4), PTZ_SPEED_FAST);
+    }
+
+    // A superseded sweep must be rejected before issuing any ioctl, even if
+    // its old timeout fires after another command has taken ownership.
+    #[test]
+    fn superseded_calibration_cannot_issue_a_move_or_timeout_stop() {
+        let controller = PtzController {
+            file: Mutex::new(File::open("/dev/null").unwrap()),
+            generation: AtomicU64::new(1),
+        };
+        let arguments = [1, 1, 1, 1];
+        assert_eq!(
+            controller.center_until(|| true).unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert_eq!(
+            controller
+                .command(Some(&arguments), Some(0), "stale move")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert_eq!(
+            controller
+                .command(None, Some(0), "stale timeout")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Interrupted
+        );
+    }
+
+    #[test]
+    fn an_old_hold_timeout_cannot_stop_a_newer_movement() {
+        let controller = Arc::new(PtzController {
+            file: Mutex::new(File::open("/dev/null").unwrap()),
+            generation: AtomicU64::new(2),
+        });
+        let old_motion = Motion {
+            controller: Arc::clone(&controller),
+            generation: 1,
+        };
+        assert_eq!(
+            old_motion.stop().unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert_eq!(controller.generation.load(Ordering::Acquire), 2);
     }
 
     #[test]

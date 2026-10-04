@@ -9,6 +9,7 @@ use crate::digest::{DigestAuth, Lockout, Outcome};
 use crate::media_engine::MediaEngineHandle;
 use crate::ptz::{PAN_MAX_DEGREES, PtzController, PtzDirection};
 use crate::security;
+use crate::shutdown::Shutdown;
 use std::io;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::process::{Command, Stdio};
@@ -17,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Semaphore, mpsc, watch};
 use tokio_rustls::TlsAcceptor;
 
 /// A boxed plaintext or TLS control connection.
@@ -30,6 +31,12 @@ pub const DEFAULT_CONTROL_PORT: u16 = 8_080;
 
 /// Maximum header bytes accepted from one control client.
 const MAX_HEADER_LEN: usize = 8 * 1024;
+
+/// Fifteen seconds is the policy budget for a complete LAN request or response.
+#[cfg(not(test))]
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+#[cfg(test)]
+const REQUEST_TIMEOUT: Duration = Duration::from_millis(300);
 
 /// Maximum request body accepted by the control service.
 const MAX_BODY_LEN: usize = 64 * 1024;
@@ -195,6 +202,7 @@ impl ControlServerConfig {
 /// Camera-local HTTP control server.
 pub struct ControlServer {
     inner: Arc<ControlInner>,
+    _lifetime: watch::Sender<()>,
     local_addr: SocketAddr,
 }
 
@@ -225,6 +233,7 @@ impl ControlServer {
         let tls_acceptor = config.tls_acceptor;
         // The writer task owns the speaker's pacing; the handlers only enqueue.
         let (audio_tx, mut audio_rx) = mpsc::channel::<SpeakerFrame>(AUDIO_QUEUE_FRAMES);
+        let (lifetime, shutdown) = Shutdown::channel();
         let inner = Arc::new(ControlInner {
             media,
             ptz,
@@ -240,14 +249,23 @@ impl ControlServer {
             night_mode: AtomicU8::new(0),
             command_lock: Mutex::new(()),
             ptz_lock: Mutex::new(()),
-            shutdown: Notify::new(),
+            shutdown,
         });
         let accept_inner = Arc::clone(&inner);
         runtime.spawn(async move { accept_loop(listener, accept_inner, tls_acceptor).await });
 
         let writer_inner = Arc::clone(&inner);
         runtime.spawn(async move {
-            while let Some(frame) = audio_rx.recv().await {
+            let mut shutdown = writer_inner.shutdown.clone();
+            loop {
+                let frame = tokio::select! {
+                    biased;
+                    _ = shutdown.wait() => break,
+                    received = audio_rx.recv() => match received {
+                        Some(frame) => frame,
+                        None => break,
+                    },
+                };
                 let result = match frame {
                     SpeakerFrame::Pcm { data, timestamp_us } => {
                         send_command(&writer_inner, true, move |handle| {
@@ -266,9 +284,16 @@ impl ControlServer {
                     tracing::warn!(?error, "camera speaker write failed");
                 }
             }
+            if let Some(ptz) = writer_inner.ptz.clone() {
+                let _ = tokio::task::spawn_blocking(move || ptz.stop()).await;
+            }
         });
 
-        Ok(Self { inner, local_addr })
+        Ok(Self {
+            inner,
+            _lifetime: lifetime,
+            local_addr,
+        })
     }
 
     /// The shared control plane, so another transport can issue the same commands
@@ -280,12 +305,6 @@ impl ControlServer {
     /// Address selected by the operating system, useful when binding port 0.
     pub const fn local_addr(&self) -> SocketAddr {
         self.local_addr
-    }
-}
-
-impl Drop for ControlServer {
-    fn drop(&mut self) {
-        self.inner.shutdown.notify_waiters();
     }
 }
 
@@ -312,20 +331,35 @@ pub(crate) struct ControlInner {
     night_mode: AtomicU8,
     command_lock: Mutex<()>,
     ptz_lock: Mutex<()>,
-    shutdown: Notify,
+    shutdown: Shutdown,
+}
+
+impl ControlInner {
+    pub(crate) fn shutdown(&self) -> Shutdown {
+        self.shutdown.clone()
+    }
 }
 
 async fn accept_loop(listener: TcpListener, inner: Arc<ControlInner>, tls: Option<TlsAcceptor>) {
+    let connections = Arc::new(Semaphore::new(security::MAX_CONTROL_CONNECTIONS));
+    let mut shutdown = inner.shutdown.clone();
     loop {
         tokio::select! {
-            _ = inner.shutdown.notified() => break,
+            biased;
+            _ = shutdown.wait() => break,
             accepted = listener.accept() => {
                 let Ok((stream, peer)) = accepted else { break };
+                let Ok(permit) = Arc::clone(&connections).try_acquire_owned() else {
+                    continue;
+                };
                 let client_inner = Arc::clone(&inner);
                 let acceptor = tls.clone();
                 tokio::spawn(async move {
-                    let result = match acceptor {
-                        Some(acceptor) => match acceptor.accept(stream).await {
+                    let _permit = permit;
+                    let mut shutdown = client_inner.shutdown.clone();
+                    let session = async {
+                        match acceptor {
+                        Some(acceptor) => match crate::tls::accept(acceptor, stream).await {
                             Ok(stream) => handle_connection(Box::new(stream), peer, client_inner).await,
                             Err(error) => Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
@@ -333,6 +367,14 @@ async fn accept_loop(listener: TcpListener, inner: Arc<ControlInner>, tls: Optio
                             )),
                         },
                         None => handle_connection(Box::new(stream), peer, client_inner).await,
+                        }
+                    };
+                    // Dropping HTTP input/output closes this connection. Device
+                    // operations already running on blocking workers finish normally.
+                    let result = tokio::select! {
+                        biased;
+                        _ = shutdown.wait() => Ok(()),
+                        result = session => result,
                     };
                     if let Err(error) = result {
                         tracing::debug!(%peer, %error, "control client connection ended");
@@ -348,14 +390,17 @@ async fn handle_connection(
     peer: SocketAddr,
     inner: Arc<ControlInner>,
 ) -> io::Result<()> {
-    let response = match read_request(&mut stream).await {
-        Ok(request) => match authorize_request(&inner, &request, peer).await {
+    let response = match tokio::time::timeout(REQUEST_TIMEOUT, read_request(&mut stream)).await {
+        Ok(Ok(request)) => match authorize_request(&inner, &request, peer).await {
             Ok(()) => dispatch(&inner, request).await,
             Err(response) => response,
         },
-        Err(error) => error_response(400, &error.to_string()),
+        Ok(Err(error)) => error_response(400, &error.to_string()),
+        Err(_) => error_response(408, "the request was not completed in time"),
     };
-    stream.write_all(&response).await
+    tokio::time::timeout(REQUEST_TIMEOUT, stream.write_all(&response))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "control response timed out"))?
 }
 
 struct HttpRequest {
@@ -804,7 +849,7 @@ pub(crate) async fn ptz_move(inner: &Arc<ControlInner>, body: &[u8]) -> Vec<u8> 
         Err(error) => return error_response(400, &error),
     };
 
-    let operation = move |ptz: &PtzController| {
+    let operation = move |ptz: &Arc<PtzController>| {
         if direction == PtzDirection::Stop {
             ptz.stop()
         } else {
@@ -829,32 +874,52 @@ pub(crate) async fn ptz_move(inner: &Arc<ControlInner>, body: &[u8]) -> Vec<u8> 
 /// settling, so stepping a held direction starts and stops the motor several times a
 /// second and reads as a stutter rather than a pan.
 pub(crate) async fn ptz_rotate(inner: &Arc<ControlInner>, body: &[u8]) -> Vec<u8> {
+    ptz_rotate_owned(inner, body).await.0
+}
+
+pub(crate) async fn ptz_rotate_owned(
+    inner: &Arc<ControlInner>,
+    body: &[u8],
+) -> (Vec<u8>, Option<crate::ptz::Motion>) {
     let direction = match parse_json_string_field(body, "direction")
         .ok()
         .and_then(|value| PtzDirection::parse(&value))
     {
         Some(direction) => direction,
-        None => return error_response(400, "PTZ direction must be left, right, up, or down"),
+        None => {
+            return (
+                error_response(400, "PTZ direction must be left, right, up, or down"),
+                None,
+            );
+        }
     };
     let speed = match parse_optional_json_u32_field(body, "speed", 5) {
         Ok(speed) if speed <= 10 => speed as u8,
-        Ok(_) => return error_response(400, "PTZ speed must be between 0 and 10"),
-        Err(error) => return error_response(400, &error),
+        Ok(_) => {
+            return (
+                error_response(400, "PTZ speed must be between 0 and 10"),
+                None,
+            );
+        }
+        Err(error) => return (error_response(400, &error), None),
     };
-    let operation = move |ptz: &PtzController| {
+    let operation = move |ptz: &Arc<PtzController>| {
         if direction == PtzDirection::Stop {
-            ptz.stop()
+            ptz.stop().map(|_| None)
         } else {
-            ptz.start_move(direction, speed)
+            ptz.start_owned(direction, speed).map(Some)
         }
     };
     match send_ptz(inner, operation).await {
-        Ok(()) => json_response(
-            200,
-            "OK",
-            &format!(r#"{{"status":"ok","direction":"{direction}","speed":{speed}}}"#),
+        Ok(motion) => (
+            json_response(
+                200,
+                "OK",
+                &format!(r#"{{"status":"ok","direction":"{direction}","speed":{speed}}}"#),
+            ),
+            motion,
         ),
-        Err(error) => ptz_error_response(error),
+        Err(error) => (ptz_error_response(error), None),
     }
 }
 
@@ -888,16 +953,18 @@ pub(crate) async fn ptz_center(inner: &Arc<ControlInner>) -> Vec<u8> {
         // a minute, and holding it would make `/ptz/position` - the one way to watch
         // progress, and the reason the flag above exists - block until the sweep
         // finished, with clients timing out against it in the meantime. Each ioctl
-        // locks the device on its own, so the camera stays answerable; a move or a
-        // stop from another client interleaves, and the park is still the last
-        // thing that happens.
-        match ptz.center() {
+        // locks the device on its own; newer moves/stops invalidate the sweep's
+        // token, so a cancelled calibration never resumes or parks afterwards.
+        match ptz.center_until(|| task_inner.shutdown.is_stopped()) {
             Ok(()) => match ptz.position() {
                 Ok((pan, tilt)) => tracing::info!(pan, tilt, "PTZ centred"),
                 Err(error) => {
                     tracing::warn!(%error, "PTZ centred but its position could not be read")
                 }
             },
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                tracing::debug!("PTZ centring cancelled");
+            }
             Err(error) => tracing::warn!(%error, "PTZ centring did not finish"),
         }
         task_inner.centering.store(false, Ordering::Release);
@@ -937,6 +1004,11 @@ where
         let _lock = command_inner.command_lock.lock().map_err(|_| {
             CommandFailure::Unavailable("control command lock poisoned".to_string())
         })?;
+        if command_inner.shutdown.is_stopped() {
+            return Err(CommandFailure::Unavailable(
+                "control service stopped".to_string(),
+            ));
+        }
         if require_active && !command_inner.active.load(Ordering::Acquire) {
             return Err(CommandFailure::Inactive);
         }
@@ -953,7 +1025,7 @@ where
 
 async fn send_ptz<F, T>(inner: &Arc<ControlInner>, operation: F) -> Result<T, PtzFailure>
 where
-    F: FnOnce(&PtzController) -> io::Result<T> + Send + 'static,
+    F: FnOnce(&Arc<PtzController>) -> io::Result<T> + Send + 'static,
     T: Send + 'static,
 {
     let ptz = inner
@@ -966,6 +1038,11 @@ where
             .ptz_lock
             .lock()
             .map_err(|_| PtzFailure::Unavailable("PTZ lock poisoned".to_string()))?;
+        if ptz_inner.shutdown.is_stopped() {
+            return Err(PtzFailure::Unavailable(
+                "control service stopped".to_string(),
+            ));
+        }
         operation(&ptz).map_err(|error| match error.kind() {
             io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData => {
                 PtzFailure::Rejected(error.to_string())
@@ -1269,6 +1346,9 @@ fn escape_json(value: &str) -> String {
         .replace('\r', "\\r")
         .replace('\n', "\\n")
 }
+
+#[cfg(test)]
+mod hardening_tests;
 
 #[cfg(test)]
 mod tests {

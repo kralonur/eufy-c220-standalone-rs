@@ -25,6 +25,7 @@ pub mod mqtt;
 pub mod ptz;
 pub mod rtsp;
 pub mod security;
+mod shutdown;
 pub mod tls;
 
 /// Environment override for the plaintext RTSP port. Port 0 retires it.

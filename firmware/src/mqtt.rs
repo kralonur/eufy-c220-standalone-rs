@@ -9,18 +9,22 @@
 //! handlers rather than reimplementing them, so a PTZ command over MQTT cannot
 //! behave differently from the same command over HTTPS.
 
+#[cfg(test)]
+mod tests;
+
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+use zeroize::Zeroizing;
 
 use rumqttc::{AsyncClient, Event, Incoming, MqttOptions, QoS};
 use tokio::time::{interval, sleep};
 use tracing::{info, warn};
 
 use crate::control::{
-    ControlInner, night_mode, ptz_center, ptz_move, ptz_rotate, ptz_stop, status_response,
+    ControlInner, night_mode, ptz_center, ptz_move, ptz_rotate_owned, ptz_stop, status_response,
     talkback_start, talkback_status_response, talkback_stop,
 };
 use crate::security;
@@ -35,20 +39,17 @@ const TOPIC_PREFIX_ENV: &str = "MQTT_TOPIC_PREFIX";
 const DISCOVERY_PREFIX_ENV: &str = "MQTT_DISCOVERY_PREFIX";
 const DISCOVERY_ENV: &str = "MQTT_DISCOVERY";
 
-/// Port used when the configuration does not name one. 8883 is the TLS port, and a
-/// CA file is what asks for TLS, so the default follows the CA rather than leading it.
+/// IANA MQTT-over-TLS port, used when the configuration does not name one.
 const DEFAULT_TLS_PORT: u16 = 8883;
-const DEFAULT_PLAIN_PORT: u16 = 1883;
 
 /// Prefix used when the configuration does not name one.
 const DEFAULT_TOPIC_PREFIX: &str = "eufy_c220";
 const DEFAULT_DISCOVERY_PREFIX: &str = "homeassistant";
 
-/// How long a `ptz/hold` keeps moving without being told to stop. The engine's PTZ
-/// moves in steps rather than continuously, so a hold is a stepping loop; this
-/// bounds how far it can run away if the release message is lost.
+/// How long a `ptz/hold` may drive toward a calibrated limit without a release
+/// message. Its generation-owned stop cannot interrupt a newer command.
 const HOLD_TIMEOUT: Duration = Duration::from_secs(10);
-/// Interval between hold steps.
+/// Poll interval for superseded holds; service closure wakes them immediately.
 const HOLD_STEP_INTERVAL: Duration = Duration::from_millis(200);
 /// PTZ speed used for every MQTT command, on the 0-10 scale.
 const COMMAND_SPEED: u8 = 5;
@@ -63,8 +64,8 @@ pub struct MqttConfig {
     host: String,
     port: u16,
     username: Option<String>,
-    password: Option<String>,
-    ca_file: Option<PathBuf>,
+    password: Option<Zeroizing<String>>,
+    ca_file: PathBuf,
     topic_prefix: String,
     discovery_prefix: String,
     discovery_enabled: bool,
@@ -77,7 +78,7 @@ impl MqttConfig {
         let Some(host) = environment(HOST_ENV)? else {
             return Ok(None);
         };
-        let ca_file = environment(CA_FILE_ENV)?.map(PathBuf::from);
+        let ca_file = require_ca_file(environment(CA_FILE_ENV)?.map(PathBuf::from))?;
         let port = match environment(PORT_ENV)? {
             Some(value) => value.trim().parse::<u16>().map_err(|error| {
                 io::Error::new(
@@ -85,20 +86,29 @@ impl MqttConfig {
                     format!("{PORT_ENV} must be a port number: {error}"),
                 )
             })?,
-            None if ca_file.is_some() => DEFAULT_TLS_PORT,
-            None => DEFAULT_PLAIN_PORT,
+            None => DEFAULT_TLS_PORT,
         };
+        let username = environment(USERNAME_ENV)?;
+        let password = security::secret_file(PASSWORD_FILE_ENV)?
+            .map(|password| Zeroizing::new(password.trim().to_string()));
+        if username.is_some() != password.is_some()
+            || password
+                .as_deref()
+                .is_some_and(|password| password.is_empty())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "MQTT username and nonempty password file must be configured together",
+            ));
+        }
         // The camera's own derived name makes the client id unique per camera, which
         // is what keeps two cameras from displacing each other on the broker.
         let client_id = format!("eufy-c220-{}", security::host_label("HOST_NAME", "c220")?);
         Ok(Some(Self {
             host,
             port,
-            username: environment(USERNAME_ENV)?,
-            // The file ends with a newline; the broker was told the password without
-            // one, so sending the raw contents fails as NotAuthorized.
-            password: security::secret_file(PASSWORD_FILE_ENV)?
-                .map(|password| password.trim().to_string()),
+            username,
+            password,
             ca_file,
             topic_prefix: environment(TOPIC_PREFIX_ENV)?
                 .unwrap_or_else(|| DEFAULT_TOPIC_PREFIX.to_string()),
@@ -108,6 +118,22 @@ impl MqttConfig {
             client_id,
         }))
     }
+}
+
+fn require_ca_file(ca_file: Option<PathBuf>) -> io::Result<PathBuf> {
+    let path = ca_file.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{CA_FILE_ENV} is required when {HOST_ENV} is configured"),
+        )
+    })?;
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "MQTT CA path must be absolute",
+        ));
+    }
+    Ok(path)
 }
 
 fn environment(variable: &str) -> io::Result<Option<String>> {
@@ -137,7 +163,7 @@ pub(crate) struct MqttTask {
     control: Arc<ControlInner>,
     /// Set while a `ptz/hold` stepping loop is running, so a second hold replaces it
     /// rather than racing it.
-    holding: Arc<AtomicBool>,
+    holding: Arc<AtomicU64>,
 }
 
 impl MqttTask {
@@ -145,17 +171,27 @@ impl MqttTask {
         Self {
             config,
             control,
-            holding: Arc::new(AtomicBool::new(false)),
+            holding: Arc::new(AtomicU64::new(0)),
         }
     }
 
     /// Run until the process ends, reconnecting after failures.
     pub(crate) async fn run(self) {
+        let mut shutdown = self.control.shutdown();
         loop {
-            if let Err(error) = self.session().await {
+            let result = tokio::select! {
+                biased;
+                _ = shutdown.wait() => return,
+                result = self.session() => result,
+            };
+            if let Err(error) = result {
                 warn!(%error, "MQTT session ended; reconnecting");
             }
-            sleep(RECONNECT_DELAY).await;
+            tokio::select! {
+                biased;
+                _ = shutdown.wait() => return,
+                _ = sleep(RECONNECT_DELAY) => {},
+            }
         }
     }
 
@@ -165,27 +201,21 @@ impl MqttTask {
             MqttOptions::new(&self.config.client_id, &self.config.host, self.config.port);
         options.set_keep_alive(Duration::from_secs(30));
 
-        match self.config.ca_file.as_ref() {
-            Some(ca_file) => {
-                let ca = std::fs::read(ca_file).map_err(|error| {
-                    // Continuing in the clear would put the broker password on the
-                    // wire, so an unreadable CA stops the connection instead.
-                    io::Error::other(format!(
-                        "MQTT CA file {} is unreadable: {error}",
-                        ca_file.display()
-                    ))
-                })?;
-                options.set_transport(rumqttc::Transport::tls_with_config(
-                    rumqttc::TlsConfiguration::Simple {
-                        ca,
-                        alpn: None,
-                        client_auth: None,
-                    },
-                ));
-                info!(ca = %ca_file.display(), port = self.config.port, "MQTT over TLS");
-            }
-            None => warn!("MQTT without a CA file; the broker connection is not encrypted"),
-        }
+        let ca_file = &self.config.ca_file;
+        let ca = std::fs::read(ca_file).map_err(|error| {
+            io::Error::other(format!(
+                "MQTT CA file {} is unreadable: {error}",
+                ca_file.display()
+            ))
+        })?;
+        options.set_transport(rumqttc::Transport::tls_with_config(
+            rumqttc::TlsConfiguration::Simple {
+                ca,
+                alpn: None,
+                client_auth: None,
+            },
+        ));
+        info!(ca = %ca_file.display(), port = self.config.port, "MQTT over TLS");
 
         // Anything watching the broker learns the camera is gone even if it loses
         // power, because the broker publishes this on the camera's behalf.
@@ -196,7 +226,13 @@ impl MqttTask {
             true,
         ));
         if let Some(username) = &self.config.username {
-            options.set_credentials(username, self.config.password.clone().unwrap_or_default());
+            options.set_credentials(
+                username,
+                self.config
+                    .password
+                    .as_ref()
+                    .map_or("", |password| password.as_str()),
+            );
         }
 
         let (client, mut eventloop) = AsyncClient::new(options, 64);
@@ -261,13 +297,14 @@ impl MqttTask {
         };
         match name {
             "ptz/set" => {
+                self.cancel_hold();
                 let body =
                     format!(r#"{{"direction":"{value}","degrees":30,"speed":{COMMAND_SPEED}}}"#);
                 self.report("ptz/set", ptz_move(&self.control, body.as_bytes()).await);
             }
             "ptz/hold" => match value {
                 "stop" => {
-                    self.holding.store(false, Ordering::Release);
+                    self.cancel_hold();
                     self.report("ptz/hold", ptz_stop(&self.control).await);
                 }
                 direction @ ("left" | "right" | "up" | "down") => {
@@ -277,7 +314,7 @@ impl MqttTask {
             },
             "ptz/move" => match value {
                 "stop" | "off" | "" => {
-                    self.holding.store(false, Ordering::Release);
+                    self.cancel_hold();
                     self.report("ptz/move", ptz_stop(&self.control).await);
                 }
                 direction @ ("left" | "right" | "up" | "down") => {
@@ -286,11 +323,11 @@ impl MqttTask {
                 other => warn!(%other, "ptz/move takes left, right, up, down or stop"),
             },
             "ptz/calibrate" => {
-                self.holding.store(false, Ordering::Release);
+                self.cancel_hold();
                 self.report("ptz/calibrate", ptz_center(&self.control).await);
             }
             "ptz/center" => {
-                self.holding.store(false, Ordering::Release);
+                self.cancel_hold();
                 self.report("ptz/center", ptz_center(&self.control).await);
             }
             "night_mode/set" => {
@@ -325,19 +362,31 @@ impl MqttTask {
     /// `ptz/hold stop`, any other movement command, or [`HOLD_TIMEOUT`] as a safety
     /// net in case the release message never arrives.
     async fn start_hold(&self, direction: String) {
-        self.holding.store(true, Ordering::Release);
+        let generation = self.holding.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
         let body = format!(r#"{{"direction":"{direction}","speed":{COMMAND_SPEED}}}"#);
-        self.report("ptz/hold", ptz_rotate(&self.control, body.as_bytes()).await);
-        let control = Arc::clone(&self.control);
+        let (response, motion) = ptz_rotate_owned(&self.control, body.as_bytes()).await;
+        self.report("ptz/hold", response);
+        let Some(motion) = motion else {
+            return;
+        };
+        let mut shutdown = self.control.shutdown();
         let holding = Arc::clone(&self.holding);
         tokio::spawn(async move {
             let deadline = Instant::now() + HOLD_TIMEOUT;
-            while holding.load(Ordering::Acquire) && Instant::now() < deadline {
-                sleep(HOLD_STEP_INTERVAL).await;
+            while holding.load(Ordering::Acquire) == generation && Instant::now() < deadline {
+                tokio::select! {
+                    biased;
+                    _ = shutdown.wait() => break,
+                    _ = sleep(HOLD_STEP_INTERVAL) => {},
+                }
             }
-            holding.store(false, Ordering::Release);
-            let _ = ptz_stop(&control).await;
+            // An old release/timeout never stops a newer HTTP or MQTT move.
+            let _ = tokio::task::spawn_blocking(move || motion.stop()).await;
         });
+    }
+
+    fn cancel_hold(&self) {
+        self.holding.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Log what a command answered; the HTTP status line is enough to tell success.

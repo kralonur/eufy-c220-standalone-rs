@@ -414,14 +414,14 @@ fn run_media_loop(
         while !stop.load(Ordering::Acquire) {
             match engine.read_record()? {
                 Some(record) if record.kind.is_video() => {
-                    rtsp.push_video_record(&record)?;
+                    rtsp.push_video_record(record)?;
                 }
                 Some(record) if record.kind == RecordKind::AudioCapture => {
                     // The native companion currently captures audio regardless
                     // of the RTSP advertisement; discard it when microphone
                     // streaming is not opted in instead of stopping the loop.
                     if audio_enabled {
-                        rtsp.push_audio_record(&record)?;
+                        rtsp.push_audio_record(record)?;
                     }
                 }
                 Some(record) if record.kind == RecordKind::NightMode => {

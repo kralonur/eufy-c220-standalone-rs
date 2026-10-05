@@ -19,7 +19,6 @@ rcgen = { workspace = true, default-features = false, features = ["pem", "ring"]
 roxmltree = { workspace = true }
 rtsp-runtime = { workspace = true, features = ["tokio"] }
 rtsp-types = { workspace = true }
-rtp = { workspace = true }
 rumqttc = { workspace = true, default-features = false, features = ["use-rustls-no-provider"] }
 rustls = { workspace = true, default-features = false, features = ["ring", "std"] }
 rustls-pki-types = { workspace = true, default-features = false, features = ["std"] }
@@ -31,3 +30,7 @@ tokio-rustls = { workspace = true, default-features = false, features = ["ring"]
 tracing = { workspace = true, default-features = false, features = ["std"] }
 tracing-subscriber = { workspace = true, default-features = false, features = ["fmt"] }
 zeroize = { workspace = true }
+
+[dev-dependencies]
+# Independent H.264 depacketizer verifies the production batch wire format.
+rtp = { workspace = true }

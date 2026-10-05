@@ -11,24 +11,33 @@
 //! `docs/hardware-video.md` from the reference project.
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use bytes::Bytes;
-use rtp::codecs::h264::H264Payloader;
-use rtp::packetizer::Payloader;
+use bytes::{Buf, Bytes, BytesMut};
 use rtsp_runtime::{InterleavedFrame, LowerTransport, ServerEvent, ServerSession, Transport};
 use rtsp_types::{Message, Method, Request, Response, StatusCode, Version, headers};
 use std::io;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, Notify, broadcast};
+use tokio::sync::{Mutex, Notify, Semaphore, broadcast, watch};
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 
 use crate::digest::{Algorithm, DigestAuth, Lockout, Outcome};
 use crate::media::{MediaRecord, RecordKind};
+use crate::shutdown::Shutdown;
+
+mod budget;
+#[cfg(test)]
+mod lifecycle_tests;
+mod packetizer;
+use budget::MediaBudget;
+use c220_media_protocol::annex_b::nalus as annex_b_nalus;
+use packetizer::{AudioPacketizer, CodecState, INTERLEAVED_HEADER_LEN, VideoPacketizer};
+#[cfg(test)]
+use packetizer::{rtp_packet, rtp_packets};
 
 /// A boxed TCP or TLS stream used by one RTSP session.
 pub trait SessionTransport: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
@@ -53,7 +62,7 @@ pub const RTP_VIDEO_CLOCK_RATE: u32 = 90_000;
 /// Fallback RTP timestamp increment for sources without capture timestamps.
 /// 15 FPS is the measured camera mode and the declared encoder rate in the
 /// reverse-engineered media engine.
-pub const RTP_VIDEO_TIMESTAMP_INCREMENT: u32 = 4_500;
+pub const RTP_VIDEO_TIMESTAMP_INCREMENT: u32 = RTP_VIDEO_CLOCK_RATE / 15;
 
 /// Dynamic RTP payload type used for the single video track.
 pub const RTP_VIDEO_PAYLOAD_TYPE: u8 = 96;
@@ -82,7 +91,27 @@ const RTP_PAYLOAD_MTU: usize = 1_200;
 
 /// Number of records retained for clients that are briefly slower than the
 /// camera. A lagging client is resynchronized at the next keyframe.
-const MEDIA_BUS_CAPACITY: usize = 256;
+const MEDIA_BUS_CAPACITY: usize = 64;
+
+/// Preserve up to 256 small 20 ms PCMA records; all allocations also share the
+/// byte budget, so this cannot turn into unbounded audio retention.
+const AUDIO_BUS_CAPACITY: usize = 256;
+
+/// Six MiB of shared encoded allocations, including slices held by active clients.
+/// This deployment policy complements count bounds; it is not a RAM measurement.
+const MEDIA_BUDGET_BYTES: u32 = 6 * 1024 * 1024;
+
+/// An idle pre-play session must complete a request within thirty seconds.
+#[cfg(not(test))]
+const SETUP_DEADLINE: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const SETUP_DEADLINE: Duration = Duration::from_millis(300);
+
+/// A fifteen-second write budget includes waiting for this client's writer lock.
+#[cfg(not(test))]
+const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
+#[cfg(test)]
+const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_millis(300);
 
 /// Maximum RTSP request/control buffer accepted from one client.
 const MAX_REQUEST_BUFFER: usize = 64 * 1024;
@@ -270,9 +299,15 @@ pub struct RtspStats {
     pub audio_frames_sent: u64,
 }
 
+enum VideoPayload<'a> {
+    Borrowed(&'a [u8]),
+    Owned(Vec<u8>),
+}
+
 #[derive(Clone, Debug)]
 struct VideoFrame {
-    data: Arc<[u8]>,
+    sequence: u64,
+    data: Bytes,
     keyframe: bool,
     codec: VideoCodec,
     timestamp_us: Option<u64>,
@@ -280,25 +315,8 @@ struct VideoFrame {
 
 #[derive(Clone, Debug)]
 struct AudioFrame {
-    data: Arc<[u8]>,
+    data: Bytes,
     timestamp_us: Option<u64>,
-}
-
-#[derive(Clone, Debug, Default)]
-struct CodecState {
-    codec: VideoCodec,
-    vps: Option<Vec<u8>>,
-    sps: Option<Vec<u8>>,
-    pps: Option<Vec<u8>>,
-}
-
-impl CodecState {
-    fn has_parameters(&self) -> bool {
-        match self.codec {
-            VideoCodec::H264 => self.sps.is_some() && self.pps.is_some(),
-            VideoCodec::H265 => self.vps.is_some() && self.sps.is_some() && self.pps.is_some(),
-        }
-    }
 }
 
 struct RtspServerInner {
@@ -313,7 +331,10 @@ struct RtspServerInner {
     talkback: TalkbackSinkSlot,
     codec: RwLock<CodecState>,
     codec_ready: Notify,
-    shutdown: Notify,
+    shutdown: Shutdown,
+    connections: Arc<Semaphore>,
+    media_budget: MediaBudget,
+    next_video_sequence: AtomicU64,
     next_session: AtomicU64,
     next_ssrc: AtomicU32,
     video_access_units_published: AtomicU64,
@@ -322,28 +343,18 @@ struct RtspServerInner {
     audio_frames_sent: AtomicU64,
 }
 
-/// Multi-client camera-local RTSP server.
+/// Camera-local RTSP server.
 ///
 /// The server never reads the sensor itself. The media engine owns capture and
 /// encoding; callers publish complete Annex-B access units with
 /// [`RtspServer::push_video_frame`] and validated PCMA frames with
-/// [`RtspServer::push_audio_frame`]. Each client receives independent RTP
-/// sequence spaces and packetizers, so a slow client cannot stall another one.
+/// [`RtspServer::push_audio_frame`]. Clients receive independent RTP sequence
+/// spaces and packetizers.
+#[derive(Clone)]
 pub struct RtspServer {
     inner: Arc<RtspServerInner>,
-    handles: Arc<AtomicUsize>,
+    _lifetime: watch::Sender<()>,
     local_addr: SocketAddr,
-}
-
-impl Clone for RtspServer {
-    fn clone(&self) -> Self {
-        self.handles.fetch_add(1, Ordering::Relaxed);
-        Self {
-            inner: Arc::clone(&self.inner),
-            handles: Arc::clone(&self.handles),
-            local_addr: self.local_addr,
-        }
-    }
 }
 
 impl std::fmt::Debug for RtspServer {
@@ -363,6 +374,9 @@ impl RtspServer {
     /// sessions and the accept loop are asynchronous.
     pub fn start(config: RtspServerConfig) -> io::Result<Self> {
         let path = normalize_path(&config.path)?;
+        let runtime = tokio::runtime::Handle::try_current().map_err(|error| {
+            io::Error::other(format!("RTSP server requires a Tokio runtime: {error}"))
+        })?;
         let (listener, local_addr) = if config.plaintext_enabled {
             let listener = StdTcpListener::bind(config.bind_address)?;
             listener.set_nonblocking(true)?;
@@ -371,12 +385,26 @@ impl RtspServer {
         } else {
             (None, config.bind_address)
         };
-        let runtime = tokio::runtime::Handle::try_current().map_err(|error| {
-            io::Error::other(format!("RTSP server requires a Tokio runtime: {error}"))
-        })?;
+        // Bind every listener before spawning tasks. If the TLS port cannot
+        // bind, dropping the local listeners rolls startup back completely.
+        let tls_listener = config
+            .rtsps
+            .map(|rtsps| -> io::Result<_> {
+                if rtsps.port == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "RTSPS port must be non-zero",
+                    ));
+                }
+                let listener = StdTcpListener::bind(("0.0.0.0", rtsps.port))?;
+                listener.set_nonblocking(true)?;
+                Ok((TcpListener::from_std(listener)?, rtsps.acceptor))
+            })
+            .transpose()?;
 
         let (media_tx, _) = broadcast::channel(MEDIA_BUS_CAPACITY);
-        let (audio_tx, _) = broadcast::channel(MEDIA_BUS_CAPACITY);
+        let (audio_tx, _) = broadcast::channel(AUDIO_BUS_CAPACITY);
+        let (lifetime, shutdown) = Shutdown::channel();
         let inner = Arc::new(RtspServerInner {
             path,
             video_width: config.video_width,
@@ -389,7 +417,10 @@ impl RtspServer {
             talkback: TalkbackSinkSlot::default(),
             codec: RwLock::new(CodecState::default()),
             codec_ready: Notify::new(),
-            shutdown: Notify::new(),
+            shutdown,
+            connections: Arc::new(Semaphore::new(crate::security::MAX_RTSP_CONNECTIONS)),
+            media_budget: MediaBudget::new(MEDIA_BUDGET_BYTES),
+            next_video_sequence: AtomicU64::new(0),
             next_session: AtomicU64::new(1),
             next_ssrc: AtomicU32::new(FIRST_RTP_SSRC),
             video_access_units_published: AtomicU64::new(0),
@@ -397,30 +428,18 @@ impl RtspServer {
             audio_frames_published: AtomicU64::new(0),
             audio_frames_sent: AtomicU64::new(0),
         });
-        let handles = Arc::new(AtomicUsize::new(1));
         if let Some(listener) = listener {
             let accept_inner = Arc::clone(&inner);
             runtime.spawn(async move { accept_loop(listener, accept_inner, None).await });
         }
-        if let Some(rtsps) = config.rtsps {
-            if rtsps.port == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "RTSPS port must be non-zero",
-                ));
-            }
-            let rtsps_listener = StdTcpListener::bind(("0.0.0.0", rtsps.port))?;
-            rtsps_listener.set_nonblocking(true)?;
-            let rtsps_listener = TcpListener::from_std(rtsps_listener)?;
+        if let Some((listener, acceptor)) = tls_listener {
             let tls_inner = Arc::clone(&inner);
-            runtime.spawn(async move {
-                accept_loop(rtsps_listener, tls_inner, Some(rtsps.acceptor)).await
-            });
+            runtime.spawn(async move { accept_loop(listener, tls_inner, Some(acceptor)).await });
         }
 
         Ok(Self {
             inner,
-            handles,
+            _lifetime: lifetime,
             local_addr,
         })
     }
@@ -452,26 +471,58 @@ impl RtspServer {
         codec: VideoCodec,
         timestamp_us: Option<u64>,
     ) -> io::Result<()> {
-        if annex_b.is_empty() {
+        self.publish_video(
+            VideoPayload::Borrowed(annex_b),
+            keyframe,
+            codec,
+            timestamp_us,
+        )
+    }
+
+    fn publish_video(
+        &self,
+        payload: VideoPayload<'_>,
+        keyframe: bool,
+        codec: VideoCodec,
+        timestamp_us: Option<u64>,
+    ) -> io::Result<()> {
+        let length = match &payload {
+            VideoPayload::Borrowed(data) => data.len(),
+            VideoPayload::Owned(data) => data.len(),
+        };
+        if length == 0 || length > c220_media_protocol::MAX_PAYLOAD_LEN {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "video access unit must not be empty",
+                "video access unit must be nonempty and fit the media protocol limit",
             ));
         }
-
-        let codec_changed = self
+        // Advance even when a byte-bound drop never enters broadcast's ring.
+        // Receivers detect holes and wait for a decodable keyframe.
+        let sequence = self
+            .inner
+            .next_video_sequence
+            .fetch_add(1, Ordering::Relaxed);
+        let data = match payload {
+            VideoPayload::Owned(data) => self.inner.media_budget.take(data),
+            VideoPayload::Borrowed(data) => self.inner.media_budget.copy(data),
+        };
+        let Some(data) = data else {
+            tracing::debug!("dropping video frame: shared payload budget exhausted");
+            return Ok(());
+        };
+        let inspection = self
             .inner
             .codec
             .write()
-            .map_err(|_| io::Error::other("RTSP codec state lock poisoned"))
-            .map(|mut state| update_codec_state(&mut state, codec, annex_b))?;
-        if codec_changed {
+            .map_err(|_| io::Error::other("RTSP codec state lock poisoned"))?
+            .inspect(codec, &data)?;
+        if inspection.changed {
             self.inner.codec_ready.notify_waiters();
         }
-
         let frame = VideoFrame {
-            data: Arc::<[u8]>::from(annex_b.to_vec()),
-            keyframe: keyframe || detected_keyframe(codec, annex_b),
+            sequence,
+            keyframe: keyframe || inspection.keyframe,
+            data,
             codec,
             timestamp_us,
         };
@@ -482,8 +533,9 @@ impl RtspServer {
         Ok(())
     }
 
-    /// Publish a video record directly from the camera-local media ABI.
-    pub fn push_video_record(&self, record: &MediaRecord) -> io::Result<()> {
+    /// Publish a video record, transferring its payload into the media bus
+    /// without copying the access unit.
+    pub fn push_video_record(&self, record: MediaRecord) -> io::Result<()> {
         if record.kind != RecordKind::VIDEO {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -496,8 +548,8 @@ impl RtspServer {
                 format!("unsupported video codec byte {}", record.codec),
             )
         })?;
-        self.push_video_frame(
-            &record.payload,
+        self.publish_video(
+            VideoPayload::Owned(record.payload),
             record.keyframe,
             codec,
             Some(record.timestamp_us),
@@ -522,19 +574,22 @@ impl RtspServer {
             ));
         }
 
-        let frame = AudioFrame {
-            data: Arc::<[u8]>::from(pcma.to_vec()),
-            timestamp_us,
-        };
+        if let Some(data) = self.inner.media_budget.copy(pcma) {
+            self.publish_audio(data, timestamp_us);
+        }
+        Ok(())
+    }
+
+    fn publish_audio(&self, data: Bytes, timestamp_us: Option<u64>) {
+        let frame = AudioFrame { data, timestamp_us };
         self.inner
             .audio_frames_published
             .fetch_add(1, Ordering::Relaxed);
         let _ = self.inner.audio_tx.send(frame);
-        Ok(())
     }
 
-    /// Publish one or more native PCMA frames from the camera-local media ABI.
-    pub fn push_audio_record(&self, record: &MediaRecord) -> io::Result<()> {
+    /// Publish native PCMA frames as shared slices of the record's payload.
+    pub fn push_audio_record(&self, record: MediaRecord) -> io::Result<()> {
         if record.kind != RecordKind::AUDIO_CAPTURE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -553,11 +608,24 @@ impl RtspServer {
             ));
         }
 
-        for (index, frame) in record.payload.chunks(AUDIO_FRAME_LEN).enumerate() {
-            let timestamp_us = record
-                .timestamp_us
-                .saturating_add((index as u64).saturating_mul(AUDIO_FRAME_DURATION_US));
-            self.push_audio_frame(frame, Some(timestamp_us))?;
+        if !self.inner.audio_enabled {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "RTSP audio track is disabled",
+            ));
+        }
+        let Some(payload) = self.inner.media_budget.take(record.payload) else {
+            tracing::debug!("dropping audio record: shared payload budget exhausted");
+            return Ok(());
+        };
+        for offset in (0..payload.len()).step_by(AUDIO_FRAME_LEN) {
+            let timestamp_us = record.timestamp_us.saturating_add(
+                ((offset / AUDIO_FRAME_LEN) as u64).saturating_mul(AUDIO_FRAME_DURATION_US),
+            );
+            self.publish_audio(
+                payload.slice(offset..offset + AUDIO_FRAME_LEN),
+                Some(timestamp_us),
+            );
         }
         Ok(())
     }
@@ -587,36 +655,41 @@ impl RtspServer {
     }
 }
 
-impl Drop for RtspServer {
-    fn drop(&mut self) {
-        if self.handles.fetch_sub(1, Ordering::Relaxed) == 1 {
-            self.inner.shutdown.notify_waiters();
-        }
-    }
-}
-
 async fn accept_loop(listener: TcpListener, inner: Arc<RtspServerInner>, tls: Option<TlsAcceptor>) {
+    let mut shutdown = inner.shutdown.clone();
     loop {
         tokio::select! {
-            _ = inner.shutdown.notified() => break,
+            biased;
+            _ = shutdown.wait() => break,
             accepted = listener.accept() => {
                 let Ok((stream, peer)) = accepted else { break };
+                let Ok(permit) = Arc::clone(&inner.connections).try_acquire_owned() else {
+                    continue;
+                };
                 if stream.set_nodelay(true).is_err() {
                     continue;
                 }
                 let client_inner = Arc::clone(&inner);
                 let acceptor = tls.clone();
                 tokio::spawn(async move {
-                    let result = match acceptor {
-                        Some(acceptor) => match acceptor.accept(stream).await {
-                            Ok(stream) => handle_connection(Box::new(stream), peer, client_inner).await,
-                            Err(error) => Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!("TLS handshake failed: {error}"),
-                            )),
-                        },
-                        None => handle_connection(Box::new(stream), peer, client_inner).await,
-                    };
+                    let _permit = permit;
+                    let mut shutdown = client_inner.shutdown.clone();
+                    let result = async {
+                        let stream: Session = match acceptor {
+                            Some(acceptor) => tokio::select! {
+                                biased;
+                                _ = shutdown.wait() => return Ok(()),
+                                result = crate::tls::accept(acceptor, stream) => Box::new(result.map_err(|error| {
+                                    io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        format!("TLS handshake failed: {error}"),
+                                    )
+                                })?),
+                            },
+                            None => Box::new(stream),
+                        };
+                        handle_connection(stream, peer, client_inner).await
+                    }.await;
                     if let Err(error) = result {
                         tracing::debug!(%peer, %error, "RTSP client connection ended");
                     }
@@ -638,21 +711,37 @@ struct ClientState {
     audio_channel: Option<u8>,
     backchannel_channel: Option<u8>,
     backchannel_sink: Option<Arc<dyn TalkbackSink>>,
-    media_task: Option<JoinHandle<()>>,
-    audio_task: Option<JoinHandle<()>>,
+    media_task: Option<JoinHandle<io::Result<()>>>,
+    audio_task: Option<JoinHandle<io::Result<()>>>,
+    media_lifetime: Option<watch::Sender<()>>,
+    playing: bool,
 }
 
 impl ClientState {
-    async fn stop_media(&mut self) {
-        if let Some(task) = self.media_task.take() {
-            task.abort();
-        }
-        if let Some(task) = self.audio_task.take() {
-            task.abort();
+    async fn stop_media(&mut self) -> io::Result<()> {
+        drop(self.media_lifetime.take());
+        self.playing = false;
+        let mut result = Ok(());
+        for task in [self.media_task.take(), self.audio_task.take()]
+            .into_iter()
+            .flatten()
+        {
+            // Finish an in-progress interleaved batch, bounded by the write
+            // deadline. Aborting partway would corrupt a following PAUSE reply.
+            let stopped = task
+                .await
+                .map_err(|error| io::Error::other(format!("RTSP worker failed: {error}")))
+                .and_then(|result| result);
+            result = result.and(stopped);
         }
         if let Some(sink) = self.backchannel_sink.take() {
-            let _ = tokio::task::spawn_blocking(move || sink.stop_talkback()).await;
+            let stopped = tokio::task::spawn_blocking(move || sink.stop_talkback())
+                .await
+                .map_err(|error| io::Error::other(format!("RTSP speaker worker failed: {error}")))
+                .and_then(|result| result);
+            result = result.and(stopped);
         }
+        result
     }
 }
 
@@ -672,29 +761,49 @@ async fn handle_connection(
         backchannel_sink: None,
         media_task: None,
         audio_task: None,
+        media_lifetime: None,
+        playing: false,
     };
-    let mut buffer = Vec::new();
-
-    loop {
-        let message = tokio::select! {
-            _ = inner.shutdown.notified() => break,
-            result = read_request(&mut reader, &mut buffer) => result?,
-        };
-        let Some(message) = message else { break };
-        match message {
-            InboundMessage::Request(request) => {
-                if handle_request(&inner, &writer, &mut session, &mut state, request, peer).await? {
+    let mut buffer = BytesMut::new();
+    let mut shutdown = inner.shutdown.clone();
+    let result = async {
+        loop {
+            let message = tokio::select! {
+                biased;
+                _ = shutdown.wait() => break,
+                result = worker_finished(&mut state.media_task) => {
+                    state.media_task.take();
+                    result?;
                     break;
+                },
+                result = worker_finished(&mut state.audio_task) => {
+                    state.audio_task.take();
+                    result?;
+                    break;
+                },
+                result = read_session_request(&mut reader, &mut buffer, state.playing) => result?,
+            };
+            let Some(message) = message else { break };
+            match message {
+                InboundMessage::Request(request) => {
+                    if handle_request(&inner, &writer, &mut session, &mut state, request, peer)
+                        .await?
+                    {
+                        break;
+                    }
+                }
+                InboundMessage::Interleaved(frame) => {
+                    handle_interleaved(&mut state, frame).await?;
                 }
             }
-            InboundMessage::Interleaved(frame) => {
-                handle_interleaved(&mut state, frame).await?;
-            }
         }
+        Ok(())
     }
+    .await;
 
-    state.stop_media().await;
-    Ok(())
+    // Error paths also finish media workers and release the speaker.
+    let stopped = state.stop_media().await;
+    result.and(stopped)
 }
 
 async fn handle_request(
@@ -799,26 +908,24 @@ async fn handle_request(
         .iter()
         .any(|event| matches!(event, ServerEvent::RequestAccepted { .. }));
 
-    if accepted && method == Method::Play {
-        state.stop_media().await;
-        if state.backchannel_channel.is_some() {
-            let Some(sink) = inner.talkback.current().ok().flatten() else {
-                send_error(writer, &request.parsed, StatusCode::ServiceUnavailable).await?;
-                return Ok(false);
-            };
-            let start_sink = Arc::clone(&sink);
-            let start_result = tokio::task::spawn_blocking(move || start_sink.start_talkback())
-                .await
-                .map_err(|error| {
-                    io::Error::other(format!("RTSP talkback worker failed: {error}"))
-                })?;
-            if let Err(error) = start_result {
-                tracing::warn!(%error, "RTSP talkback start failed");
-                send_error(writer, &request.parsed, StatusCode::ServiceUnavailable).await?;
-                return Ok(false);
-            }
-            state.backchannel_sink = Some(sink);
+    if accepted && matches!(method, Method::Play | Method::Pause | Method::Teardown) {
+        state.stop_media().await?;
+    }
+    if accepted && method == Method::Play && state.backchannel_channel.is_some() {
+        let Some(sink) = inner.talkback.current().ok().flatten() else {
+            send_error(writer, &request.parsed, StatusCode::ServiceUnavailable).await?;
+            return Ok(false);
+        };
+        let start_sink = Arc::clone(&sink);
+        let start_result = tokio::task::spawn_blocking(move || start_sink.start_talkback())
+            .await
+            .map_err(|error| io::Error::other(format!("RTSP talkback worker failed: {error}")))?;
+        if let Err(error) = start_result {
+            tracing::warn!(%error, "RTSP talkback start failed");
+            send_error(writer, &request.parsed, StatusCode::ServiceUnavailable).await?;
+            return Ok(false);
         }
+        state.backchannel_sink = Some(sink);
     }
 
     let response = customize_response(
@@ -828,10 +935,7 @@ async fn handle_request(
         sdp.as_deref(),
         setup.as_ref().map(|(_, _, transport)| transport.as_str()),
     )?;
-    {
-        let mut writer = writer.lock().await;
-        writer.write_all(&response).await?;
-    }
+    write_to_client(writer, &response).await?;
 
     if !accepted {
         return Ok(false);
@@ -848,12 +952,16 @@ async fn handle_request(
             }
         }
         Method::Play => {
+            let (lifetime, shutdown) = Shutdown::channel();
+            state.media_lifetime = Some(lifetime);
+            state.playing = true;
             if let Some(channel) = state.video_channel {
+                let shutdown = shutdown.clone();
                 let receiver = inner.media_tx.subscribe();
                 let media_inner = Arc::clone(inner);
                 let media_writer = Arc::clone(writer);
                 state.media_task = Some(tokio::spawn(async move {
-                    media_loop(media_inner, media_writer, channel, receiver).await;
+                    media_loop(media_inner, media_writer, channel, receiver, shutdown).await
                 }));
             }
             if let Some(channel) = state.audio_channel {
@@ -861,13 +969,11 @@ async fn handle_request(
                 let media_inner = Arc::clone(inner);
                 let media_writer = Arc::clone(writer);
                 state.audio_task = Some(tokio::spawn(async move {
-                    audio_media_loop(media_inner, media_writer, channel, receiver).await;
+                    audio_media_loop(media_inner, media_writer, channel, receiver, shutdown).await
                 }));
             }
         }
-        Method::Pause => state.stop_media().await,
         Method::Teardown => {
-            state.stop_media().await;
             state.video_channel = None;
             state.audio_channel = None;
             state.backchannel_channel = None;
@@ -1027,6 +1133,7 @@ async fn wait_for_codec(inner: &RtspServerInner) -> bool {
         return true;
     }
 
+    let mut shutdown = inner.shutdown.clone();
     tokio::time::timeout(CODEC_READY_TIMEOUT, async {
         loop {
             if inner
@@ -1038,9 +1145,10 @@ async fn wait_for_codec(inner: &RtspServerInner) -> bool {
                 return true;
             }
             tokio::select! {
+                biased;
+                _ = shutdown.wait() => return false,
                 _ = inner.codec_ready.notified() => {}
                 _ = tokio::time::sleep(CODEC_READY_POLL) => {}
-                _ = inner.shutdown.notified() => return false,
             }
         }
     })
@@ -1048,18 +1156,33 @@ async fn wait_for_codec(inner: &RtspServerInner) -> bool {
     .unwrap_or(false)
 }
 
+async fn worker_finished(task: &mut Option<JoinHandle<io::Result<()>>>) -> io::Result<()> {
+    match task {
+        Some(task) => task
+            .await
+            .map_err(|error| io::Error::other(format!("RTSP worker failed: {error}")))?,
+        None => std::future::pending().await,
+    }
+}
+
 async fn media_loop(
     inner: Arc<RtspServerInner>,
     writer: Arc<Mutex<WriteHalf<Session>>>,
     channel: u8,
     mut receiver: broadcast::Receiver<VideoFrame>,
-) {
+    mut stopped: Shutdown,
+) -> io::Result<()> {
     let mut packetizer: Option<VideoPacketizer> = None;
+    let mut previous_sequence: Option<u64> = None;
     let mut waiting_for_keyframe = true;
+    let mut output = Vec::with_capacity(RTP_PAYLOAD_MTU + RTP_HEADER_LEN + INTERLEAVED_HEADER_LEN);
+    let mut shutdown = inner.shutdown.clone();
 
     loop {
         let frame = tokio::select! {
-            _ = inner.shutdown.notified() => break,
+            biased;
+            _ = shutdown.wait() => break,
+            _ = stopped.wait() => break,
             received = receiver.recv() => match received {
                 Ok(frame) => frame,
                 Err(broadcast::error::RecvError::Lagged(_)) => {
@@ -1070,6 +1193,10 @@ async fn media_loop(
             },
         };
 
+        if previous_sequence.is_some_and(|sequence| sequence.wrapping_add(1) != frame.sequence) {
+            waiting_for_keyframe = true;
+        }
+        previous_sequence = Some(frame.sequence);
         if waiting_for_keyframe && !frame.keyframe {
             continue;
         }
@@ -1081,66 +1208,20 @@ async fn media_loop(
         let Some(packetizer) = packetizer.as_mut() else {
             continue;
         };
-        let packets = packetizer.packetize(&frame);
-        if packets.is_empty() {
+        output.clear();
+        packetizer.append_rtp_into(&frame, channel, &mut output)?;
+        if output.is_empty() {
             waiting_for_keyframe = true;
             continue;
         }
-
-        for packet in packets {
-            if write_interleaved(&writer, channel, &packet).await.is_err() {
-                return;
-            }
-        }
+        // One writer lock and TLS write per access unit, not per fragment.
+        write_to_client(&writer, &output).await?;
         waiting_for_keyframe = false;
         inner
             .video_access_units_sent
             .fetch_add(1, Ordering::Relaxed);
     }
-}
-
-struct AudioPacketizer {
-    sequence: u16,
-    timestamp_value: u32,
-    timestamp_base: u32,
-    source_base_us: Option<u64>,
-    last_source_us: Option<u64>,
-    ssrc: u32,
-}
-
-impl AudioPacketizer {
-    fn new(ssrc: u32) -> Self {
-        Self {
-            sequence: 0,
-            timestamp_value: 0,
-            timestamp_base: 0,
-            source_base_us: None,
-            last_source_us: None,
-            ssrc,
-        }
-    }
-
-    fn packetize(&mut self, frame: &AudioFrame) -> Vec<u8> {
-        let sequence = self.sequence;
-        self.sequence = self.sequence.wrapping_add(1);
-        let timestamp = timestamp_from_source_at_rate(
-            &mut self.timestamp_value,
-            &mut self.timestamp_base,
-            &mut self.source_base_us,
-            &mut self.last_source_us,
-            frame.timestamp_us,
-            RTP_AUDIO_CLOCK_RATE,
-            RTP_AUDIO_TIMESTAMP_INCREMENT,
-        );
-        rtp_packet(
-            RTP_AUDIO_PAYLOAD_TYPE,
-            false,
-            sequence,
-            timestamp,
-            self.ssrc,
-            &frame.data,
-        )
-    }
+    Ok(())
 }
 
 async fn audio_media_loop(
@@ -1148,39 +1229,39 @@ async fn audio_media_loop(
     writer: Arc<Mutex<WriteHalf<Session>>>,
     channel: u8,
     mut receiver: broadcast::Receiver<AudioFrame>,
-) {
+    mut stopped: Shutdown,
+) -> io::Result<()> {
     let ssrc = inner.next_ssrc.fetch_add(1, Ordering::Relaxed);
     let mut packetizer = AudioPacketizer::new(ssrc);
+    let mut output = Vec::with_capacity(AUDIO_FRAME_LEN + RTP_HEADER_LEN + INTERLEAVED_HEADER_LEN);
+    let mut shutdown = inner.shutdown.clone();
 
     loop {
         let frame = tokio::select! {
-            _ = inner.shutdown.notified() => break,
+            biased;
+            _ = shutdown.wait() => break,
+            _ = stopped.wait() => break,
             received = receiver.recv() => match received {
                 Ok(frame) => frame,
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(broadcast::error::RecvError::Closed) => break,
             },
         };
-        let packet = packetizer.packetize(&frame);
-        if write_interleaved(&writer, channel, &packet).await.is_err() {
-            break;
-        }
+        output.clear();
+        packetizer.append_rtp_into(&frame, channel, &mut output)?;
+        write_to_client(&writer, &output).await?;
         inner.audio_frames_sent.fetch_add(1, Ordering::Relaxed);
     }
+    Ok(())
 }
 
-async fn write_interleaved(
-    writer: &Arc<Mutex<WriteHalf<Session>>>,
-    channel: u8,
-    payload: &[u8],
-) -> io::Result<()> {
-    let frame = InterleavedFrame::new(channel, payload.to_vec());
-    let bytes = frame
-        .to_bytes()
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
-
-    let mut writer = writer.lock().await;
-    writer.write_all(&bytes).await
+async fn write_to_client(writer: &Arc<Mutex<WriteHalf<Session>>>, bytes: &[u8]) -> io::Result<()> {
+    tokio::time::timeout(CLIENT_WRITE_TIMEOUT, async {
+        let mut writer = writer.lock().await;
+        writer.write_all(bytes).await
+    })
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "RTSP client stopped reading"))?
 }
 
 #[derive(Debug)]
@@ -1191,7 +1272,7 @@ enum InboundMessage {
 
 #[derive(Debug)]
 struct InboundRequest {
-    raw: Vec<u8>,
+    raw: Bytes,
     parsed: Request<Vec<u8>>,
 }
 
@@ -1230,15 +1311,28 @@ fn method_name(method: &Method) -> String {
     }
 }
 
+async fn read_session_request(
+    reader: &mut ReadHalf<Session>,
+    buffer: &mut BytesMut,
+    playing: bool,
+) -> io::Result<Option<InboundMessage>> {
+    if playing {
+        return read_request(reader, buffer).await;
+    }
+    tokio::time::timeout(SETUP_DEADLINE, read_request(reader, buffer))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "RTSP setup request timed out"))?
+}
+
 async fn read_request(
     reader: &mut ReadHalf<Session>,
-    buffer: &mut Vec<u8>,
+    buffer: &mut BytesMut,
 ) -> io::Result<Option<InboundMessage>> {
     loop {
         if buffer.first() == Some(&b'$') {
             match InterleavedFrame::parse(buffer) {
                 Ok(Some((frame, consumed))) => {
-                    buffer.drain(..consumed);
+                    buffer.advance(consumed);
                     return Ok(Some(InboundMessage::Interleaved(frame)));
                 }
                 Ok(None) => {}
@@ -1252,7 +1346,7 @@ async fn read_request(
         } else if !buffer.is_empty() {
             match Message::<Vec<u8>>::parse(buffer) {
                 Ok((Message::Request(parsed), consumed)) => {
-                    let raw = buffer.drain(..consumed).collect();
+                    let raw = buffer.split_to(consumed).freeze();
                     return Ok(Some(InboundMessage::Request(InboundRequest {
                         raw,
                         parsed,
@@ -1281,7 +1375,8 @@ async fn read_request(
             ));
         }
         let mut chunk = [0_u8; 4 * 1024];
-        let count = reader.read(&mut chunk).await?;
+        let capacity = chunk.len().min(MAX_REQUEST_BUFFER - buffer.len());
+        let count = reader.read(&mut chunk[..capacity]).await?;
         if count == 0 {
             if buffer.is_empty() {
                 return Ok(None);
@@ -1492,8 +1587,7 @@ async fn send_error(
         .header(headers::SERVER, RTSP_SERVER_NAME)
         .build(Vec::<u8>::new());
     let bytes = serialize_message(&Message::from(response))?;
-    let mut writer = writer.lock().await;
-    writer.write_all(&bytes).await
+    write_to_client(writer, &bytes).await
 }
 
 async fn send_unauthorized(
@@ -1518,8 +1612,7 @@ async fn send_unauthorized(
         .header(headers::WWW_AUTHENTICATE, challenge)
         .build(Vec::<u8>::new());
     let bytes = serialize_message(&Message::from(response))?;
-    let mut writer = writer.lock().await;
-    writer.write_all(&bytes).await
+    write_to_client(writer, &bytes).await
 }
 
 fn content_base(uri: &rtsp_types::Url) -> String {
@@ -1629,462 +1722,8 @@ fn build_sdp(
     Some(sdp)
 }
 
-fn update_codec_state(state: &mut CodecState, codec: VideoCodec, annex_b: &[u8]) -> bool {
-    let mut changed = false;
-    if state.codec != codec {
-        *state = CodecState {
-            codec,
-            ..CodecState::default()
-        };
-        changed = true;
-    }
-
-    for nal in annex_b_nalus(annex_b) {
-        match codec {
-            VideoCodec::H264 => {
-                if !is_valid_h264_nal(nal) {
-                    continue;
-                }
-                match nal[0] & 0x1f {
-                    7 => {
-                        changed |= state.sps.as_deref() != Some(nal);
-                        state.sps = Some(nal.to_vec());
-                    }
-                    8 => {
-                        changed |= state.pps.as_deref() != Some(nal);
-                        state.pps = Some(nal.to_vec());
-                    }
-                    _ => {}
-                }
-            }
-            VideoCodec::H265 => {
-                if nal.len() < 2 {
-                    continue;
-                }
-                match (nal[0] >> 1) & 0x3f {
-                    32 => {
-                        changed |= state.vps.as_deref() != Some(nal);
-                        state.vps = Some(nal.to_vec());
-                    }
-                    33 => {
-                        changed |= state.sps.as_deref() != Some(nal);
-                        state.sps = Some(nal.to_vec());
-                    }
-                    34 => {
-                        changed |= state.pps.as_deref() != Some(nal);
-                        state.pps = Some(nal.to_vec());
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-    changed
-}
-
-fn detected_keyframe(codec: VideoCodec, annex_b: &[u8]) -> bool {
-    annex_b_nalus(annex_b).into_iter().any(|nal| match codec {
-        VideoCodec::H264 => is_valid_h264_nal(nal) && nal[0] & 0x1f == 5,
-        VideoCodec::H265 => nal.len() >= 2 && matches!((nal[0] >> 1) & 0x3f, 16..=23),
-    })
-}
-
-fn annex_b_nalus(data: &[u8]) -> Vec<&[u8]> {
-    let mut starts = Vec::new();
-    let mut index = 0;
-    while index + 3 <= data.len() {
-        if data[index..].starts_with(&[0, 0, 1]) {
-            starts.push((index, 3));
-            index += 3;
-        } else if index + 4 <= data.len() && data[index..].starts_with(&[0, 0, 0, 1]) {
-            starts.push((index, 4));
-            index += 4;
-        } else {
-            index += 1;
-        }
-    }
-
-    starts
-        .iter()
-        .enumerate()
-        .filter_map(|(position, (start, prefix_len))| {
-            let end = starts
-                .get(position + 1)
-                .map(|(next, _)| *next)
-                .unwrap_or(data.len());
-            let nal_start = start + prefix_len;
-            (nal_start < end).then_some(&data[nal_start..end])
-        })
-        .collect()
-}
-
-fn is_valid_h264_nal(nal: &[u8]) -> bool {
-    !nal.is_empty() && nal[0] & 0x80 == 0 && matches!(nal[0] & 0x1f, 1..=23)
-}
-
 fn hex_lower(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-enum VideoPacketizer {
-    H264(H264Packetizer),
-    H265(H265Packetizer),
-}
-
-impl VideoPacketizer {
-    fn new(codec: VideoCodec, ssrc: u32) -> Self {
-        match codec {
-            VideoCodec::H264 => Self::H264(H264Packetizer::new(ssrc)),
-            VideoCodec::H265 => Self::H265(H265Packetizer::new(ssrc)),
-        }
-    }
-
-    fn codec(&self) -> VideoCodec {
-        match self {
-            Self::H264(_) => VideoCodec::H264,
-            Self::H265(_) => VideoCodec::H265,
-        }
-    }
-
-    fn packetize(&mut self, frame: &VideoFrame) -> Vec<Vec<u8>> {
-        let payloads = match self {
-            Self::H264(packetizer) => packetizer.payloads(&frame.data, frame.keyframe),
-            Self::H265(packetizer) => packetizer.payloads(&frame.data, frame.keyframe),
-        };
-        let timestamp = match self {
-            Self::H264(packetizer) => packetizer.timestamp(frame.timestamp_us),
-            Self::H265(packetizer) => packetizer.timestamp(frame.timestamp_us),
-        };
-        let ssrc = match self {
-            Self::H264(packetizer) => packetizer.ssrc,
-            Self::H265(packetizer) => packetizer.ssrc,
-        };
-
-        let count = payloads.len();
-        payloads
-            .into_iter()
-            .enumerate()
-            .map(|(index, payload)| {
-                let current_sequence = self.next_sequence();
-                rtp_packet(
-                    RTP_VIDEO_PAYLOAD_TYPE,
-                    index + 1 == count,
-                    current_sequence,
-                    timestamp,
-                    ssrc,
-                    &payload,
-                )
-            })
-            .collect()
-    }
-
-    fn next_sequence(&mut self) -> u16 {
-        match self {
-            Self::H264(packetizer) => {
-                let sequence = packetizer.sequence;
-                packetizer.sequence = packetizer.sequence.wrapping_add(1);
-                sequence
-            }
-            Self::H265(packetizer) => {
-                let sequence = packetizer.sequence;
-                packetizer.sequence = packetizer.sequence.wrapping_add(1);
-                sequence
-            }
-        }
-    }
-}
-
-struct H264Packetizer {
-    sequence: u16,
-    timestamp_value: u32,
-    timestamp_base: u32,
-    source_base_us: Option<u64>,
-    last_source_us: Option<u64>,
-    ssrc: u32,
-    sps: Option<Vec<u8>>,
-    pps: Option<Vec<u8>>,
-}
-
-impl H264Packetizer {
-    fn new(ssrc: u32) -> Self {
-        Self {
-            sequence: 0,
-            timestamp_value: 0,
-            timestamp_base: 0,
-            source_base_us: None,
-            last_source_us: None,
-            ssrc,
-            sps: None,
-            pps: None,
-        }
-    }
-
-    fn payloads(&mut self, data: &[u8], keyframe: bool) -> Vec<Bytes> {
-        let nalus = annex_b_nalus(data);
-        let mut vcl_data = Vec::new();
-        let mut has_vcl = false;
-        for nal in nalus {
-            if !is_valid_h264_nal(nal) {
-                continue;
-            }
-            match nal[0] & 0x1f {
-                7 => self.sps = Some(nal.to_vec()),
-                8 => self.pps = Some(nal.to_vec()),
-                1..=5 => {
-                    has_vcl = true;
-                    vcl_data.extend_from_slice(&[0, 0, 0, 1]);
-                    vcl_data.extend_from_slice(nal);
-                }
-                _ => {}
-            }
-        }
-        if !has_vcl {
-            return Vec::new();
-        }
-
-        let mut payloads = Vec::new();
-        if keyframe
-            && let (Some(sps), Some(pps)) = (self.sps.as_deref(), self.pps.as_deref())
-            && let Some(parameter_payload) = aggregate_h264(sps, pps)
-            && parameter_payload.len() <= RTP_PAYLOAD_MTU
-        {
-            payloads.push(Bytes::from(parameter_payload));
-        }
-
-        let mut payloader = H264Payloader::default();
-        if let Ok(vcl_payloads) = payloader.payload(RTP_PAYLOAD_MTU, &Bytes::from(vcl_data)) {
-            payloads.extend(vcl_payloads);
-        }
-        payloads
-    }
-
-    fn timestamp(&mut self, source_us: Option<u64>) -> u32 {
-        timestamp_from_source(
-            &mut self.timestamp_value,
-            &mut self.timestamp_base,
-            &mut self.source_base_us,
-            &mut self.last_source_us,
-            source_us,
-        )
-    }
-}
-
-struct H265Packetizer {
-    sequence: u16,
-    timestamp_value: u32,
-    timestamp_base: u32,
-    source_base_us: Option<u64>,
-    last_source_us: Option<u64>,
-    ssrc: u32,
-    vps: Option<Vec<u8>>,
-    sps: Option<Vec<u8>>,
-    pps: Option<Vec<u8>>,
-}
-
-impl H265Packetizer {
-    fn new(ssrc: u32) -> Self {
-        Self {
-            sequence: 0,
-            timestamp_value: 0,
-            timestamp_base: 0,
-            source_base_us: None,
-            last_source_us: None,
-            ssrc,
-            vps: None,
-            sps: None,
-            pps: None,
-        }
-    }
-
-    fn payloads(&mut self, data: &[u8], keyframe: bool) -> Vec<Bytes> {
-        let nalus = annex_b_nalus(data);
-        let mut vcl_data = Vec::new();
-        let mut has_vcl = false;
-        let mut has_irap = false;
-        for nal in nalus {
-            if nal.len() < 2 {
-                continue;
-            }
-            let nal_type = (nal[0] >> 1) & 0x3f;
-            match nal_type {
-                32 => self.vps = Some(nal.to_vec()),
-                33 => self.sps = Some(nal.to_vec()),
-                34 => self.pps = Some(nal.to_vec()),
-                0..=31 => {
-                    has_vcl = true;
-                    has_irap |= (16..=23).contains(&nal_type);
-                    vcl_data.extend_from_slice(&[0, 0, 0, 1]);
-                    vcl_data.extend_from_slice(nal);
-                }
-                _ => {}
-            }
-        }
-        if !has_vcl {
-            return Vec::new();
-        }
-
-        let mut payloads = Vec::new();
-        if (keyframe || has_irap)
-            && let (Some(vps), Some(sps), Some(pps)) = (
-                self.vps.as_deref(),
-                self.sps.as_deref(),
-                self.pps.as_deref(),
-            )
-            && let Some(parameter_payload) = aggregate_h265(vps, sps, pps)
-            && parameter_payload.len() <= RTP_PAYLOAD_MTU
-        {
-            payloads.push(Bytes::from(parameter_payload));
-        }
-
-        payloads.extend(fragment_h265_vcl(&vcl_data));
-        payloads
-    }
-
-    fn timestamp(&mut self, source_us: Option<u64>) -> u32 {
-        timestamp_from_source(
-            &mut self.timestamp_value,
-            &mut self.timestamp_base,
-            &mut self.source_base_us,
-            &mut self.last_source_us,
-            source_us,
-        )
-    }
-}
-
-fn timestamp_from_source(
-    current: &mut u32,
-    base_rtp: &mut u32,
-    source_base_us: &mut Option<u64>,
-    last_source_us: &mut Option<u64>,
-    source_us: Option<u64>,
-) -> u32 {
-    timestamp_from_source_at_rate(
-        current,
-        base_rtp,
-        source_base_us,
-        last_source_us,
-        source_us,
-        RTP_VIDEO_CLOCK_RATE,
-        RTP_VIDEO_TIMESTAMP_INCREMENT,
-    )
-}
-
-fn timestamp_from_source_at_rate(
-    current: &mut u32,
-    base_rtp: &mut u32,
-    source_base_us: &mut Option<u64>,
-    last_source_us: &mut Option<u64>,
-    source_us: Option<u64>,
-    clock_rate: u32,
-    fallback_increment: u32,
-) -> u32 {
-    let Some(source_us) = source_us else {
-        let timestamp = *current;
-        *current = current.wrapping_add(fallback_increment);
-        return timestamp;
-    };
-
-    let previous = *last_source_us;
-    let monotonic_source = previous
-        .map(|last| source_us.max(last))
-        .unwrap_or(source_us);
-    *last_source_us = Some(monotonic_source);
-    let base = *source_base_us.get_or_insert(monotonic_source);
-    let elapsed = monotonic_source.saturating_sub(base);
-    let seconds = elapsed / 1_000_000;
-    let remainder = elapsed % 1_000_000;
-    let ticks = seconds
-        .saturating_mul(u64::from(clock_rate))
-        .saturating_add(remainder.saturating_mul(u64::from(clock_rate)) / 1_000_000);
-    let mut timestamp = base_rtp.wrapping_add(ticks as u32);
-    if previous.is_some() && timestamp <= *current {
-        timestamp = current.wrapping_add(1);
-    }
-    *current = timestamp;
-    timestamp
-}
-
-fn aggregate_h264(sps: &[u8], pps: &[u8]) -> Option<Vec<u8>> {
-    let sps_len = u16::try_from(sps.len()).ok()?;
-    let pps_len = u16::try_from(pps.len()).ok()?;
-    let mut payload = Vec::with_capacity(1 + 2 + sps.len() + 2 + pps.len());
-    payload.push((sps.first().copied().unwrap_or(0) & 0x60) | 24);
-    payload.extend_from_slice(&sps_len.to_be_bytes());
-    payload.extend_from_slice(sps);
-    payload.extend_from_slice(&pps_len.to_be_bytes());
-    payload.extend_from_slice(pps);
-    Some(payload)
-}
-
-fn fragment_h265_vcl(data: &[u8]) -> Vec<Bytes> {
-    let mut payloads = Vec::new();
-    for nal in annex_b_nalus(data) {
-        if nal.len() < 2 {
-            continue;
-        }
-        if nal.len() <= RTP_PAYLOAD_MTU {
-            payloads.push(Bytes::copy_from_slice(nal));
-            continue;
-        }
-
-        let nal_type = (nal[0] >> 1) & 0x3f;
-        let max_fragment_len = RTP_PAYLOAD_MTU.saturating_sub(3);
-        if max_fragment_len == 0 {
-            continue;
-        }
-        let mut offset = 2;
-        while offset < nal.len() {
-            let end = (offset + max_fragment_len).min(nal.len());
-            let mut fragment = Vec::with_capacity(3 + end - offset);
-            // RFC 7798 FU indicator: preserve F/layer-id high bit and TID,
-            // replace the NAL type with 49 (fragmentation unit).
-            fragment.push((nal[0] & 0x81) | (49 << 1));
-            fragment.push(nal[1]);
-            let mut fu_header = nal_type;
-            if offset == 2 {
-                fu_header |= 0x80;
-            }
-            if end == nal.len() {
-                fu_header |= 0x40;
-            }
-            fragment.push(fu_header);
-            fragment.extend_from_slice(&nal[offset..end]);
-            payloads.push(Bytes::from(fragment));
-            offset = end;
-        }
-    }
-    payloads
-}
-
-fn aggregate_h265(vps: &[u8], sps: &[u8], pps: &[u8]) -> Option<Vec<u8>> {
-    let mut payload = Vec::with_capacity(2 + 2 + vps.len() + 2 + sps.len() + 2 + pps.len());
-    payload.extend_from_slice(&[0x60, 0x01]);
-    for nal in [vps, sps, pps] {
-        let length = u16::try_from(nal.len()).ok()?;
-        payload.extend_from_slice(&length.to_be_bytes());
-        payload.extend_from_slice(nal);
-    }
-    Some(payload)
-}
-
-fn rtp_packet(
-    payload_type: u8,
-    marker: bool,
-    sequence: u16,
-    timestamp: u32,
-    ssrc: u32,
-    payload: &[u8],
-) -> Vec<u8> {
-    let mut packet = Vec::with_capacity(12 + payload.len());
-    packet.extend_from_slice(&[
-        0x80,
-        (if marker { 0x80 } else { 0 }) | (payload_type & 0x7f),
-    ]);
-    packet.extend_from_slice(&sequence.to_be_bytes());
-    packet.extend_from_slice(&timestamp.to_be_bytes());
-    packet.extend_from_slice(&ssrc.to_be_bytes());
-    packet.extend_from_slice(payload);
-    packet
 }
 
 #[cfg(test)]
@@ -2115,6 +1754,7 @@ mod tests {
 
     struct TestTalkbackSink {
         starts: AtomicUsize,
+        stops: AtomicUsize,
         pcm: TestMutex<Vec<u8>>,
         ready: Arc<tokio::sync::Notify>,
     }
@@ -2123,6 +1763,7 @@ mod tests {
         fn default() -> Self {
             Self {
                 starts: AtomicUsize::new(0),
+                stops: AtomicUsize::new(0),
                 pcm: TestMutex::new(Vec::new()),
                 ready: Arc::new(tokio::sync::Notify::new()),
             }
@@ -2145,6 +1786,8 @@ mod tests {
         }
 
         fn stop_talkback(&self) -> io::Result<()> {
+            self.stops.fetch_add(1, AtomicOrdering::Relaxed);
+            self.ready.notify_one();
             Ok(())
         }
     }
@@ -2152,16 +1795,28 @@ mod tests {
     #[test]
     fn parses_mixed_annex_b_start_codes() {
         let data = [0, 0, 0, 1, 0x67, 1, 2, 0, 0, 1, 0x68, 3, 4];
-        let nalus = annex_b_nalus(&data);
+        let nalus = annex_b_nalus(&data).collect::<Vec<_>>();
         assert_eq!(nalus, [vec![0x67, 1, 2].as_slice(), &[0x68, 3, 4]]);
     }
 
     #[test]
     fn h264_packetizer_emits_parameter_set_and_fragmented_rtp() {
-        let mut packetizer = H264Packetizer::new(0x1234_5678);
+        let mut packetizer = VideoPacketizer::new(VideoCodec::H264, 0x1234_5678);
         let mut frame = h264_parameter_frame();
         frame.extend_from_slice(&[0; 3_000]);
-        let packets = packetizer.payloads(&frame, true);
+        let frame = VideoFrame {
+            sequence: 0,
+            data: Bytes::from(frame),
+            codec: VideoCodec::H264,
+            keyframe: true,
+            timestamp_us: None,
+        };
+        let mut batch = Vec::new();
+        packetizer.append_rtp_into(&frame, 0, &mut batch).unwrap();
+        let packets = rtp_packets(&batch)
+            .into_iter()
+            .map(|packet| packet[RTP_HEADER_LEN..].to_vec())
+            .collect::<Vec<_>>();
 
         assert!(packets.len() > 2);
         assert_eq!(packets[0][0] & 0x1f, 24);
@@ -2170,8 +1825,20 @@ mod tests {
 
     #[test]
     fn h265_packetizer_keeps_vcl_after_parameter_aggregation() {
-        let mut packetizer = H265Packetizer::new(0x1234_5678);
-        let packets = packetizer.payloads(&h265_parameter_frame(), true);
+        let mut packetizer = VideoPacketizer::new(VideoCodec::H265, 0x1234_5678);
+        let frame = VideoFrame {
+            sequence: 0,
+            data: Bytes::from(h265_parameter_frame()),
+            codec: VideoCodec::H265,
+            keyframe: true,
+            timestamp_us: None,
+        };
+        let mut batch = Vec::new();
+        packetizer.append_rtp_into(&frame, 0, &mut batch).unwrap();
+        let packets = rtp_packets(&batch)
+            .into_iter()
+            .map(|packet| packet[RTP_HEADER_LEN..].to_vec())
+            .collect::<Vec<_>>();
 
         assert_eq!((packets[0][0] >> 1) & 0x3f, 48);
         assert!(packets.len() >= 2);
@@ -2196,16 +1863,20 @@ mod tests {
     fn pcma_packetizer_uses_8khz_rtp_timestamps() {
         let mut packetizer = AudioPacketizer::new(0x1234_5678);
         let first = AudioFrame {
-            data: Arc::<[u8]>::from(vec![0xaa; AUDIO_FRAME_LEN]),
+            data: Bytes::from(vec![0xaa; AUDIO_FRAME_LEN]),
             timestamp_us: Some(1_000_000),
         };
         let second = AudioFrame {
-            data: Arc::<[u8]>::from(vec![0xbb; AUDIO_FRAME_LEN]),
+            data: Bytes::from(vec![0xbb; AUDIO_FRAME_LEN]),
             timestamp_us: Some(1_020_000),
         };
 
-        let first_packet = packetizer.packetize(&first);
-        let second_packet = packetizer.packetize(&second);
+        let mut batch = Vec::new();
+        packetizer.append_rtp_into(&first, 0, &mut batch).unwrap();
+        packetizer.append_rtp_into(&second, 0, &mut batch).unwrap();
+        let packets = rtp_packets(&batch);
+        let first_packet = &packets[0];
+        let second_packet = &packets[1];
 
         assert_eq!(first_packet.len(), 12 + AUDIO_FRAME_LEN);
         assert_eq!(first_packet[1], RTP_AUDIO_PAYLOAD_TYPE);
@@ -2230,8 +1901,8 @@ mod tests {
         config.audio_enabled = true;
         let state = CodecState {
             codec: VideoCodec::H264,
-            sps: Some(vec![0x67, 0x42, 0x00, 0x1f]),
-            pps: Some(vec![0x68, 0xce, 0x06, 0xe2]),
+            sps: Some(Bytes::from_static(&[0x67, 0x42, 0x00, 0x1f])),
+            pps: Some(Bytes::from_static(&[0x68, 0xce, 0x06, 0xe2])),
             ..CodecState::default()
         };
         let sdp = build_sdp(
@@ -2410,6 +2081,17 @@ mod tests {
             .flat_map(|sample| sample.to_le_bytes())
             .collect::<Vec<_>>();
         assert_eq!(pcm, expected);
+
+        // A malformed request exits through an error, not TEARDOWN. The
+        // speaker still must be released instead of skipping session cleanup.
+        socket
+            .write_all(b"not an RTSP request\r\n\r\n")
+            .await
+            .expect("malformed request");
+        tokio::time::timeout(Duration::from_secs(1), sink.ready.notified())
+            .await
+            .expect("error path should stop talkback");
+        assert_eq!(sink.stops.load(AtomicOrdering::Relaxed), 1);
     }
 
     #[tokio::test]

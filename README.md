@@ -1,5 +1,21 @@
 # eufy-c220-standalone-rs
 
+```mermaid
+flowchart LR
+    camera["Eufy C220 / T8W11<br/>Standalone Rust firmware"]
+    relay["MediaMTX relay"]
+    viewers["Video clients<br/>Frigate · VLC · NVRs"]
+    controls["Control clients"]
+    broker["MQTT broker"]
+    ha["Home Assistant"]
+
+    camera -->|Authenticated RTSPS · one consumer| relay
+    relay -->|Local fan-out| viewers
+    controls -->|HTTPS / minimal ONVIF PTZ| camera
+    camera <-->|Verified-TLS MQTT| broker
+    broker <-->|State + commands| ha
+```
+
 Local-only firmware for the **Eufy C220 / T8W11**, reference `os03b10` sensor
 revision. No Eufy account, cloud or vendor app. Factory bootloader, kernel,
 drivers and calibration are preserved.

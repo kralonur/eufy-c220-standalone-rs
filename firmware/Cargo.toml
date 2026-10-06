@@ -13,7 +13,7 @@ libc = { workspace = true }
 md-5 = { workspace = true, default-features = false }
 mdns-sd = { workspace = true, default-features = false }
 # Enable std search acceleration for the shared protocol's Annex-B iterator.
-memchr = { workspace = true }
+memchr = { workspace = true, features = ["std"] }
 rand = { workspace = true, default-features = false, features = ["std_rng", "sys_rng"] }
 rcgen = { workspace = true, default-features = false, features = ["pem", "ring"] }
 roxmltree = { workspace = true }

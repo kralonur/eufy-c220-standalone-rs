@@ -1,5 +1,24 @@
 # Install, setup and recovery
 
+## Installation at a glance
+
+This is a roadmap, not a substitute for the checks and commands below.
+
+```mermaid
+flowchart TD
+    hardware["Confirm reference hardware"] --> backup["Back up all flash + NVRAM<br/>Establish recovery first"]
+    backup --> harvest["Factory bootstrap + harvest"]
+    harvest --> build["Build with private vendor inputs"]
+    build --> secured{"Secure packaging succeeds?"}
+    secured -->|No| stop["Stop · do not bypass hardening"]
+    secured -->|Yes| write["Check flash map + image size<br/>Pad, write and read back"]
+    write --> match{"Readback hash matches?"}
+    match -->|No| recover["Do not reboot<br/>Keep shell and use recovery plan"]
+    match -->|Yes| provision["Reboot + provision on isolated LAN"]
+    provision --> verify["Trust certificate out of band<br/>Verify authentication + video"]
+    verify --> done["Remove provisioning card<br/>Confirm normal boot"]
+```
+
 ## 1. Check hardware and back up
 
 Only the reference **C220 / T8W11**, `os03b10_CMK-OT2117-PC1_30IRC-F16.bin`
@@ -246,6 +265,20 @@ That Frigate client's ONVIF connection disables certificate verification itself;
 keep it LAN-restricted. Video pinning is independent.
 
 ## Recovery, updates and handover
+
+```mermaid
+flowchart TD
+    problem{"Does camera startup still run?"}
+    problem -->|No| hardware["Hardware recovery<br/>Card/button recovery cannot run"]
+    problem -->|Yes| issue{"What needs repair?"}
+    issue -->|Wi-Fi| wifi["Boot with wifi.txt<br/>Preserves logins"]
+    issue -->|Credentials| credentials["Boot with full provision.txt<br/>Replaces security config"]
+    issue -->|Maintenance shell| shell["Authenticated maintenance API<br/>or maintenance.txt on card"]
+    issue -->|Offline, no usable card| rescue["Create rescue hotspot<br/>Hold reset about 6 seconds, release"]
+    rescue --> telnet["Camera joins hotspot as a client<br/>Root Telnet on isolated trusted LAN"]
+    issue -->|Owner reset| reset["Remove provisioning cards<br/>Hold reset at least 10 seconds"]
+    reset --> erased["Known owner settings removed<br/>Reboots · not secure erasure"]
+```
 
 | Situation | Action |
 | --- | --- |

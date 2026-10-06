@@ -22,8 +22,9 @@ const INSECURE_SECRET_MODE_BITS: u32 = 0o077;
 /// handshakes: eight concurrent API requests leave room for polling and controls.
 pub(crate) const MAX_CONTROL_CONNECTIONS: usize = 8;
 
-/// Shared RTSP/RTSPS admission budget, including pre-authentication and TLS.
-pub(crate) const MAX_RTSP_CONNECTIONS: usize = 4;
+/// One camera-side consumer across RTSP/RTSPS, including pre-auth/TLS work.
+/// MediaMTX owns this connection and handles downstream viewer fan-out.
+pub(crate) const MAX_RTSP_CONNECTIONS: usize = 1;
 
 /// Longest DNS label, from RFC 1035.
 const MAX_HOST_LABEL_LENGTH: usize = 63;

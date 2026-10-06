@@ -74,6 +74,50 @@ async fn dropping_server_before_accept_task_runs_releases_listener() {
     .expect("pre-poll stop must be retained");
 }
 
+// MediaMTX is the sole consumer: the shared gate must reject a second
+// connection even when it uses the other transport, without disturbing the first.
+#[tokio::test]
+async fn single_consumer_limit_is_shared_with_tls() {
+    let server = RtspServer::start(RtspServerConfig::new("127.0.0.1:0".parse().unwrap())).unwrap();
+    let tls_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let tls_address = tls_listener.local_addr().unwrap();
+    let tls_config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_cert_resolver(Arc::new(rustls::server::ResolvesServerCertUsingSni::new()));
+    tokio::spawn(accept_loop(
+        tls_listener,
+        Arc::clone(&server.inner),
+        Some(TlsAcceptor::from(Arc::new(tls_config))),
+    ));
+
+    let mut consumer = tokio::net::TcpStream::connect(server.local_addr())
+        .await
+        .unwrap();
+    consumer
+        .write_all(b"OPTIONS rtsp://127.0.0.1/live RTSP/1.0\r\nCSeq: 1\r\n\r\n")
+        .await
+        .unwrap();
+    let mut response = [0; b"RTSP/1.0 200 OK".len()];
+    consumer.read_exact(&mut response).await.unwrap();
+    assert_eq!(&response, b"RTSP/1.0 200 OK");
+
+    for address in [server.local_addr(), tls_address] {
+        let mut excess = tokio::net::TcpStream::connect(address).await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(SETUP_DEADLINE / 2, excess.read(&mut [0]))
+                .await
+                .unwrap()
+                .unwrap(),
+            0,
+            "second consumer must close before any TLS handshake or RTSP request",
+        );
+    }
+}
+
 // Unauthenticated idle clients must not retain unbounded tasks or admission.
 #[tokio::test]
 async fn idle_setup_expires_and_admission_recovers() {

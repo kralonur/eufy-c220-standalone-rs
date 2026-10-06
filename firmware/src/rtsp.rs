@@ -346,13 +346,13 @@ struct RtspServerInner {
     audio_frames_sent: AtomicU64,
 }
 
-/// Camera-local RTSP server.
+/// Single-consumer camera-local RTSP server.
 ///
 /// The server never reads the sensor itself. The media engine owns capture and
 /// encoding; callers publish complete Annex-B access units with
 /// [`RtspServer::push_video_frame`] and validated PCMA frames with
-/// [`RtspServer::push_audio_frame`]. Clients receive independent RTP sequence
-/// spaces and packetizers.
+/// [`RtspServer::push_audio_frame`]. The sole consumer receives its own RTP
+/// sequence spaces and packetizers; MediaMTX provides downstream viewer fan-out.
 #[derive(Clone)]
 pub struct RtspServer {
     inner: Arc<RtspServerInner>,

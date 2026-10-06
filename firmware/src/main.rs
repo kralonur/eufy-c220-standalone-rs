@@ -312,6 +312,16 @@ async fn run_firmware() -> Result<(), Box<dyn Error + Send + Sync>> {
     control_config.auth = http_auth;
     control_config.lockout = lockout;
     control_config.tls_acceptor = if api_tls { tls_acceptor } else { None };
+    if control_tls_enabled && control_config.auth.is_some() && rtsps_port != 0 {
+        let username = std::env::var(HTTP_USERNAME_ENV)?;
+        let password = security::secret_file(HTTP_PASSWORD_FILE_ENV)?
+            .ok_or_else(|| std::io::Error::other("ONVIF control password is missing"))?;
+        control_config.onvif = Some(Arc::new(control::OnvifService::new(
+            username.trim().to_string(),
+            password,
+            rtsps_port,
+        )));
+    }
     let control = ControlServer::start(control_config, media_slot.clone(), ptz)?;
 
     // MQTT shares the control plane above, so a command over the broker takes exactly

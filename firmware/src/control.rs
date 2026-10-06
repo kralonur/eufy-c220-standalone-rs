@@ -17,6 +17,9 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+mod onvif;
+pub use onvif::Service as OnvifService;
+
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, mpsc, watch};
 use tokio_rustls::TlsAcceptor;
@@ -174,6 +177,8 @@ pub struct ControlServerConfig {
     pub lockout: Arc<Lockout>,
     /// TLS acceptor for the control listener in production.
     pub tls_acceptor: Option<TlsAcceptor>,
+    /// Optional ONVIF WS-Security adapter, exposed only on authenticated TLS.
+    pub onvif: Option<Arc<OnvifService>>,
 }
 
 impl std::fmt::Debug for ControlServerConfig {
@@ -195,6 +200,7 @@ impl ControlServerConfig {
             auth: None,
             lockout: Arc::new(Lockout::new()),
             tls_acceptor: None,
+            onvif: None,
         }
     }
 }
@@ -222,6 +228,12 @@ impl ControlServer {
         media: MediaEngineSlot,
         ptz: Option<Arc<PtzController>>,
     ) -> io::Result<Self> {
+        if config.onvif.is_some() && (config.tls_acceptor.is_none() || config.auth.is_none()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "ONVIF requires TLS and control credentials",
+            ));
+        }
         let listener = StdTcpListener::bind(config.bind_address)?;
         listener.set_nonblocking(true)?;
         let local_addr = listener.local_addr()?;
@@ -238,6 +250,7 @@ impl ControlServer {
             media,
             ptz,
             auth: config.auth,
+            onvif: config.onvif,
             lockout: config.lockout,
             maintenance_available,
             maintenance_telnet_started: AtomicBool::new(false),
@@ -312,6 +325,7 @@ pub(crate) struct ControlInner {
     media: MediaEngineSlot,
     ptz: Option<Arc<PtzController>>,
     auth: Option<Arc<DigestAuth>>,
+    onvif: Option<Arc<OnvifService>>,
     lockout: Arc<Lockout>,
     /// The shell route is exposed only on the authenticated TLS listener.
     maintenance_available: bool,
@@ -349,6 +363,7 @@ async fn accept_loop(listener: TcpListener, inner: Arc<ControlInner>, tls: Optio
             _ = shutdown.wait() => break,
             accepted = listener.accept() => {
                 let Ok((stream, peer)) = accepted else { break };
+                let Ok(local) = stream.local_addr() else { continue; };
                 let Ok(permit) = Arc::clone(&connections).try_acquire_owned() else {
                     continue;
                 };
@@ -360,13 +375,13 @@ async fn accept_loop(listener: TcpListener, inner: Arc<ControlInner>, tls: Optio
                     let session = async {
                         match acceptor {
                         Some(acceptor) => match crate::tls::accept(acceptor, stream).await {
-                            Ok(stream) => handle_connection(Box::new(stream), peer, client_inner).await,
+                            Ok(stream) => handle_connection(Box::new(stream), peer, local, client_inner).await,
                             Err(error) => Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
                                 format!("TLS handshake failed: {error}"),
                             )),
                         },
-                        None => handle_connection(Box::new(stream), peer, client_inner).await,
+                        None => handle_connection(Box::new(stream), peer, local, client_inner).await,
                         }
                     };
                     // Dropping HTTP input/output closes this connection. Device
@@ -388,11 +403,12 @@ async fn accept_loop(listener: TcpListener, inner: Arc<ControlInner>, tls: Optio
 async fn handle_connection(
     mut stream: ControlStream,
     peer: SocketAddr,
+    local: SocketAddr,
     inner: Arc<ControlInner>,
 ) -> io::Result<()> {
     let response = match tokio::time::timeout(REQUEST_TIMEOUT, read_request(&mut stream)).await {
         Ok(Ok(request)) => match authorize_request(&inner, &request, peer).await {
-            Ok(()) => dispatch(&inner, request).await,
+            Ok(()) => dispatch(&inner, request, peer, local).await,
             Err(response) => response,
         },
         Ok(Err(error)) => error_response(400, &error.to_string()),
@@ -535,6 +551,10 @@ async fn authorize_request(
     request: &HttpRequest,
     peer: SocketAddr,
 ) -> Result<(), Vec<u8>> {
+    // SOAP authenticates its WS-Security UsernameToken, not HTTP Digest.
+    if request.method == "POST" && onvif_path(&request.path) && inner.onvif.is_some() {
+        return Ok(());
+    }
     let Some(auth) = inner.auth.as_ref() else {
         return Ok(());
     };
@@ -582,7 +602,25 @@ fn unauthorized_response(auth: &DigestAuth, stale: bool) -> Vec<u8> {
     .collect()
 }
 
-async fn dispatch(inner: &Arc<ControlInner>, request: HttpRequest) -> Vec<u8> {
+fn onvif_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/onvif/device_service" | "/onvif/media_service" | "/onvif/ptz_service"
+    )
+}
+
+async fn dispatch(
+    inner: &Arc<ControlInner>,
+    request: HttpRequest,
+    peer: SocketAddr,
+    local: SocketAddr,
+) -> Vec<u8> {
+    if request.method == "POST"
+        && onvif_path(&request.path)
+        && let Some(service) = &inner.onvif
+    {
+        return service.dispatch(inner, &request.body, peer, local).await;
+    }
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/healthz") => health_response(inner),
         ("GET", "/status") => status_response(inner).await,

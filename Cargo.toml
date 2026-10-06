@@ -19,7 +19,7 @@ rcgen = "0.14.10"
 rand = "0.10.3"
 roxmltree = "0.21.1"
 rtp = "0.17.2"
-rtsp-runtime = "0.6.0"
+rtsp-runtime = "0.7.1"
 rtsp-types = "0.1.3"
 # MQTT client. The rustls mode without a provider is used so that the ring provider
 # already in the tree serves TLS here too, rather than adding AWS-LC.

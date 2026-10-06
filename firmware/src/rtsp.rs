@@ -12,6 +12,10 @@
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use bytes::{Buf, Bytes, BytesMut};
+use rand::{
+    Rng, SeedableRng,
+    rngs::{StdRng, SysRng},
+};
 use rtsp_runtime::{InterleavedFrame, LowerTransport, ServerEvent, ServerSession, Transport};
 use rtsp_types::{Message, Method, Request, Response, StatusCode, Version, headers};
 use std::io;
@@ -335,7 +339,6 @@ struct RtspServerInner {
     connections: Arc<Semaphore>,
     media_budget: MediaBudget,
     next_video_sequence: AtomicU64,
-    next_session: AtomicU64,
     next_ssrc: AtomicU32,
     video_access_units_published: AtomicU64,
     video_access_units_sent: AtomicU64,
@@ -421,7 +424,6 @@ impl RtspServer {
             connections: Arc::new(Semaphore::new(crate::security::MAX_RTSP_CONNECTIONS)),
             media_budget: MediaBudget::new(MEDIA_BUDGET_BYTES),
             next_video_sequence: AtomicU64::new(0),
-            next_session: AtomicU64::new(1),
             next_ssrc: AtomicU32::new(FIRST_RTP_SSRC),
             video_access_units_published: AtomicU64::new(0),
             video_access_units_sent: AtomicU64::new(0),
@@ -752,8 +754,11 @@ async fn handle_connection(
 ) -> io::Result<()> {
     let (mut reader, writer) = tokio::io::split(stream);
     let writer = Arc::new(Mutex::new(writer));
-    let session_seed = inner.next_session.fetch_add(1, Ordering::Relaxed);
-    let mut session = ServerSession::new().with_session_seed(session_seed);
+    // RFC 2326 §3.4 requires unpredictable session IDs. Seed the CSPRNG
+    // fallibly once so the runtime's infallible ID callback needs no OS I/O.
+    let mut session_ids = StdRng::try_from_rng(&mut SysRng)
+        .map_err(|error| io::Error::other(format!("RTSP session entropy unavailable: {error}")))?;
+    let mut session = ServerSession::new(move || session_ids.next_u64());
     let mut state = ClientState {
         video_channel: None,
         audio_channel: None,
@@ -2160,9 +2165,21 @@ mod tests {
             .find_map(|line| line.strip_prefix("Session: "))
             .expect("SETUP should return a session")
             .to_string();
+        let id = session.split(';').next().unwrap();
+        assert_eq!(id.len(), 16);
+        assert!(id.bytes().all(|byte| byte.is_ascii_hexdigit()));
+
+        // The 0.7 security boundary must survive our request adapter: neither
+        // an absent nor a foreign session may start the media workers.
+        for (cseq, header) in [(4, ""), (5, "Session: foreign-session\r\n")] {
+            let request =
+                format!("PLAY rtsp://127.0.0.1/live RTSP/1.0\r\nCSeq: {cseq}\r\n{header}\r\n");
+            socket.write_all(request.as_bytes()).await.unwrap();
+            assert!(read_response(&mut socket).await.starts_with("RTSP/1.0 454"));
+        }
 
         let play =
-            format!("PLAY rtsp://127.0.0.1/live RTSP/1.0\r\nCSeq: 4\r\nSession: {session}\r\n\r\n");
+            format!("PLAY rtsp://127.0.0.1/live RTSP/1.0\r\nCSeq: 6\r\nSession: {session}\r\n\r\n");
         socket
             .write_all(play.as_bytes())
             .await

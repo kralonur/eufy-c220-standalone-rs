@@ -1,58 +1,54 @@
 # Security
 
-## Deliberate, and not a vulnerability
+## Trust boundaries
 
-Each of these is a design decision with a reason. Please read them before reporting.
+- Factory firmware executes card `iq.sh` as root. Secure standalone packaging
+  removes executable SD/NVRAM hooks; restoring factory `/home` restores vendor
+  behaviour. Trusted recovery parses data on a `ro,nosuid,nodev,noexec` card.
+- Physical access is a credential: a card or reset button can reprovision the
+  camera and open root Telnet. The authenticated maintenance API can also open
+  port 23 for one boot. Unprovisioned/rescue states expose that shell too. Keep
+  setup isolated, remove cards and reboot out of maintenance before normal use.
+- RTSPS/HTTPS require TLS and credentials; only `/healthz` is public. A one-boot
+  `.standalone_insecure_bringup` marker exists for isolated bench debugging,
+  never production. There is no firmware-upload endpoint.
+- Certificate discovery is not trust. mDNS publishes names, never fingerprints.
+  Establish trust out of band/isolated setup; reject unexplained pin changes.
+- Reset removes known deployment files, not arbitrary private files or vendor
+  logs. See [handover](docs/setup-and-recovery.md#recovery-updates-and-handover).
 
-- **The card hook in [README.md](README.md#install)
-  (`iq.sh`) is the vendor firmware's, not this project's.** Before this firmware is
-  installed, a card in the slot makes the factory firmware run a script as root on
-  every boot. That is how the camera is entered without a programmer. This project
-  cannot remove it and does not add it; it exists on every camera of this model,
-  installed or not, and it goes away when the factory `/home` is restored.
-- **The maintenance shell** (root `telnetd` on port 23) is one boot at a time and is
-  armed either through the authenticated API (`POST /maintenance/enable`) or by a
-  card carrying `maintenance.txt`. Both need physical access or credentials, and the
-  startup script kills a stale shell at the next boot. This firmware never ships an
-  always-on unauthenticated shell.
-- **Card files are data, never executed.** Recovery parses `wifi.txt`,
-  `provision.txt`, `cert.pem` and `key.pem` as key/value text from a card mounted
-  `ro,nosuid,nodev,noexec`, and `maintenance.txt` is read for its presence only.
-  There are no `custom.sh`, factory, SD or NVRAM script hooks in this firmware.
-- **A card in the slot is treated as a credential.** Whoever can insert one can open
-  a shell or move the camera to another network. That is the same physical access the
-  device cannot defend against, and the reason the card is documented as something to
-  remove and store like a password.
-- **Everything that requires the programmer, the UART console or the card slot** is
-  physical access by design.
-- **`/healthz` is unauthenticated on purpose**, and answers only whether the service
-  is up. Every other endpoint needs Digest credentials over TLS.
-- **Digest with MD5 is offered for RTSP** alongside SHA-256, because several common
-  RTSP clients refuse a challenge that lists both. SHA-256 is what the control API
-  and MQTT use.
-- **The certificate is self-signed and public.** It is generated on first boot so a
-  new camera needs no CA ceremony; clients pin it or trust it explicitly. Fetching it
-  from the camera is expected behaviour, not a leak.
-- **mDNS publishes names, never fingerprints**, so discovery cannot be used to make a
-  client trust the wrong certificate.
+## Authentication and resource limits
 
-## Reporting a vulnerability
+Digest retains zeroizing password-equivalent HA1 hashes. SHA-256 control auth
+and RTSP MD5 compatibility run over TLS. `qop=auth` nonce counts must increase;
+the bounded 256-entry replay cache loses history on eviction. Legacy no-qop
+clients have no nonce-count replay protection. Five failures from one address
+cause a 30-minute in-memory lockout. RTSP session IDs are unpredictable;
+missing/mismatched IDs fail session-scoped methods.
 
-Report it privately rather than in a public issue: use the repository's private
-vulnerability reporting if it is enabled, or write to the maintainer address in the
-commit history. Please include the firmware hash (`md5sum /home/c220-firmware`), the
-camera revision, what triggers it, and any log line that shows it - a claim about
-this device is only actionable with the device's state attached.
+Minimal ONVIF uses TLS and WS-Security PasswordDigest, retaining a zeroizing copy
+of the HTTP password. PasswordText is refused; timestamp, nonce and replay limits
+apply. Client TLS verification remains the client's responsibility.
 
-There is no bug bounty. Expect an acknowledgement, a fix if it is real, and credit
-unless you would rather not be named.
+Password/key files must be regular, owned by root/effective service UID and mode
+`0600` or stricter. MQTT requires verified TLS and an absolute readable CA path;
+configured username/password must be paired. There is no plaintext fallback.
+The MQTT library retains its own credential copy while operating.
 
-## Out of scope
+One RTSP/RTSPS slot includes pre-auth/TLS work; eight control connections are
+admitted independently. TLS handshakes have a five-second deadline, control
+read/write and RTSP writes fifteen seconds, RTSP pre-PLAY thirty seconds.
+Allocation/queue limits and cleanup are in [media engine](docs/media-engine.md#runtime-policies).
+These are bounded-service policies, not a throughput guarantee.
 
-- Physical access of any kind: the card slot, the UART console, the flash programmer,
-  and anything that follows from having the camera in your hands.
-- The vendor firmware, the vendor app and the vendor cloud, which this project does
-  not modify or interact with.
-- The factory bootloader, kernel and drivers, which are left untouched.
-- Anything that requires the credentials, and clients that ignore certificate
-  verification.
+## Reporting
+
+Report suspected vulnerabilities privately through repository vulnerability
+reporting if enabled, or the maintainer address in commit history. Include source
+or firmware hash, board revision, reproduction and redacted logs. Never attach
+credentials, private keys, dumps or private recordings publicly. There is no bug
+bounty or guaranteed response time.
+
+Factory bootloader/kernel/drivers and vendor cloud/app are outside this
+project's control. Physical access is trusted by design, but credentialed API
+behaviour that exceeds its intended permissions can still be a valid bug.

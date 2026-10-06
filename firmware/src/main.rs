@@ -322,7 +322,11 @@ async fn run_firmware() -> Result<(), Box<dyn Error + Send + Sync>> {
             rtsps_port,
         )));
     }
-    let control = ControlServer::start(control_config, media_slot.clone(), ptz)?;
+    let control = ControlServer::start(control_config, media_slot.clone(), ptz.clone())?;
+    if ptz.is_some() {
+        tracing::info!("starting PTZ homing sweep");
+        let _ = control::ptz_center(&control.inner()).await;
+    }
 
     // MQTT shares the control plane above, so a command over the broker takes exactly
     // the same path as the same command over HTTPS. A configuration without a broker
@@ -379,6 +383,15 @@ async fn run_firmware() -> Result<(), Box<dyn Error + Send + Sync>> {
             media_task.await
         }
     };
+
+    // Stop a startup sweep before runtime teardown waits for blocking workers.
+    if let Some(ptz) = ptz {
+        match tokio::task::spawn_blocking(move || ptz.stop()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::warn!(%error, "PTZ shutdown failed"),
+            Err(error) => tracing::warn!(%error, "PTZ shutdown worker failed"),
+        }
+    }
 
     match media_result {
         Ok(result) => result?,
